@@ -22,10 +22,18 @@ per-field edge case, so the whole load re-runs the unchanged pure-Python path.
 
 from __future__ import annotations
 
+import json
 import typing
 
 from marshmallow import Schema, ValidationError
-from marshmallow.decorators import POST_LOAD, PRE_LOAD, VALIDATES, VALIDATES_SCHEMA
+from marshmallow.decorators import (
+    POST_DUMP,
+    POST_LOAD,
+    PRE_DUMP,
+    PRE_LOAD,
+    VALIDATES,
+    VALIDATES_SCHEMA,
+)
 from marshmallow.error_store import ErrorStore
 
 from marshmallow_core import _compiler
@@ -43,6 +51,7 @@ _LOAD_HOOKS = (PRE_LOAD, POST_LOAD, VALIDATES, VALIDATES_SCHEMA)
 # Saved originals; ``None`` while not installed (also used by ``is_installed``).
 _orig_serialize: typing.Any = None
 _orig_do_load: typing.Any = None
+_orig_dumps: typing.Any = None
 
 
 def is_installed() -> bool:
@@ -53,6 +62,11 @@ def is_installed() -> bool:
 def _has_load_hooks(schema: Schema) -> bool:
     hooks = schema._hooks
     return any(hooks.get(hook) for hook in _LOAD_HOOKS)
+
+
+def _has_dump_hooks(schema: Schema) -> bool:
+    hooks = schema._hooks
+    return bool(hooks.get(PRE_DUMP)) or bool(hooks.get(POST_DUMP))
 
 
 def _patched_serialize(self: Schema, obj: typing.Any, *, many: bool = False):
@@ -198,23 +212,51 @@ def _accelerated_load(
     return result
 
 
+def _patched_dumps(self: Schema, obj: typing.Any, *args, many: bool | None = None, **kwargs):
+    # Only fuse the default ``json.dumps`` call: any extra positional/keyword
+    # argument (indent=, sort_keys=, cls=, ...) or a non-stdlib render module
+    # could change the output, so defer to ``dump`` + ``render_module.dumps``.
+    # Dump hooks (pre_dump/post_dump) also force the unfused path (they run via
+    # ``dump``, which the fused writer bypasses).
+    if (
+        not args
+        and not kwargs
+        and self.opts.render_module is json
+        and not _has_dump_hooks(self)
+    ):
+        cache = vars(self)
+        js = cache.get("_mc_dump_json", _UNSET)
+        if js is _UNSET:
+            js = cache["_mc_dump_json"] = _compiler.build_dump_json_serializer(self)
+        if js is not None:
+            try:
+                return js.run_json(obj, self.many if many is None else bool(many))
+            except _compiler.AccelFallback:
+                pass  # value the JSON writer can't reproduce -> stock path below
+    return _orig_dumps(self, obj, *args, many=many, **kwargs)
+
+
 def install() -> None:
     """Patch the Rust core into ``marshmallow.Schema`` (idempotent)."""
-    global _orig_serialize, _orig_do_load
+    global _orig_serialize, _orig_do_load, _orig_dumps
     if is_installed():
         return
     _orig_serialize = Schema._serialize
     _orig_do_load = Schema._do_load
+    _orig_dumps = Schema.dumps
     Schema._serialize = _patched_serialize  # type: ignore[method-assign]
     Schema._do_load = _patched_do_load  # type: ignore[method-assign]
+    Schema.dumps = _patched_dumps  # type: ignore[method-assign]
 
 
 def uninstall() -> None:
     """Restore stock marshmallow's pure-Python ``Schema`` methods (idempotent)."""
-    global _orig_serialize, _orig_do_load
+    global _orig_serialize, _orig_do_load, _orig_dumps
     if not is_installed():
         return
     Schema._serialize = _orig_serialize  # type: ignore[method-assign]
     Schema._do_load = _orig_do_load  # type: ignore[method-assign]
+    Schema.dumps = _orig_dumps  # type: ignore[method-assign]
     _orig_serialize = None
     _orig_do_load = None
+    _orig_dumps = None

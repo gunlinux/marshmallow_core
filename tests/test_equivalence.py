@@ -296,6 +296,97 @@ def test_nested_instance_only_equivalence(monkeypatch):
     assert accelerated == pure == {"title": "t", "inner": {"a": "x"}}
 
 
+# ---- fused dumps (dump -> JSON string in Rust) ----------------------------
+
+
+def _dumps_both(schema_factory, obj, *, many=False, monkeypatch, **kwargs):
+    """Return (fused, stock) JSON strings for ``obj``."""
+    fused = schema_factory().dumps(obj, many=many, **kwargs)
+    monkeypatch.setattr(accel, "build_dump_json_serializer", lambda schema: None)
+    stock = schema_factory().dumps(obj, many=many, **kwargs)
+    return fused, stock
+
+
+def test_dumps_flat_equivalence(monkeypatch):
+    obj = {"i": 3, "f": 1.5, "s": 'a "quote"\n', "b": True, "r": [1, None, False]}
+    fused, stock = _dumps_both(FlatSchema, obj, monkeypatch=monkeypatch)
+    assert fused == stock
+
+
+def test_dumps_unicode_and_floats_equivalence(monkeypatch):
+    class S(Schema):
+        s = fields.String()
+        f = fields.Float()
+        big = fields.Float()
+
+    obj = {"s": "héllo \U0001F600 / world", "f": 0.1, "big": 2.5e20}
+    fused, stock = _dumps_both(S, obj, monkeypatch=monkeypatch)
+    assert fused == stock
+
+
+def test_dumps_nested_and_list_equivalence(monkeypatch):
+    obj = {
+        "people": [
+            {
+                "name": "Foo",
+                "age": 30,
+                "address": {"city": "X", "coordinates": {"lat": 1.0, "lng": 2.0}},
+                "tags": ["a", "b"],
+                "scores": [1, 2, 3],
+            },
+            {"name": "Bar", "age": 41, "address": None, "tags": [], "scores": None},
+        ],
+        "total": 2,
+    }
+    fused, stock = _dumps_both(Container, obj, monkeypatch=monkeypatch)
+    assert fused == stock
+
+
+def test_dumps_temporal_enum_uuid_equivalence(monkeypatch):
+    fused, stock = _dumps_both(
+        TemporalEnumSchema, _TEMPORAL_OBJ, monkeypatch=monkeypatch
+    )
+    assert fused == stock
+
+
+def test_dumps_many_equivalence(monkeypatch):
+    objs = [Obj(i=n, f=float(n), s=str(n), b=bool(n % 2), r=n) for n in range(4)]
+    fused, stock = _dumps_both(
+        lambda: FlatSchema(many=True), objs, many=True, monkeypatch=monkeypatch
+    )
+    assert fused == stock
+
+
+def test_dumps_with_kwargs_uses_stock(monkeypatch):
+    """Extra json kwargs (indent/sort_keys) must defer to stock json.dumps."""
+    obj = {"i": 3, "f": 1.5, "s": "hi", "b": True, "r": 1}
+    fused = FlatSchema().dumps(obj, indent=2, sort_keys=True)
+    monkeypatch.setattr(accel, "build_dump_json_serializer", lambda schema: None)
+    stock = FlatSchema().dumps(obj, indent=2, sort_keys=True)
+    assert fused == stock
+
+
+def test_dumps_post_dump_hook_equivalence(monkeypatch):
+    class S(Schema):
+        i = fields.Integer()
+
+        @post_dump
+        def add(self, data, **kwargs):
+            data["doubled"] = data["i"] * 2
+            return data
+
+    fused, stock = _dumps_both(S, {"i": 5}, monkeypatch=monkeypatch)
+    assert fused == stock
+
+
+def test_dumps_decimal_raises_like_stock(monkeypatch):
+    class S(Schema):
+        d = fields.Decimal()
+
+    with pytest.raises(TypeError):
+        S().dumps({"d": decimal.Decimal("1.5")})
+
+
 # ---- Load (deserialization) accelerator ------------------------------------
 
 

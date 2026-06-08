@@ -287,6 +287,25 @@ def build_dump_serializer(schema: Schema) -> typing.Any | None:
     return _core.DumpSerializer(payload, missing)
 
 
+def build_dump_json_serializer(schema: Schema) -> typing.Any | None:
+    """Compile ``schema`` into a serializer whose ``run_json`` fuses ``dump`` +
+    ``json.dumps``, or ``None`` to fall back.
+
+    Uses the same payload as :func:`build_dump_serializer`; the JSON writer
+    raises ``AccelFallback`` for any value it cannot reproduce byte-for-byte, so
+    no extra compile-time gating is needed beyond the dump payload itself. The
+    caller (:mod:`marshmallow_core._patch`) only invokes this for hook-free
+    schemas dumped through the stdlib ``json`` render module.
+    """
+    if not is_available():
+        return None
+    payload = _build_payload(schema)
+    if payload is None:
+        return None
+    assert _core is not None  # narrowed by is_available()
+    return _core.DumpSerializer(payload, missing)
+
+
 # ---- Load (deserialization) acceleration -----------------------------------
 #
 # Mirrors the dump builders but for the ``load`` path. A native field encodes

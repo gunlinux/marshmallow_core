@@ -26,7 +26,7 @@ use pyo3::exceptions::{
 };
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
 create_exception!(
     _core,
@@ -125,6 +125,119 @@ impl DumpSerializer {
     fn run<'py>(&self, obj: &Bound<'py, PyAny>, many: bool) -> PyResult<Bound<'py, PyAny>> {
         self.root.run(&self.ctx, obj, many)
     }
+
+    /// Serialize ``obj`` straight to a JSON string, fusing ``dump`` +
+    /// ``json.dumps`` and skipping the intermediate Python dict. Byte-for-byte
+    /// identical to stdlib ``json.dumps(self._serialize(obj, many))`` for the
+    /// cases it handles; it raises ``AccelFallback`` for anything it cannot
+    /// reproduce exactly (e.g. an unencodable value or a non-``str`` dict key),
+    /// and the caller falls back to ``dump`` + ``json.dumps``.
+    fn run_json(&self, obj: &Bound<'_, PyAny>, many: bool) -> PyResult<String> {
+        let mut buf = String::new();
+        self.root.write_json(&mut buf, &self.ctx, obj, many)?;
+        Ok(buf)
+    }
+}
+
+/// Append ``s`` to ``buf`` as a JSON string literal, matching CPython's
+/// ``json.encoder.py_encode_basestring_ascii`` (``ensure_ascii=True``):
+/// short escapes for ``" \\ \n \r \t \b \f``, ``\u00XX`` for other control
+/// characters, raw bytes for printable ASCII (``0x20..=0x7E``, ``/`` unescaped),
+/// and ``\uXXXX`` (surrogate pairs above the BMP) for everything else.
+fn json_escape_into(buf: &mut String, s: &str) {
+    use std::fmt::Write as _;
+    buf.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => buf.push_str("\\\""),
+            '\\' => buf.push_str("\\\\"),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
+            '\t' => buf.push_str("\\t"),
+            '\u{8}' => buf.push_str("\\b"),
+            '\u{c}' => buf.push_str("\\f"),
+            c if ('\u{20}'..='\u{7e}').contains(&c) => buf.push(c),
+            c => {
+                let cp = c as u32;
+                if cp <= 0xFFFF {
+                    let _ = write!(buf, "\\u{cp:04x}");
+                } else {
+                    let v = cp - 0x10000;
+                    let hi = 0xD800 + (v >> 10);
+                    let lo = 0xDC00 + (v & 0x3FF);
+                    let _ = write!(buf, "\\u{hi:04x}\\u{lo:04x}");
+                }
+            }
+        }
+    }
+    buf.push('"');
+}
+
+/// JSON-encode an arbitrary Python value into ``buf`` exactly as stdlib
+/// ``json.dumps`` (default options) would, or raise ``AccelFallback`` for a type
+/// it cannot reproduce byte-for-byte (so the caller defers to ``json.dumps``,
+/// which then either encodes it or raises the identical ``TypeError``).
+fn write_json_value(buf: &mut String, value: &Bound<'_, PyAny>) -> PyResult<()> {
+    if value.is_none() {
+        buf.push_str("null");
+        return Ok(());
+    }
+    // ``bool`` first: it is an ``int`` subclass.
+    if value.is_instance_of::<PyBool>() {
+        buf.push_str(if value.is_truthy()? { "true" } else { "false" });
+        return Ok(());
+    }
+    if value.is_exact_instance_of::<PyInt>() {
+        buf.push_str(value.str()?.to_str()?); // ``int.__repr__``
+        return Ok(());
+    }
+    if value.is_exact_instance_of::<PyFloat>() {
+        let f: f64 = value.extract()?;
+        if f.is_nan() {
+            buf.push_str("NaN");
+        } else if f.is_infinite() {
+            buf.push_str(if f > 0.0 { "Infinity" } else { "-Infinity" });
+        } else {
+            buf.push_str(value.repr()?.to_str()?); // ``float.__repr__`` == json
+        }
+        return Ok(());
+    }
+    if value.is_exact_instance_of::<PyString>() {
+        json_escape_into(buf, value.cast::<PyString>()?.to_str()?);
+        return Ok(());
+    }
+    if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
+        buf.push('[');
+        let mut first = true;
+        for item in value.try_iter()? {
+            if !first {
+                buf.push_str(", ");
+            }
+            first = false;
+            write_json_value(buf, &item?)?;
+        }
+        buf.push(']');
+        return Ok(());
+    }
+    if let Ok(dict) = value.cast::<PyDict>() {
+        buf.push('{');
+        let mut first = true;
+        for (k, v) in dict.iter() {
+            // json.dumps coerces int/float/bool/None keys; defer those rare
+            // cases to stdlib so we never mis-order or mis-format a key.
+            let key = k.cast::<PyString>().map_err(|_| fallback())?;
+            if !first {
+                buf.push_str(", ");
+            }
+            first = false;
+            json_escape_into(buf, key.to_str()?);
+            buf.push_str(": ");
+            write_json_value(buf, &v)?;
+        }
+        buf.push('}');
+        return Ok(());
+    }
+    Err(fallback()) // unencodable type (Decimal, datetime, custom, ...) -> defer
 }
 
 impl Serializer {
@@ -187,6 +300,89 @@ impl Serializer {
             }
         }
         Ok(dict)
+    }
+
+    /// JSON form of [`Serializer::run`]: write ``obj`` (or each element if
+    /// ``many``) as JSON into ``buf``. Mirrors ``run``'s ``many``/None handling.
+    fn write_json(
+        &self,
+        buf: &mut String,
+        ctx: &Ctx,
+        obj: &Bound<'_, PyAny>,
+        many: bool,
+    ) -> PyResult<()> {
+        if many && !obj.is_none() {
+            buf.push('[');
+            let mut first = true;
+            for item in obj.try_iter()? {
+                if !first {
+                    buf.push_str(", ");
+                }
+                first = false;
+                self.write_json_one(buf, ctx, &item?)?;
+            }
+            buf.push(']');
+            Ok(())
+        } else {
+            self.write_json_one(buf, ctx, obj)
+        }
+    }
+
+    /// JSON form of [`Serializer::run_one`]: write one object as a JSON object.
+    fn write_json_one(&self, buf: &mut String, ctx: &Ctx, obj: &Bound<'_, PyAny>) -> PyResult<()> {
+        let py = obj.py();
+        let missing = ctx.missing.bind(py);
+        let accessor = self.accessor.bind(py);
+        buf.push('{');
+        let mut first = true;
+        for spec in &self.specs {
+            match spec {
+                FieldSpec::Callback {
+                    name,
+                    output_key,
+                    field,
+                } => {
+                    let val = field.bind(py).call_method1(
+                        intern!(py, "serialize"),
+                        (name.bind(py), obj, accessor),
+                    )?;
+                    if val.is(missing) {
+                        continue;
+                    }
+                    if !first {
+                        buf.push_str(", ");
+                    }
+                    first = false;
+                    json_escape_into(buf, output_key.bind(py).to_str()?);
+                    buf.push_str(": ");
+                    write_json_value(buf, &val)?;
+                }
+                FieldSpec::Native {
+                    key,
+                    key_parts,
+                    output_key,
+                    dump_default,
+                    element,
+                } => {
+                    let mut value = get_value(py, obj, key, key_parts, missing)?;
+                    if value.is(missing) {
+                        value = dump_default.bind(py).clone();
+                    }
+                    if value.is(missing) {
+                        continue;
+                    }
+                    if !first {
+                        buf.push_str(", ");
+                    }
+                    first = false;
+                    json_escape_into(buf, output_key.bind(py).to_str()?);
+                    buf.push_str(": ");
+                    element.write_json(buf, ctx, &value)?;
+                }
+            }
+        }
+        buf.push('}');
+        Ok(())
     }
 }
 
@@ -283,6 +479,45 @@ impl Element {
                 ctx.dict_fn.bind(py).call1((value,)) // ``self.mapping_type(value)``
             }
             Element::Constant { constant } => Ok(constant.bind(py).clone()),
+        }
+    }
+
+    /// JSON form of [`Element::apply`]: write the serialized value as JSON into
+    /// ``buf``. ``Nested``/``List`` recurse structurally (no intermediate dict);
+    /// every other element computes its serialized value via ``apply`` and hands
+    /// it to [`write_json_value`], so the JSON output is exactly
+    /// ``json.dumps(self.apply(value))``.
+    fn write_json(&self, buf: &mut String, ctx: &Ctx, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        match self {
+            Element::Nested(serializer, many) => {
+                if value.is_none() {
+                    buf.push_str("null");
+                    Ok(())
+                } else {
+                    serializer.write_json(buf, ctx, value, *many)
+                }
+            }
+            Element::List(inner) => {
+                if value.is_none() {
+                    buf.push_str("null");
+                    return Ok(());
+                }
+                buf.push('[');
+                let mut first = true;
+                for each in value.try_iter()? {
+                    if !first {
+                        buf.push_str(", ");
+                    }
+                    first = false;
+                    inner.write_json(buf, ctx, &each?)?;
+                }
+                buf.push(']');
+                Ok(())
+            }
+            _ => {
+                let serialized = self.apply(ctx, value)?;
+                write_json_value(buf, &serialized)
+            }
         }
     }
 }
