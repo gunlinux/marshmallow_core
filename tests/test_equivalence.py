@@ -28,8 +28,10 @@ from marshmallow import (
     fields,
     post_dump,
     post_load,
+    pre_load,
     validate,
     validates,
+    validates_schema,
 )
 
 
@@ -614,6 +616,126 @@ def test_load_schema_validator_runs(monkeypatch):
     assert accelerated == pure == {"a": 1, "b": 2}
     with pytest.raises(ValidationError):
         S().load({"a": -1, "b": 2})
+
+
+# ---- hook-bearing load schemas (accelerated per-field step) --------------
+
+
+class HookLoadSchema(Schema):
+    a = fields.Integer()
+    b = fields.String()
+    c = fields.Integer(validate=validate.Range(min=0))
+
+    @pre_load
+    def inject(self, data, **kwargs):
+        data = dict(data)
+        data.setdefault("a", 0)
+        return data
+
+    @post_load
+    def total(self, data, **kwargs):
+        data["seen"] = sorted(data)
+        return data
+
+    @validates("b")
+    def check_b(self, value, **kwargs):
+        if value == "bad":
+            raise ValidationError("b is bad")
+
+    @validates_schema
+    def check_all(self, data, **kwargs):
+        if data.get("a") == data.get("c"):
+            raise ValidationError("a must differ from c")
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"a": 5, "b": "x", "c": 3},
+        {"b": "y", "c": 1},  # pre_load injects a
+        {"a": 7},  # b/c missing
+    ],
+)
+def test_load_hooks_valid_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(HookLoadSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"a": 1, "b": "bad", "c": 3},  # field-level @validates fails
+        {"a": 4, "b": "x", "c": 4},  # @validates_schema fails
+        {"a": 1, "b": "x", "c": -5},  # native validator fails
+        {"a": "NaN", "b": "x"},  # field deserialize fails
+        {"a": 1, "b": 123, "c": 2},  # b not a string
+    ],
+)
+def test_load_hooks_error_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        HookLoadSchema().load(data)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        HookLoadSchema().load(data)
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_hooks_is_native():
+    schema = HookLoadSchema()
+    schema.load({"a": 1, "b": "x", "c": 2})  # trigger lazy build
+    assert accel.is_available() == (
+        vars(schema).get("_mc_load_deserializer") is not None
+    )
+
+
+def test_load_pre_load_validation_error_matches(monkeypatch):
+    """A ``pre_load`` that raises must produce identical errors via both paths."""
+
+    class S(Schema):
+        x = fields.Integer()
+
+        @pre_load
+        def guard(self, data, **kwargs):
+            if "x" not in data:
+                raise ValidationError("x required", field_name="x")
+            return data
+
+    with pytest.raises(ValidationError) as acc_exc:
+        S().load({})
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        S().load({})
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_hooks_many_equivalence(monkeypatch):
+    accelerated, pure = _load_both(
+        lambda: HookLoadSchema(many=True),
+        [{"a": 1, "b": "x", "c": 2}, {"a": 9, "b": "z", "c": 0}],
+        many=True,
+        monkeypatch=monkeypatch,
+    )
+    assert accelerated == pure
+
+
+def test_load_post_load_only_uses_core(monkeypatch):
+    """A schema whose only hook is ``post_load`` is accelerated (not deferred)."""
+
+    class S(Schema):
+        i = fields.Integer()
+
+        @post_load
+        def add(self, data, **kwargs):
+            data["doubled"] = data["i"] * 2
+            return data
+
+    schema = S()
+    schema.load({"i": 5})
+    assert accel.is_available() == (
+        vars(schema).get("_mc_load_deserializer") is not None
+    )
+    accelerated, pure = _load_both(S, {"i": 5}, monkeypatch=monkeypatch)
+    assert accelerated == pure == {"i": 5, "doubled": 10}
 
 
 def test_load_callback_base_exception_not_swallowed():

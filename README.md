@@ -46,13 +46,15 @@ marshmallow_core.uninstall()    # restore the stock pure-Python methods
 
 ## Scope / limitations
 
-`install()` accelerates dump for all compilable schemas, and load for schemas
-**without** `pre_load` / `post_load` / `validates` / `validates_schema` hooks
-(those use the pure-Python load path; the hook-aware split can't be reproduced
-by patching from outside marshmallow). Collection/dotted `partial`,
-`unknown=INCLUDE`, custom `dict_class` / `get_attribute`, self-referential
-schemas, custom strptime temporal formats, and callable defaults always fall
-back to pure Python.
+`install()` accelerates dump for all compilable schemas, and load for most
+schemas — including those with `pre_load` / `post_load` / `validates` /
+`validates_schema` hooks: the core runs the per-field deserialize step while
+those hooks run in Python around it (mirroring marshmallow's own `_do_load`
+split). Recognized field validators (`Range` / `Length` / `OneOf`) run natively;
+any other validator, or field-level `pre_load` / `post_load`, keeps that field
+on the callback path. Collection/dotted `partial`, `unknown=INCLUDE`, custom
+`dict_class` / `get_attribute`, self-referential schemas, custom strptime
+temporal formats, and callable defaults always fall back to pure Python.
 
 ## Development
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from marshmallow import Schema, fields, validate
+from marshmallow import Schema, fields, post_load, pre_load, validate, validates
 
 # ---- flat scalars ----------------------------------------------------------
 
@@ -112,6 +112,32 @@ def _validator_obj() -> dict:
     return {"age": 30, "name": "Foo Bar", "role": "user", "score": 88.5}
 
 
+# ---- hook-bearing (pre_load / post_load / validates) -----------------------
+
+
+class HookSchema(Schema):
+    a = fields.Integer()
+    b = fields.String()
+    c = fields.Float()
+
+    @pre_load
+    def _pre(self, data, **kwargs):
+        return data
+
+    @post_load
+    def _post(self, data, **kwargs):
+        return data
+
+    @validates("a")
+    def _check_a(self, value, **kwargs):
+        if value < 0:
+            raise ValueError("negative")
+
+
+def _hook_obj() -> dict:
+    return {"a": 5, "b": "hello world", "c": 2.5}
+
+
 #: name -> (schema_class, sample_dict). The sample is the *loaded* form for dump
 #: and the input form for load; for these schemas the two coincide closely
 #: enough that the same dict drives both directions.
@@ -120,4 +146,5 @@ CASES: dict[str, tuple[type[Schema], dict]] = {
     "nested": (NestedSchema, _nested_obj()),
     "list": (ListSchema, _list_obj()),
     "validator": (ValidatorSchema, _validator_obj()),
+    "hooks": (HookSchema, _hook_obj()),
 }

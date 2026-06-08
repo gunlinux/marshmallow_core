@@ -19,14 +19,14 @@ bottom within a phase.
 ## Phase 1 — Coverage gaps
 
 ### Hook-bearing load schemas
-- [ ] Map out marshmallow 4.x `_do_load` body (pre_load → deserialize → validators → post_load)
-- [ ] In `_patched_do_load`, run `pre_load` in Python before the core step
-- [ ] Call the core for the per-field deserialize when hooks are present
-- [ ] Run field validators in Python after the core step
-- [ ] Run schema validators (`validates_schema`) in Python
-- [ ] Run `post_load` in Python after the core step
-- [ ] Remove the `not _has_load_hooks(self)` guard once the split works
-- [ ] Add equivalence tests for pre_load + post_load + validates schemas
+- [x] Map out marshmallow 4.x `_do_load` body (pre_load → deserialize → validators → post_load)
+- [x] In `_patched_do_load`, run `pre_load` in Python before the core step
+- [x] Call the core for the per-field deserialize when hooks are present
+- [x] Run field validators in Python after the core step
+- [x] Run schema validators (`validates_schema`) in Python
+- [x] Run `post_load` in Python after the core step
+- [x] Remove the `not _has_load_hooks(self)` guard once the split works
+- [x] Add equivalence tests for pre_load + post_load + validates schemas
 
 ### Native validators
 - [x] Add a validator tag space (compiler + lib.rs)
