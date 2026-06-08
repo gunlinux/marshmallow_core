@@ -40,6 +40,13 @@ marshmallow_core.uninstall()    # restore the stock pure-Python methods
   the unchanged pure-Python load, so every error message and value matches
   exactly. The **dump** core has no fallback, so each native dump element is
   provably identical to `Field._serialize`.
+- `dumps` is **fused**: it writes JSON bytes directly in Rust, skipping the
+  intermediate Python dict and the `json.dumps` pass, byte-for-byte identical to
+  `json.dumps(schema.dump(obj))`. It activates for hook-free schemas using the
+  stdlib `json` render module with no extra `json` kwargs, and falls back to
+  `dump` + `json.dumps` for anything it can't reproduce exactly. (`loads` is
+  already accelerated through the patched load path; a Rust JSON *parser* was
+  prototyped but did not beat CPython's C `json.loads`, so it was not shipped.)
 - Acceleration is strictly a speedup. Set `MARSHMALLOW_NO_ACCEL=1` (or hit a
   protocol-version mismatch between the Python and Rust halves) and the core
   becomes a no-op even after `install()`.

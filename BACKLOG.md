@@ -47,14 +47,21 @@ bottom within a phase.
 
 ## Phase 2 — Fused JSON path
 
-- [ ] Add a dump→JSON-bytes core object in `lib.rs`
-- [ ] Build the JSON-dump payload in `_compiler.py`
-- [ ] Wrap `Schema.dumps` in `_patch.py`
-- [ ] Equivalence tests: `dumps` output matches stock
-- [ ] Add a JSON→loaded core object in `lib.rs`
-- [ ] Build the JSON-load payload in `_compiler.py`
-- [ ] Wrap `Schema.loads` in `_patch.py` with `AccelFallback`
-- [ ] Equivalence tests: `loads` result + errors match stock
+- [x] Add a dump→JSON-bytes core object in `lib.rs` (`DumpSerializer.run_json`)
+- [x] Build the JSON-dump payload in `_compiler.py` (`build_dump_json_serializer`)
+- [x] Wrap `Schema.dumps` in `_patch.py`
+- [x] Equivalence tests: `dumps` output matches stock
+- [~] Add a JSON→loaded core object in `lib.rs` — **implemented + benchmarked,
+      not shipped.** A `serde_json`-backed single-pass `LoadDeserializer.run_json`
+      was prototyped, but it is consistently *slower* than CPython's C `json.loads`
+      followed by the already-accelerated `_do_load` (e.g. nested 2.12µs vs 1.96µs;
+      100-record list 60µs vs 37µs). `loads` already benefits from the `_do_load`
+      patch, so fusing it only adds a heavy dependency and a regression. Reverted
+      per the roadmap's "confirm a real gain, not a regression" rule.
+- [~] Build the JSON-load payload in `_compiler.py` — see above (reverted)
+- [~] Wrap `Schema.loads` in `_patch.py` with `AccelFallback` — see above (reverted)
+- [~] Equivalence tests: `loads` result + errors match stock — verified during the
+      prototype (big-int/error/unknown-key parity held); dropped with the revert
 
 ## Phase 3 — Remaining deferrals + micro-opts
 
