@@ -73,6 +73,28 @@ MARSHMALLOW_NO_ACCEL=1 pytest
 and errors with the core active vs. forced onto pure Python, across scalars,
 nested/list/enum/temporal/UUID fields, `partial=True`, and error inputs.
 
+## Benchmarking
+
+The `performance/` directory (not shipped in wheels) measures the core against
+stock marshmallow through the public `install()` / `uninstall()` API. Run it from
+the repo root with the compiled extension importable (`uvx maturin develop
+--release` first, or point `PYTHONPATH` at the repo while the wheel is installed):
+
+```bash
+# stock-vs-core table for dump / load / dumps / loads on four schema shapes
+python -m performance.benchmark                       # all cases
+python -m performance.benchmark --number 20000 --only flat,list
+
+# coverage probe: per-field native vs callback for each schema shape
+python -m performance.analyze_paths
+```
+
+`benchmark.py` reports per-call microseconds for stock and core plus the speedup
+ratio, across flat-scalar, nested, list-heavy, and validator-heavy schemas.
+`analyze_paths.py` inspects the compiled payload and shows which fields run
+native in Rust vs. fall back to a Python callback — it tells you exactly where a
+real schema still defers to pure Python.
+
 ## Releasing
 
 CI (`.github/workflows/ci.yml`) builds the wheel and runs the suite against
