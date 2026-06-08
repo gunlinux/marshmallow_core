@@ -1,5 +1,7 @@
 # marshmallow_core
 
+[![CI](https://github.com/gunlinux/marshmallow_core/actions/workflows/ci.yml/badge.svg)](https://github.com/gunlinux/marshmallow_core/actions/workflows/ci.yml)
+
 A Rust acceleration core for [marshmallow](https://github.com/marshmallow-code/marshmallow),
 shipped as a **separate, opt-in package**. Install it next to stock marshmallow
 and activate it explicitly — it replaces marshmallow's per-object
@@ -66,6 +68,21 @@ pytest
 # force the pure-Python path
 MARSHMALLOW_NO_ACCEL=1 pytest
 ```
+
+`tests/test_equivalence.py` asserts that `dump`/`load` produce identical output
+and errors with the core active vs. forced onto pure Python, across scalars,
+nested/list/enum/temporal/UUID fields, `partial=True`, and error inputs.
+
+## Releasing
+
+CI (`.github/workflows/ci.yml`) builds the wheel and runs the suite against
+stock marshmallow on Python 3.10–3.13, both with the core active and with
+`MARSHMALLOW_NO_ACCEL=1`. Publishing (`.github/workflows/release.yml`) builds
+abi3 wheels + sdist for Linux/macOS/Windows on a `v*` tag and uploads them to
+PyPI via [trusted publishing](https://docs.pypi.org/trusted-publishers/). Before
+the first release, configure the PyPI trusted publisher for this repo and create
+a `pypi` GitHub Environment, then push a tag (e.g. `git tag v0.1.0 && git push
+--tags`).
 
 ## License
 
