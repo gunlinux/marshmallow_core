@@ -1,0 +1,17 @@
+[package]
+name = "marshmallow_core"
+version = "0.1.0"
+edition = "2021"
+description = "Rust acceleration core for marshmallow serialization (separate, opt-in package)"
+license = "MIT"
+repository = "https://github.com/gunlinux/marshmallow_core"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
+
+[profile.release]
+lto = "thin"

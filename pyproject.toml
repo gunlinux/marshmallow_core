@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "marshmallow_core"
+version = "0.1.0"
+description = "Rust acceleration core for marshmallow serialization, installed as a separate, opt-in package."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "gunlinux" }]
+keywords = ["marshmallow", "serialization", "rust", "performance"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "License :: OSI Approved :: MIT License",
+]
+dependencies = ["marshmallow>=4,<5"]
+
+[project.urls]
+Homepage = "https://github.com/gunlinux/marshmallow_core"
+Source = "https://github.com/gunlinux/marshmallow_core"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.maturin]
+module-name = "marshmallow_core._core"
+python-source = "python"
+features = ["pyo3/extension-module"]

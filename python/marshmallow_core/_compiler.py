@@ -1,0 +1,409 @@
+"""Optional Rust acceleration for the ``dump`` (serialization) path.
+
+This module compiles a bound :class:`~marshmallow.Schema` into a Rust-backed
+``DumpSerializer`` that replaces the per-object Python ``_serialize`` loop. It is
+strictly optional: if the ``_marshmallow_core`` extension is not installed (or is
+disabled via ``MARSHMALLOW_NO_ACCEL``), :func:`build_dump_serializer` returns
+``None`` and marshmallow uses its pure-Python path unchanged.
+
+A schema is compiled into a recursive *payload* (see the wire format below).
+Every field becomes either a *native* serializer (formatted entirely in Rust) or
+a *callback* that defers to the Python ``Field.serialize`` method, so accelerated
+output is identical to pure-Python output. Natively supported:
+
+* scalars (exact type): ``Raw``, ``Boolean``, ``String``, ``Integer``, ``Float``;
+* ``Nested`` (exact type) whose inner schema is itself compilable and has no
+  ``pre_dump``/``post_dump`` hooks — the nested schema is recursed in Rust;
+* ``List`` (exact type) whose element field is natively supported.
+
+Everything else (``Method``, ``Function``, ``DateTime``, ``UUID``, ``Email``,
+``Enum``, callable ``dump_default``, a schema overriding ``get_attribute``, ...)
+falls back to the callback path.
+
+Wire format passed to ``DumpSerializer(payload, missing)``:
+
+* ``payload`` = ``(accessor, [field_spec, ...])`` — one schema level.
+* ``field_spec`` native   = ``(False, output_key, key, dump_default, element)``.
+* ``field_spec`` callback = ``(True, output_key, attr_name, field)``.
+* ``element`` scalar = ``(kind:int, as_string:bool)`` with ``kind`` in 0..=3.
+* ``element`` nested = ``(4, payload, many:bool)``.
+* ``element`` list   = ``(5, element)``.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import os
+import typing
+import uuid
+
+from marshmallow import fields as ma_fields
+from marshmallow.constants import EXCLUDE, RAISE, missing
+from marshmallow.decorators import (
+    POST_DUMP,
+    POST_LOAD,
+    PRE_DUMP,
+    PRE_LOAD,
+    VALIDATES,
+    VALIDATES_SCHEMA,
+)
+
+if typing.TYPE_CHECKING:
+    from marshmallow.schema import Schema
+
+try:
+    from marshmallow_core import _core
+except ImportError:  # pragma: no cover - extension is optional
+    _core = None  # type: ignore[assignment]
+
+#: Wire-format/ABI version this module speaks. Must match the extension's
+#: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
+#: paired with newer ``marshmallow``, or vice versa) disables the core so we
+#: never hand mismatched payloads to a build that would misread the tags.
+_EXPECTED_PROTOCOL = 1
+
+
+class _NoFallbackError(Exception):
+    """Placeholder so ``except AccelFallback`` is valid when the ext is absent."""
+
+
+#: Raised by the Rust load core to ask the caller to use the pure-Python path.
+AccelFallback: type[BaseException] = (
+    _core.AccelFallback if _core is not None else _NoFallbackError
+)
+
+# Dump element tags. Must match the tags in crates/marshmallow-core/src/lib.rs.
+_PASSTHROUGH = 0
+_STRING = 1
+_INTEGER = 2
+_FLOAT = 3
+_NESTED = 4
+_LIST = 5
+_UUID = 6
+_TEMPORAL = 7
+_ENUM = 8
+
+# Load element tags (a distinct tag space from the dump tags above).
+_L_PASSTHROUGH = 0
+_L_STRING = 1
+_L_INTEGER = 2
+_L_FLOAT = 3
+_L_NESTED = 4
+_L_LIST = 5
+_L_ENUM = 6
+_L_UUID = 7
+_L_TEMPORAL = 8
+
+# Unknown-key handling codes passed to the Rust load core.
+_UNKNOWN_CODES = {RAISE: 0, EXCLUDE: 1}
+
+# Schema-level hooks that make a schema ineligible for the native load path.
+_LOAD_HOOKS = (PRE_LOAD, POST_LOAD, VALIDATES, VALIDATES_SCHEMA)
+
+# Exact scalar field type -> element kind. Subclasses deliberately fall back to
+# the callback path so we never second-guess an overridden ``_serialize``.
+# ``Email``/``Url`` are included because their ``_serialize`` is exactly
+# ``String._serialize`` (validation only happens on load).
+_SCALAR_KINDS: dict[type, int] = {
+    ma_fields.Raw: _PASSTHROUGH,
+    ma_fields.Boolean: _PASSTHROUGH,
+    ma_fields.String: _STRING,
+    ma_fields.Email: _STRING,
+    ma_fields.Url: _STRING,
+    ma_fields.Integer: _INTEGER,
+    ma_fields.Float: _FLOAT,
+}
+
+# Temporal field types whose ``_serialize`` is exactly ``_TemporalField._serialize``.
+_TEMPORAL_TYPES: frozenset[type] = frozenset(
+    {
+        ma_fields.DateTime,
+        ma_fields.NaiveDateTime,
+        ma_fields.AwareDateTime,
+        ma_fields.Date,
+        ma_fields.Time,
+    }
+)
+
+# Temporal types whose ``_deserialize`` is exactly ``_TemporalField._deserialize``.
+# ``NaiveDateTime``/``AwareDateTime`` are excluded: they override ``_deserialize``
+# with extra timezone handling, so they stay on the callback path.
+_LOAD_TEMPORAL_TYPES: frozenset[type] = frozenset(
+    {
+        ma_fields.DateTime,
+        ma_fields.Date,
+        ma_fields.Time,
+    }
+)
+
+
+def is_available() -> bool:
+    """Return whether the Rust acceleration extension is importable and enabled.
+
+    A protocol-version mismatch between this module and the compiled extension
+    disables acceleration (the pure-Python path is always correct).
+
+    Note: this is consulted by ``build_*`` the first time a schema is dumped/
+    loaded and the result is cached on the schema, so toggling
+    ``MARSHMALLOW_NO_ACCEL`` after that first use has no effect for that schema.
+    """
+    return (
+        _core is not None
+        and getattr(_core, "PROTOCOL_VERSION", None) == _EXPECTED_PROTOCOL
+        and not os.environ.get("MARSHMALLOW_NO_ACCEL")
+    )
+
+
+def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
+    """Build the value->output ``element`` for ``field``, or ``None`` to fall back.
+
+    The element mirrors ``field._serialize`` (the transform applied to a value),
+    independent of attribute access. ``stack`` carries the schema classes already
+    being compiled, so self-referential schemas fall back instead of recursing
+    forever at compile time.
+    """
+    ftype = type(field)
+    kind = _SCALAR_KINDS.get(ftype)
+    if kind is not None:
+        return (kind, bool(getattr(field, "as_string", False)))
+    if ftype is ma_fields.Nested:
+        # ``field.schema`` resolves the inner schema (applying only/exclude/many).
+        inner_schema = field.schema
+        if inner_schema._hooks[PRE_DUMP] or inner_schema._hooks[POST_DUMP]:
+            return None  # schema.dump != _serialize; must use the callback path
+        payload = _build_payload(inner_schema, stack)
+        if payload is None:
+            return None
+        many = bool(inner_schema.many or field.many)
+        return (_NESTED, payload, many)
+    if ftype is ma_fields.List:
+        inner_element = _build_element(field.inner, stack)
+        if inner_element is None:
+            return None
+        return (_LIST, inner_element)
+    if ftype is ma_fields.UUID:
+        return (_UUID,)
+    if ftype in _TEMPORAL_TYPES:
+        # ``field.format`` is resolved to a concrete string once the field is
+        # bound to its schema (which has happened by the first dump).
+        data_format = field.format or field.DEFAULT_FORMAT
+        if not isinstance(data_format, str):
+            return None
+        func = field.SERIALIZATION_FUNCS.get(data_format)
+        return (_TEMPORAL, func, data_format)
+    if ftype is ma_fields.Enum:
+        # Enum serializes value.value / value.name through an inner field.
+        inner_element = _build_element(field.field, stack)
+        if inner_element is None:
+            return None
+        return (_ENUM, bool(field.by_value), inner_element)
+    return None
+
+
+def _build_payload(schema: Schema, stack: tuple[type, ...] = ()) -> tuple | None:
+    """Build the ``(accessor, specs)`` payload for one schema level, or ``None``."""
+    if schema.dict_class is not dict:
+        return None  # the Rust side always builds plain dicts
+    cls = type(schema)
+    if cls in stack:
+        return None  # self-referential schema: break the compile-time recursion
+    stack = (*stack, cls)
+    from marshmallow.schema import Schema as _Schema
+
+    # A custom ``get_attribute`` is incompatible with native attribute access, so
+    # force every field through the callback path (which honours the accessor).
+    force_callback = type(schema).get_attribute is not _Schema.get_attribute
+
+    specs = []
+    for attr_name, field in schema.dump_fields.items():
+        output_key = field.data_key if field.data_key is not None else attr_name
+        dump_default = field.dump_default
+        element = None
+        if not force_callback and not (
+            dump_default is not missing and callable(dump_default)
+        ):
+            element = _build_element(field, stack)
+        if element is not None:
+            check_key = field.attribute if field.attribute is not None else attr_name
+            specs.append((False, output_key, check_key, dump_default, element))
+        else:
+            # Rust calls ``field.serialize(attr_name, obj, accessor)``.
+            specs.append((True, output_key, attr_name, field))
+
+    return (schema.get_attribute, specs)
+
+
+def build_dump_serializer(schema: Schema) -> typing.Any | None:
+    """Compile ``schema`` into a Rust ``DumpSerializer``, or ``None`` to fall back.
+
+    Returns ``None`` (use the pure-Python path) when the extension is unavailable
+    or the schema uses a feature the fast path does not model.
+
+    Unlike the load path, the dump core has **no ``AccelFallback``** — once a
+    field is compiled native it cannot defer to Python mid-serialization. Only
+    add a field type here when its native ``Element`` is provably identical to
+    ``Field._serialize`` for *every* input, and cover it with a ``_dump_both``
+    equivalence test.
+    """
+    if not is_available():
+        return None
+    payload = _build_payload(schema)
+    if payload is None:
+        return None
+    assert _core is not None  # narrowed by is_available()
+    return _core.DumpSerializer(payload, missing)
+
+
+# ---- Load (deserialization) acceleration -----------------------------------
+#
+# Mirrors the dump builders but for the ``load`` path. A native field encodes
+# enough of ``Field.deserialize`` (required/allow_none/load_default + the value
+# transform) that the Rust core can reproduce the *valid-input* result exactly;
+# anything else is a callback that defers to ``field.deserialize``. The Rust core
+# raises :data:`AccelFallback` the moment it sees an error/edge case, so all
+# error reporting stays on the unchanged pure-Python path.
+
+
+def _has_field_processors(field: typing.Any) -> bool:
+    """True if a field has validators or its own pre/post-load processors."""
+    return bool(field.validators or field.pre_load or field.post_load)
+
+
+def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
+    """Build the value->value load ``element`` for ``field``, or ``None``."""
+    ftype = type(field)
+    if ftype is ma_fields.Raw:
+        return (_L_PASSTHROUGH,)
+    if ftype is ma_fields.String:
+        return (_L_STRING,)
+    if ftype is ma_fields.Integer:
+        if field.strict:  # strict needs an ``numbers.Integral`` check; defer
+            return None
+        return (_L_INTEGER,)
+    if ftype is ma_fields.Float:
+        return (_L_FLOAT, bool(field.allow_nan))
+    if ftype is ma_fields.Nested:
+        inner_schema = field.schema
+        many = bool(inner_schema.many or field.many)
+        # ``Nested._load`` loads with ``unknown=field.unknown`` when set, else the
+        # inner schema's own ``unknown``.
+        unknown = field.unknown if field.unknown is not None else inner_schema.unknown
+        payload = _build_load_payload(
+            inner_schema, many=many, unknown=unknown, stack=stack
+        )
+        if payload is None:
+            return None
+        return (_L_NESTED, payload)
+    if ftype is ma_fields.List:
+        inner = field.inner
+        if _has_field_processors(inner):
+            return None  # inner.deserialize would run validators/processors
+        inner_element = _build_load_element(inner, stack)
+        if inner_element is None:
+            return None
+        return (_L_LIST, inner_element, bool(inner.allow_none))
+    if ftype is ma_fields.Enum:
+        # Enum deserializes ``value`` through ``field.field`` then maps it to a
+        # member via ``enum(val)``/``enum[val]``. ``by_value`` may be a Field,
+        # which is truthy -> the by-value path, matching ``if self.by_value``.
+        inner_element = _build_load_element(field.field, stack)
+        if inner_element is None:
+            return None
+        return (_L_ENUM, field.enum, bool(field.by_value), inner_element)
+    if ftype is ma_fields.UUID:
+        # ``UUID._validated``: pass through an existing UUID, else ``uuid.UUID(value)``
+        # (with the 16-byte ``bytes=`` special case). Any error -> fall back.
+        return (_L_UUID, uuid.UUID)
+    if ftype in _LOAD_TEMPORAL_TYPES:
+        # ``_TemporalField._deserialize`` passes through an existing instance, else
+        # applies ``DESERIALIZATION_FUNCS[format]``. A custom strptime format (no
+        # registered func) is left to the callback path.
+        data_format = field.format or field.DEFAULT_FORMAT
+        func = field.DESERIALIZATION_FUNCS.get(data_format)
+        if func is None:
+            return None
+        internal_type = getattr(dt, field.OBJ_TYPE)
+        return (_L_TEMPORAL, internal_type, func)
+    return None
+
+
+def _build_load_payload(
+    schema: Schema,
+    *,
+    many: bool,
+    unknown: str | None = None,
+    stack: tuple[type, ...] = (),
+    is_root: bool = False,
+) -> tuple | None:
+    """Build ``(many, unknown_code, known_keys, specs)`` for one schema level.
+
+    ``unknown`` overrides the schema's own option (used by ``Nested`` fields,
+    which can pass their own ``unknown`` down). ``None`` means use the schema's.
+    ``is_root`` marks the schema whose ``load`` is being compiled: its ``pre_load``
+    /``post_load``/``validates``/``validates_schema`` hooks are run by ``_do_load``
+    *around* the accelerated per-field deserialize, so they don't disqualify it.
+    A *nested* schema gets no such wrapper, so its hooks still force the callback
+    path (``Nested.deserialize`` -> ``inner.load`` runs them in Python).
+    """
+    if schema.dict_class is not dict:
+        return None  # the Rust side always builds plain dicts
+    if not is_root and any(schema._hooks[hook] for hook in _LOAD_HOOKS):
+        return None  # nested load != _deserialize once hooks/validators are involved
+    if not is_root and schema.partial:
+        # The root's ``partial`` is threaded as a runtime flag to ``run``; a nested
+        # schema's *own* ``partial`` option isn't captured by that flag (it only
+        # applies when the parent isn't partial), so defer to the Python path.
+        return None
+    unknown_code = _UNKNOWN_CODES.get(schema.unknown if unknown is None else unknown)
+    if unknown_code is None:
+        return None  # INCLUDE keeps unknown keys (set-ordered); defer
+    cls = type(schema)
+    if cls in stack:
+        return None  # self-referential schema: break compile-time recursion
+    stack = (*stack, cls)
+
+    specs = []
+    known_keys = []
+    for attr_name, field in schema.load_fields.items():
+        data_key = field.data_key if field.data_key is not None else attr_name
+        out_key = field.attribute if field.attribute is not None else attr_name
+        known_keys.append(data_key)
+        if "." in out_key:
+            return None  # nested attribute writes need ``set_value``; defer
+        element = None
+        load_default = field.load_default
+        callable_default = load_default is not missing and callable(load_default)
+        if not _has_field_processors(field) and not callable_default:
+            element = _build_load_element(field, stack)
+        if element is not None:
+            specs.append(
+                (
+                    False,
+                    data_key,
+                    out_key,
+                    load_default,
+                    bool(field.required),
+                    bool(field.allow_none),
+                    element,
+                )
+            )
+        else:
+            # Rust calls ``field.deserialize(value, attr_name, data)``.
+            specs.append((True, data_key, attr_name, out_key, field))
+
+    return (bool(many), unknown_code, frozenset(known_keys), specs)
+
+
+def build_load_deserializer(schema: Schema) -> typing.Any | None:
+    """Compile ``schema`` into a Rust ``LoadDeserializer``, or ``None`` to fall back.
+
+    The returned object's ``run(data, many)`` reproduces ``load`` for valid input
+    and raises :data:`AccelFallback` for anything off the happy path.
+    """
+    if not is_available():
+        return None
+    payload = _build_load_payload(schema, many=bool(schema.many), is_root=True)
+    if payload is None:
+        return None
+    assert _core is not None  # narrowed by is_available()
+    return _core.LoadDeserializer(payload, missing)
