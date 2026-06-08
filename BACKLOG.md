@@ -37,11 +37,13 @@ bottom within a phase.
 - [x] Equivalence tests: pass + fail inputs for each validator
 
 ### New field types
-- [ ] Native `Decimal` (dump + load)
-- [ ] Native `Dict`/`Mapping` (dump + load)
-- [ ] Native `Constant`
-- [ ] Share `Number` base coercion with Integer/Float
-- [ ] Equivalence tests for each new field type (valid + error)
+- [x] Native `Decimal` (dump + load)
+- [x] Native `Dict`/`Mapping` (dump + load) — plain dict-copy case
+- [x] Native `Constant`
+- [x] Share `Number` base coercion with Integer/Float — Decimal reuses the
+      field's own (`Number`-based) `_serialize`/`_deserialize` rather than
+      duplicating coercion in Rust
+- [x] Equivalence tests for each new field type (valid + error)
 
 ## Phase 2 — Fused JSON path
 

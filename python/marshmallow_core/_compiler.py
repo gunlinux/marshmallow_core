@@ -61,7 +61,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 2
+_EXPECTED_PROTOCOL = 3
 
 
 class _NoFallbackError(Exception):
@@ -83,6 +83,9 @@ _LIST = 5
 _UUID = 6
 _TEMPORAL = 7
 _ENUM = 8
+_DECIMAL = 9
+_DICT = 10
+_CONSTANT = 11
 
 # Load element tags (a distinct tag space from the dump tags above).
 _L_PASSTHROUGH = 0
@@ -94,6 +97,9 @@ _L_LIST = 5
 _L_ENUM = 6
 _L_UUID = 7
 _L_TEMPORAL = 8
+_L_DECIMAL = 9
+_L_DICT = 10
+_L_CONSTANT = 11
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -208,6 +214,22 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
         if inner_element is None:
             return None
         return (_ENUM, bool(field.by_value), inner_element)
+    if ftype is ma_fields.Decimal:
+        # Decimal formatting (quantize/places/rounding) is intrinsically Python;
+        # hand the field's own ``_serialize`` to the core (provably identical).
+        return (_DECIMAL, field._serialize)
+    if ftype is ma_fields.Dict:
+        # Only the plain dict-copy case (``dict(value)``) is native; per-key/value
+        # field serialization falls back to the callback path.
+        if (
+            field.key_field is None
+            and field.value_field is None
+            and field.mapping_type is dict
+        ):
+            return (_DICT,)
+        return None
+    if ftype is ma_fields.Constant:
+        return (_CONSTANT, field.constant)
     return None
 
 
@@ -395,6 +417,20 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
             return None
         internal_type = getattr(dt, field.OBJ_TYPE)
         return (_L_TEMPORAL, internal_type, func)
+    if ftype is ma_fields.Decimal:
+        # ``Decimal._deserialize`` (``_validated``) is intrinsically Python; hand
+        # it to the core, which turns any ``ValidationError`` into a fallback.
+        return (_L_DECIMAL, field._deserialize)
+    if ftype is ma_fields.Dict:
+        if (
+            field.key_field is None
+            and field.value_field is None
+            and field.mapping_type is dict
+        ):
+            return (_L_DICT,)
+        return None
+    if ftype is ma_fields.Constant:
+        return (_L_CONSTANT, field.constant)
     return None
 
 

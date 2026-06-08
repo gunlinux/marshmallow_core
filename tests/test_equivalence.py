@@ -11,6 +11,7 @@ valid, if redundant, equivalence check).
 """
 
 import datetime as dt
+import decimal
 import enum
 import uuid
 
@@ -696,6 +697,174 @@ def test_load_temporal_uuid_is_native():
     schema = LoadTemporalSchema()
     schema.load({"day": "2020-01-02"})  # trigger lazy build
     assert accel.is_available() == (vars(schema).get("_mc_load_deserializer") is not None)
+
+
+# ---- new native field types: Decimal / Dict / Constant -------------------
+
+
+class DecimalDumpSchema(Schema):
+    plain = fields.Decimal()
+    as_str = fields.Decimal(as_string=True)
+    placed = fields.Decimal(places=2)
+    placed_str = fields.Decimal(places=2, as_string=True)
+    nan_ok = fields.Decimal(allow_nan=True)
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {
+            "plain": decimal.Decimal("3.14159"),
+            "as_str": decimal.Decimal("2.5"),
+            "placed": decimal.Decimal("1.239"),
+            "placed_str": decimal.Decimal("9.005"),
+            "nan_ok": decimal.Decimal("1.0"),
+        },
+        {"plain": 5, "as_str": "2.50", "placed": 1.5},  # mixed input types
+        dict.fromkeys(["plain", "as_str", "placed", "placed_str", "nan_ok"]),  # None
+        {},  # all missing
+    ],
+)
+def test_dump_decimal_equivalence(obj, monkeypatch):
+    accelerated, pure = _dump_both(DecimalDumpSchema, obj, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+def test_dump_decimal_nan_equivalence(monkeypatch):
+    # ``NaN != NaN``, so compare structurally rather than with ``==``.
+    obj = {"nan_ok": decimal.Decimal("NaN")}
+    accelerated, pure = _dump_both(DecimalDumpSchema, obj, monkeypatch=monkeypatch)
+    assert accelerated["nan_ok"].is_nan() and pure["nan_ok"].is_nan()
+
+
+class DecimalLoadSchema(Schema):
+    plain = fields.Decimal()
+    placed = fields.Decimal(places=2)
+    nan_ok = fields.Decimal(allow_nan=True)
+    ranged = fields.Decimal(validate=validate.Range(min=0))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"plain": "3.14", "placed": "1.239", "ranged": "5"},
+        {"plain": 42},
+        {},  # all missing
+    ],
+)
+def test_load_decimal_valid_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(DecimalLoadSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+def test_load_decimal_nan_equivalence(monkeypatch):
+    accelerated, pure = _load_both(
+        DecimalLoadSchema, {"nan_ok": "NaN"}, monkeypatch=monkeypatch
+    )
+    assert accelerated["nan_ok"].is_nan() and pure["nan_ok"].is_nan()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"plain": "not-a-number"},  # InvalidOperation -> invalid
+        {"plain": "NaN"},  # special (allow_nan False)
+        {"plain": True},  # bool rejected
+        {"ranged": "-1"},  # native validator failure
+    ],
+)
+def test_load_decimal_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        DecimalLoadSchema().load(data)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        DecimalLoadSchema().load(data)
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_decimal_is_native():
+    d = DecimalDumpSchema()
+    d.dump({"plain": decimal.Decimal("1")})
+    ld = DecimalLoadSchema()
+    ld.load({"plain": "1"})
+    if accel.is_available():
+        assert vars(d).get("_mc_dump_serializer") is not None
+        assert vars(ld).get("_mc_load_deserializer") is not None
+
+
+class DictSchema(Schema):
+    meta = fields.Dict()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [{"a": 1, "b": [1, 2], "c": {"nested": True}}, {}, None],
+)
+def test_dump_dict_equivalence(value, monkeypatch):
+    accelerated, pure = _dump_both(DictSchema, {"meta": value}, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "value",
+    [{"a": 1, "b": "x"}, {}],
+)
+def test_load_dict_equivalence(value, monkeypatch):
+    accelerated, pure = _load_both(DictSchema, {"meta": value}, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+def test_load_dict_non_mapping_error_matches_python(monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        DictSchema().load({"meta": [1, 2, 3]})  # not a Mapping
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        DictSchema().load({"meta": [1, 2, 3]})
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_dict_with_value_field_falls_back(monkeypatch):
+    """A Dict with a value field uses the callback path (still equivalent)."""
+
+    class S(Schema):
+        m = fields.Dict(values=fields.Integer())
+
+    accelerated, pure = _dump_both(S, {"m": {"a": 1}}, monkeypatch=monkeypatch)
+    assert accelerated == pure
+    acc_load, pure_load = _load_both(S, {"m": {"a": "5"}}, monkeypatch=monkeypatch)
+    assert acc_load == pure_load == {"m": {"a": 5}}
+
+
+class ConstantSchema(Schema):
+    ver = fields.Constant("v1")
+    none_const = fields.Constant(None)
+    num = fields.Integer()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"num": 7},
+        {"ver": "ignored", "none_const": "ignored", "num": 1},  # input ignored
+        {},
+    ],
+)
+def test_dump_constant_equivalence(data, monkeypatch):
+    accelerated, pure = _dump_both(ConstantSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"num": 7},
+        {"ver": "ignored", "num": 1},
+        {},
+    ],
+)
+def test_load_constant_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(ConstantSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
 
 
 # ---- partial=True acceleration -------------------------------------------

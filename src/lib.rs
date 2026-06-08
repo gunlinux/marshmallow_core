@@ -41,6 +41,19 @@ struct Ctx {
     missing: Py<PyAny>,
     int_fn: Py<PyAny>,
     float_fn: Py<PyAny>,
+    dict_fn: Py<PyAny>,
+}
+
+impl Ctx {
+    fn new(py: Python<'_>, missing: Py<PyAny>) -> PyResult<Self> {
+        let builtins = py.import("builtins")?;
+        Ok(Ctx {
+            missing,
+            int_fn: builtins.getattr("int")?.unbind(),
+            float_fn: builtins.getattr("float")?.unbind(),
+            dict_fn: builtins.getattr("dict")?.unbind(),
+        })
+    }
 }
 
 /// A value -> serialized-output transform (mirrors a field's ``_serialize``).
@@ -62,6 +75,13 @@ enum Element {
         by_value: bool,
         inner: Box<Element>,
     },
+    /// Decimal: defer to the field's own ``_serialize`` (intrinsically Python
+    /// ``decimal`` formatting), provably identical to the callback path.
+    Decimal { serialize: Py<PyAny> },
+    /// Dict (no key/value fields): ``dict(value)``.
+    Dict,
+    /// Constant: always returns the held constant, ignoring the input value.
+    Constant { constant: Py<PyAny> },
 }
 
 enum FieldSpec {
@@ -96,12 +116,7 @@ impl DumpSerializer {
     /// ``payload`` is ``(accessor, [field_spec, ...])``; see ``marshmallow._accel``.
     #[new]
     fn new(py: Python<'_>, payload: &Bound<'_, PyAny>, missing: Py<PyAny>) -> PyResult<Self> {
-        let builtins = py.import("builtins")?;
-        let ctx = Ctx {
-            missing,
-            int_fn: builtins.getattr("int")?.unbind(),
-            float_fn: builtins.getattr("float")?.unbind(),
-        };
+        let ctx = Ctx::new(py, missing)?;
         let root = parse_serializer(py, payload)?;
         Ok(DumpSerializer { ctx, root })
     }
@@ -254,6 +269,20 @@ impl Element {
                 };
                 inner.apply(ctx, &member)
             }
+            Element::Decimal { serialize } => {
+                // ``_serialize`` itself returns ``None`` for ``None``; calling it
+                // is byte-for-byte the callback path's ``_serialize``.
+                serialize
+                    .bind(py)
+                    .call1((value, py.None(), py.None()))
+            }
+            Element::Dict => {
+                if value.is_none() {
+                    return Ok(py.None().into_bound(py));
+                }
+                ctx.dict_fn.bind(py).call1((value,)) // ``self.mapping_type(value)``
+            }
+            Element::Constant { constant } => Ok(constant.bind(py).clone()),
         }
     }
 }
@@ -348,6 +377,15 @@ fn parse_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<Element> {
                 inner: Box::new(inner),
             })
         }
+        9 => Ok(Element::Decimal {
+            // (9, bound _serialize)
+            serialize: t.get_item(1)?.unbind(),
+        }),
+        10 => Ok(Element::Dict), // (10,)
+        11 => Ok(Element::Constant {
+            // (11, constant)
+            constant: t.get_item(1)?.unbind(),
+        }),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown element tag {other}"
         ))),
@@ -462,6 +500,14 @@ enum LoadElement {
         internal_type: Py<PyAny>,
         func: Py<PyAny>,
     },
+    /// Decimal: defer to the field's own ``_deserialize`` (``_validated``);
+    /// any ``ValidationError`` becomes ``AccelFallback``.
+    Decimal { deserialize: Py<PyAny> },
+    /// Dict (no key/value fields): copy a dict input via ``dict(value)``; a
+    /// non-dict input defers (Python decides Mapping-or-``invalid``).
+    Dict,
+    /// Constant: always returns the held constant, ignoring the input value.
+    Constant { constant: Py<PyAny> },
 }
 
 /// A recognized ``marshmallow.validate`` validator, modelled to reproduce only
@@ -523,12 +569,7 @@ impl LoadDeserializer {
     /// ``payload`` is ``(many, unknown, known_keys, [field_spec, ...])``.
     #[new]
     fn new(py: Python<'_>, payload: &Bound<'_, PyAny>, missing: Py<PyAny>) -> PyResult<Self> {
-        let builtins = py.import("builtins")?;
-        let ctx = Ctx {
-            missing,
-            int_fn: builtins.getattr("int")?.unbind(),
-            float_fn: builtins.getattr("float")?.unbind(),
-        };
+        let ctx = Ctx::new(py, missing)?;
         let root = parse_load_serializer(py, payload)?;
         Ok(LoadDeserializer { ctx, root })
     }
@@ -861,6 +902,18 @@ impl LoadElement {
                 }
                 func.bind(py).call1((value,)).map_err(|e| to_fallback(py, e))
             }
+            LoadElement::Decimal { deserialize } => deserialize
+                .bind(py)
+                .call1((value, py.None(), py.None()))
+                .map_err(|e| to_fallback(py, e)),
+            LoadElement::Dict => {
+                if value.is_instance_of::<PyDict>() {
+                    ctx.dict_fn.bind(py).call1((value,))
+                } else {
+                    Err(fallback()) // non-dict: defer (Mapping check / ``invalid``)
+                }
+            }
+            LoadElement::Constant { constant } => Ok(constant.bind(py).clone()),
         }
     }
 }
@@ -1017,6 +1070,15 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
                 func: t.get_item(2)?.unbind(),
             })
         }
+        9 => Ok(LoadElement::Decimal {
+            // (9, bound _deserialize)
+            deserialize: t.get_item(1)?.unbind(),
+        }),
+        10 => Ok(LoadElement::Dict), // (10,)
+        11 => Ok(LoadElement::Constant {
+            // (11, constant)
+            constant: t.get_item(1)?.unbind(),
+        }),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown load element tag {other}"
         ))),
@@ -1027,7 +1089,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {

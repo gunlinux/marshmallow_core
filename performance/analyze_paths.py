@@ -31,6 +31,9 @@ _DUMP_KIND = {
     _compiler._UUID: "uuid",
     _compiler._TEMPORAL: "temporal",
     _compiler._ENUM: "enum",
+    _compiler._DECIMAL: "decimal",
+    _compiler._DICT: "dict",
+    _compiler._CONSTANT: "constant",
 }
 _LOAD_KIND = {
     _compiler._L_PASSTHROUGH: "passthrough",
@@ -42,6 +45,9 @@ _LOAD_KIND = {
     _compiler._L_ENUM: "enum",
     _compiler._L_UUID: "uuid",
     _compiler._L_TEMPORAL: "temporal",
+    _compiler._L_DECIMAL: "decimal",
+    _compiler._L_DICT: "dict",
+    _compiler._L_CONSTANT: "constant",
 }
 
 
