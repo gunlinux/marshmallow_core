@@ -464,6 +464,28 @@ enum LoadElement {
     },
 }
 
+/// A recognized ``marshmallow.validate`` validator, modelled to reproduce only
+/// its *pass/fail decision* (mirrors `marshmallow_core._compiler._build_validator`).
+/// On failure the field raises ``AccelFallback`` and Python re-runs the validator
+/// to emit the exact (possibly custom) error message.
+enum Validator {
+    /// ``Range``: fail if below ``min`` or above ``max`` (inclusivity per flag).
+    Range {
+        min: Option<Py<PyAny>>,
+        max: Option<Py<PyAny>>,
+        min_inclusive: bool,
+        max_inclusive: bool,
+    },
+    /// ``Length``: fail unless ``len(value)`` satisfies equal / min / max.
+    Length {
+        min: Option<i64>,
+        max: Option<i64>,
+        equal: Option<i64>,
+    },
+    /// ``OneOf``: fail unless ``value in choices``.
+    OneOf { choices: Py<PyAny> },
+}
+
 enum LoadFieldSpec {
     Native {
         data_key: Py<PyString>, // key read from the input mapping
@@ -472,6 +494,7 @@ enum LoadFieldSpec {
         required: bool,
         allow_none: bool,
         element: LoadElement,
+        validators: Vec<Validator>,
     },
     Callback {
         data_key: Py<PyString>,
@@ -571,6 +594,7 @@ impl LoadSerializer {
                     required,
                     allow_none,
                     element,
+                    validators,
                 } => {
                     let raw = data.get_item(data_key.bind(py))?;
                     let Some(value) = raw else {
@@ -595,6 +619,16 @@ impl LoadSerializer {
                         return Err(fallback()); // ``null`` error
                     }
                     let result = element.apply(ctx, &value, partial)?;
+                    // Validators run on the deserialized value (mirrors
+                    // ``Field._validate(output)``); any failure or error defers
+                    // to Python for the exact ``ValidationError`` message.
+                    for validator in validators {
+                        match validator.check(&result) {
+                            Ok(true) => {}
+                            Ok(false) => return Err(fallback()),
+                            Err(e) => return Err(to_fallback(py, e)),
+                        }
+                    }
                     out.set_item(out_key.bind(py), result)?;
                 }
                 LoadFieldSpec::Callback {
@@ -648,6 +682,65 @@ impl LoadSerializer {
             }
         }
         Ok(out)
+    }
+}
+
+impl Validator {
+    /// Return ``Ok(true)`` if ``value`` passes, ``Ok(false)`` if it fails (the
+    /// caller then raises ``AccelFallback``). A comparison/``len``/``in`` that
+    /// itself raises is propagated as ``Err`` and turned into a fallback too.
+    fn check(&self, value: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let py = value.py();
+        match self {
+            Validator::Range {
+                min,
+                max,
+                min_inclusive,
+                max_inclusive,
+            } => {
+                if let Some(m) = min {
+                    let m = m.bind(py);
+                    let below = if *min_inclusive {
+                        value.lt(m)?
+                    } else {
+                        value.le(m)?
+                    };
+                    if below {
+                        return Ok(false);
+                    }
+                }
+                if let Some(m) = max {
+                    let m = m.bind(py);
+                    let above = if *max_inclusive {
+                        value.gt(m)?
+                    } else {
+                        value.ge(m)?
+                    };
+                    if above {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Validator::Length { min, max, equal } => {
+                let length = value.len()? as i64;
+                if let Some(e) = equal {
+                    return Ok(length == *e);
+                }
+                if let Some(m) = min {
+                    if length < *m {
+                        return Ok(false);
+                    }
+                }
+                if let Some(m) = max {
+                    if length > *m {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Validator::OneOf { choices } => choices.bind(py).contains(value),
+        }
     }
 }
 
@@ -808,7 +901,13 @@ fn parse_load_field_spec(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Lo
             field: t.get_item(4)?.unbind(),
         })
     } else {
-        // (False, data_key, out_key, load_default, required, allow_none, element)
+        // (False, data_key, out_key, load_default, required, allow_none,
+        //  element, [validator, ...])
+        let validators_list = t.get_item(7)?.cast_into::<PyList>()?;
+        let mut validators = Vec::with_capacity(validators_list.len());
+        for item in validators_list.iter() {
+            validators.push(parse_validator(py, &item)?);
+        }
         Ok(LoadFieldSpec::Native {
             data_key: t.get_item(1)?.cast_into::<PyString>()?.unbind(),
             out_key: t.get_item(2)?.cast_into::<PyString>()?.unbind(),
@@ -816,7 +915,60 @@ fn parse_load_field_spec(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Lo
             required: t.get_item(4)?.extract()?,
             allow_none: t.get_item(5)?.extract()?,
             element: parse_load_element(py, &t.get_item(6)?)?,
+            validators,
         })
+    }
+}
+
+/// Parse a validator spec tuple (see ``_compiler._build_validator``).
+fn parse_validator(_py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<Validator> {
+    let t = v.cast::<PyTuple>()?;
+    let tag: u8 = t.get_item(0)?.extract()?;
+    match tag {
+        0 => {
+            // (0, min_or_None, max_or_None, min_inclusive, max_inclusive)
+            let min_obj = t.get_item(1)?;
+            let max_obj = t.get_item(2)?;
+            Ok(Validator::Range {
+                min: if min_obj.is_none() {
+                    None
+                } else {
+                    Some(min_obj.unbind())
+                },
+                max: if max_obj.is_none() {
+                    None
+                } else {
+                    Some(max_obj.unbind())
+                },
+                min_inclusive: t.get_item(3)?.extract()?,
+                max_inclusive: t.get_item(4)?.extract()?,
+            })
+        }
+        1 => {
+            // (1, min_or_None, max_or_None, equal_or_None)
+            let parse_opt = |i: usize| -> PyResult<Option<i64>> {
+                let o = t.get_item(i)?;
+                if o.is_none() {
+                    Ok(None)
+                } else {
+                    Ok(Some(o.extract()?))
+                }
+            };
+            Ok(Validator::Length {
+                min: parse_opt(1)?,
+                max: parse_opt(2)?,
+                equal: parse_opt(3)?,
+            })
+        }
+        2 => {
+            // (2, choices)
+            Ok(Validator::OneOf {
+                choices: t.get_item(1)?.unbind(),
+            })
+        }
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown validator tag {other}"
+        ))),
     }
 }
 
@@ -875,7 +1027,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {

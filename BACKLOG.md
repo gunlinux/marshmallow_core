@@ -5,16 +5,16 @@ bottom within a phase.
 
 ## Phase 0 — Measurement
 
-- [ ] Create `performance/` directory
-- [ ] Port `benchmark.py` from the fork; drive it via `install()`/`uninstall()`
-- [ ] Add flat-scalar schema benchmark case
-- [ ] Add nested schema benchmark case
-- [ ] Add list-heavy schema benchmark case
-- [ ] Add validator-heavy schema benchmark case
-- [ ] Benchmark `dump`, `load`, `dumps`, `loads` for each case
-- [ ] Print a stock-vs-core comparison table
-- [ ] Write a coverage probe: report per-field native vs callback for a schema
-- [ ] Document how to run the benchmark in README
+- [x] Create `performance/` directory
+- [x] Port `benchmark.py` from the fork; drive it via `install()`/`uninstall()`
+- [x] Add flat-scalar schema benchmark case
+- [x] Add nested schema benchmark case
+- [x] Add list-heavy schema benchmark case
+- [x] Add validator-heavy schema benchmark case
+- [x] Benchmark `dump`, `load`, `dumps`, `loads` for each case
+- [x] Print a stock-vs-core comparison table
+- [x] Write a coverage probe: report per-field native vs callback for a schema
+- [x] Document how to run the benchmark in README
 
 ## Phase 1 — Coverage gaps
 
@@ -29,12 +29,12 @@ bottom within a phase.
 - [ ] Add equivalence tests for pre_load + post_load + validates schemas
 
 ### Native validators
-- [ ] Add a validator tag space (compiler + lib.rs)
-- [ ] Native `Range` validator
-- [ ] Native `Length` validator
-- [ ] Native `OneOf` validator
-- [ ] Compile only recognized validators; fall back on any other
-- [ ] Equivalence tests: pass + fail inputs for each validator
+- [x] Add a validator tag space (compiler + lib.rs)
+- [x] Native `Range` validator
+- [x] Native `Length` validator
+- [x] Native `OneOf` validator
+- [x] Compile only recognized validators; fall back on any other
+- [x] Equivalence tests: pass + fail inputs for each validator
 
 ### New field types
 - [ ] Native `Decimal` (dump + load)

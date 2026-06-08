@@ -38,6 +38,7 @@ import typing
 import uuid
 
 from marshmallow import fields as ma_fields
+from marshmallow import validate as ma_validate
 from marshmallow.constants import EXCLUDE, RAISE, missing
 from marshmallow.decorators import (
     POST_DUMP,
@@ -60,7 +61,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 1
+_EXPECTED_PROTOCOL = 2
 
 
 class _NoFallbackError(Exception):
@@ -93,6 +94,16 @@ _L_LIST = 5
 _L_ENUM = 6
 _L_UUID = 7
 _L_TEMPORAL = 8
+
+# Native load validator tags (a distinct tag space; see ``_build_validator``).
+_V_RANGE = 0
+_V_LENGTH = 1
+_V_ONEOF = 2
+
+# ``OneOf`` is only compiled when its ``choices`` is one of these stable, re-
+# iterable containers; a consumable iterator would behave differently on the
+# second ``load``, so it stays on the (always-correct) callback path.
+_ONEOF_CONTAINERS = (list, tuple, set, frozenset, dict, range, str)
 
 # Unknown-key handling codes passed to the Rust load core.
 _UNKNOWN_CODES = {RAISE: 0, EXCLUDE: 1}
@@ -265,8 +276,68 @@ def build_dump_serializer(schema: Schema) -> typing.Any | None:
 
 
 def _has_field_processors(field: typing.Any) -> bool:
-    """True if a field has validators or its own pre/post-load processors."""
+    """True if a field has validators or its own pre/post-load processors.
+
+    Used for *inner* fields (e.g. a ``List``'s element) whose ``deserialize`` the
+    core would have to call to honour validators/hooks; those still force the
+    enclosing field onto the callback path. The *top-level* field path compiles
+    recognized validators natively (see :func:`_compile_validators`) and only
+    defers for ``pre_load``/``post_load``.
+    """
     return bool(field.validators or field.pre_load or field.post_load)
+
+
+def _has_load_pre_post(field: typing.Any) -> bool:
+    """True if a field has its own ``pre_load``/``post_load`` processors.
+
+    Unlike validators (which run *after* ``_deserialize`` and only decide
+    pass/fail, so the core can model them natively and fall back on failure),
+    field-level ``pre_load``/``post_load`` transform the value and must run in
+    Python — such a field always stays a callback.
+    """
+    return bool(field.pre_load or field.post_load)
+
+
+def _build_validator(validator: typing.Any) -> tuple | None:
+    """Compile a single ``validate`` validator into a spec tuple, or ``None``.
+
+    Only ``Range``/``Length``/``OneOf`` (exact types) are modelled. The native
+    core reproduces only each validator's *pass/fail decision*; on failure it
+    raises :data:`AccelFallback` so Python re-runs the validator and emits the
+    exact (possibly custom) error message. Custom messages therefore need no
+    modelling here.
+    """
+    vtype = type(validator)
+    if vtype is ma_validate.Range:
+        return (
+            _V_RANGE,
+            validator.min,
+            validator.max,
+            bool(validator.min_inclusive),
+            bool(validator.max_inclusive),
+        )
+    if vtype is ma_validate.Length:
+        return (_V_LENGTH, validator.min, validator.max, validator.equal)
+    if vtype is ma_validate.OneOf:
+        if not isinstance(validator.choices, _ONEOF_CONTAINERS):
+            return None  # consumable/odd choices -> defer to Python
+        return (_V_ONEOF, validator.choices)
+    return None
+
+
+def _compile_validators(validators: typing.Any) -> list[tuple] | None:
+    """Compile a field's validator list, or ``None`` if any is unrecognized.
+
+    Returns an empty list for a field with no validators. ``None`` means the
+    field must use the callback path (Python runs the unrecognized validator).
+    """
+    specs = []
+    for validator in validators:
+        spec = _build_validator(validator)
+        if spec is None:
+            return None
+        specs.append(spec)
+    return specs
 
 
 def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
@@ -371,10 +442,15 @@ def _build_load_payload(
         if "." in out_key:
             return None  # nested attribute writes need ``set_value``; defer
         element = None
+        validators: list[tuple] = []
         load_default = field.load_default
         callable_default = load_default is not missing and callable(load_default)
-        if not _has_field_processors(field) and not callable_default:
-            element = _build_load_element(field, stack)
+        if not _has_load_pre_post(field) and not callable_default:
+            # Recognized validators compile natively; any other defers the field.
+            compiled = _compile_validators(field.validators)
+            if compiled is not None:
+                element = _build_load_element(field, stack)
+                validators = compiled
         if element is not None:
             specs.append(
                 (
@@ -385,6 +461,7 @@ def _build_load_payload(
                     bool(field.required),
                     bool(field.allow_none),
                     element,
+                    validators,
                 )
             )
         else:

@@ -483,6 +483,109 @@ def test_load_validator_field_falls_back(monkeypatch):
         S().load({"age": -1})
 
 
+# ---- native validators (Range / Length / OneOf) --------------------------
+
+
+class ValidatorSchema(Schema):
+    age = fields.Integer(validate=validate.Range(min=0, max=150))
+    name = fields.String(validate=validate.Length(min=1, max=8))
+    code = fields.String(validate=validate.Length(equal=3))
+    role = fields.String(validate=validate.OneOf(["admin", "user", "guest"]))
+    score = fields.Float(
+        validate=validate.Range(min=0.0, max=100.0, max_inclusive=False)
+    )
+    tags = fields.List(fields.Integer(), validate=validate.Length(min=1))
+    # two validators on one field -> both must pass
+    pin = fields.Integer(validate=[validate.Range(min=1000), validate.Range(max=9999)])
+
+
+_VALIDATOR_OK = {
+    "age": 30,
+    "name": "Foo",
+    "code": "abc",
+    "role": "user",
+    "score": 50.0,
+    "tags": [1, 2],
+    "pin": 1234,
+}
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        _VALIDATOR_OK,
+        {"age": 0, "score": 0.0},  # inclusive min boundary OK
+        {"name": "12345678", "code": "xyz"},  # max-length boundary OK
+        {},  # nothing present, nothing required
+    ],
+)
+def test_load_validators_valid_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(ValidatorSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"age": -1},  # below Range min
+        {"age": 151},  # above Range max
+        {"name": ""},  # below Length min
+        {"name": "123456789"},  # above Length max
+        {"code": "ab"},  # not equal length
+        {"role": "root"},  # not in OneOf choices
+        {"score": 100.0},  # max not inclusive -> fails at the bound
+        {"tags": []},  # list Length min fails
+        {"pin": 999},  # first Range fails
+        {"pin": 10000},  # second Range fails
+    ],
+)
+def test_load_validators_error_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        ValidatorSchema().load(data)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        ValidatorSchema().load(data)
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_validators_is_native():
+    schema = ValidatorSchema()
+    schema.load({"age": 1})  # trigger lazy build
+    assert accel.is_available() == (
+        vars(schema).get("_mc_load_deserializer") is not None
+    )
+
+
+def test_load_unrecognized_validator_falls_back(monkeypatch):
+    """A validator the core does not model keeps the field on the Python path."""
+
+    def not_thirteen(value):
+        if value == 13:
+            raise ValidationError("unlucky")
+
+    class S(Schema):
+        x = fields.Integer(validate=not_thirteen)
+
+    accelerated, pure = _load_both(S, {"x": 5}, monkeypatch=monkeypatch)
+    assert accelerated == pure == {"x": 5}
+    with pytest.raises(ValidationError):
+        S().load({"x": 13})
+
+
+def test_load_oneof_custom_choices_equivalence(monkeypatch):
+    """OneOf over a set/tuple/range still matches stock."""
+
+    class S(Schema):
+        a = fields.String(validate=validate.OneOf({"x", "y"}))
+        b = fields.Integer(validate=validate.OneOf(range(0, 10)))
+        c = fields.Integer(validate=validate.OneOf((1, 2, 3)))
+
+    accelerated, pure = _load_both(
+        S, {"a": "x", "b": 5, "c": 2}, monkeypatch=monkeypatch
+    )
+    assert accelerated == pure
+
+
 def test_load_post_load_hook_runs(monkeypatch):
     class S(Schema):
         i = fields.Integer()

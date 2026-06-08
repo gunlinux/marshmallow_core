@@ -72,10 +72,20 @@ def _dump_field_report(schema: Schema) -> list[FieldReport]:
 def _load_field_report(schema: Schema) -> list[FieldReport]:
     out = []
     for attr_name, field in schema.load_fields.items():
-        element = _compiler._build_load_element(field, ())
-        # Mirror the per-field guards in ``_build_load_payload``.
-        blocked = _compiler._has_field_processors(field)
-        if element is None or blocked:
+        # Mirror the per-field guards in ``_build_load_payload``: pre/post-load
+        # always defers; validators defer only if any is unrecognized.
+        load_default = field.load_default
+        callable_default = load_default is not _compiler.missing and callable(
+            load_default
+        )
+        element = None
+        if (
+            not _compiler._has_load_pre_post(field)
+            and not callable_default
+            and _compiler._compile_validators(field.validators) is not None
+        ):
+            element = _compiler._build_load_element(field, ())
+        if element is None:
             out.append(FieldReport(attr_name, False, "callback"))
         else:
             out.append(FieldReport(attr_name, True, _LOAD_KIND.get(element[0], "?")))
