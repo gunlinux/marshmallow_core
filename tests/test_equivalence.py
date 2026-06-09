@@ -900,6 +900,26 @@ def test_load_pluck_is_native():
     assert element is not None and element[0] == _compiler._L_PLUCK
 
 
+@pytest.mark.parametrize(
+    ("factory", "obj"),
+    [
+        (LoadPluckSchema, {"artist": {"id": 42, "name": "x"}}),
+        (LoadPluckManySchema, {"artists": [{"id": 1}, {"id": 2}, {"id": 3}]}),
+        (LoadPluckManySchema, {"artists": []}),
+    ],
+)
+def test_dump_pluck_equivalence(factory, obj, monkeypatch):
+    accelerated, pure = _dump_both(factory, obj, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+def test_dump_pluck_is_native():
+    from marshmallow_core import _compiler
+
+    element = _compiler._build_element(fields.Pluck(_ArtistSchema, "id"), ())
+    assert element is not None and element[0] == _compiler._PLUCK
+
+
 class TimeDeltaSchema(Schema):
     secs = fields.TimeDelta()  # precision="seconds"
     millis = fields.TimeDelta(precision="milliseconds")

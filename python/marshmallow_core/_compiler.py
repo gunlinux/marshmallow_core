@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 12
+_EXPECTED_PROTOCOL = 13
 
 
 class _NoFallbackError(Exception):
@@ -93,6 +93,7 @@ _CONSTANT = 11
 _TIMEDELTA = 12
 _DICT_TYPED = 13
 _TUPLE = 14
+_PLUCK = 15
 
 # Load element tags (a distinct tag space from the dump tags above).
 _L_PASSTHROUGH = 0
@@ -213,6 +214,22 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
     kind = _SCALAR_KINDS.get(ftype)
     if kind is not None:
         return (kind, bool(getattr(field, "as_string", False)))
+    if ftype is ma_fields.Pluck:
+        # ``Pluck._serialize`` = ``Nested._serialize`` then ``ret[data_key]``
+        # (``utils.pluck`` per item when ``many``). Build the inner dump payload
+        # and extract the plucked key in the core.
+        inner_schema = field.schema
+        if (
+            inner_schema._hooks[PRE_DUMP]
+            or inner_schema._hooks[POST_DUMP]
+            or _overrides_native_dump(inner_schema)
+        ):
+            return None
+        payload = _build_payload(inner_schema, stack)
+        if payload is None:
+            return None
+        many = bool(inner_schema.many or field.many)
+        return (_PLUCK, payload, field._field_data_key, many)
     if ftype is ma_fields.Nested:
         # ``field.schema`` resolves the inner schema (applying only/exclude/many).
         inner_schema = field.schema

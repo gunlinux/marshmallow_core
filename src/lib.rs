@@ -94,6 +94,13 @@ enum Element {
     /// Tuple: serialize each position; defers (dump fallback) on a length
     /// mismatch so Python raises the exact ``zip(strict=True)`` error.
     Tuple(Vec<Element>),
+    /// Pluck: dump via the inner schema, then extract ``data_key`` (``utils.pluck``
+    /// per item when ``many``).
+    Pluck {
+        serializer: Box<Serializer>,
+        data_key: Py<PyString>,
+        many: bool,
+    },
 }
 
 enum FieldSpec {
@@ -545,6 +552,27 @@ impl Element {
                 }
                 Ok(PyTuple::new(py, items)?.into_any())
             }
+            Element::Pluck {
+                serializer,
+                data_key,
+                many,
+            } => {
+                if value.is_none() {
+                    return Ok(py.None().into_bound(py));
+                }
+                let dk = data_key.bind(py);
+                let ret = serializer.run(ctx, value, *many)?;
+                if *many {
+                    // ``utils.pluck(ret, key)`` == ``[d[key] for d in ret]``.
+                    let out = PyList::empty(py);
+                    for d in ret.try_iter()? {
+                        out.append(d?.get_item(dk)?)?;
+                    }
+                    Ok(out.into_any())
+                } else {
+                    ret.get_item(dk) // ``ret[data_key]``
+                }
+            }
         }
     }
 
@@ -713,6 +741,15 @@ fn parse_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<Element> {
                 elements.push(parse_element(py, &item)?);
             }
             Ok(Element::Tuple(elements))
+        }
+        15 => {
+            // (15, nested_payload, data_key, many)
+            let serializer = parse_serializer(py, &t.get_item(1)?)?;
+            Ok(Element::Pluck {
+                serializer: Box::new(serializer),
+                data_key: t.get_item(2)?.cast_into::<PyString>()?.unbind(),
+                many: t.get_item(3)?.extract()?,
+            })
         }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown element tag {other}"
@@ -1768,7 +1805,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 12;
+const PROTOCOL_VERSION: u32 = 13;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
