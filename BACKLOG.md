@@ -80,8 +80,15 @@ raw-Rust). Ordered by measured ROI. The first item of that pass —
 **native `Boolean` load** — is already done (list load 28.7µs → 9.5µs,
 8.0x → 23.8x; it now matches list dump). The rest, top to bottom:
 
+**Status: Phase 4 complete.** All tiers landed. The composite fields
+(typed `Dict`, `Tuple`, `Pluck`) are accelerated on **load only** — the dump
+core has no `AccelFallback` and these iterate arbitrary mappings / use
+`zip(strict=True)`, so a provably-identical dump can't be guaranteed; their
+dump stays on the callback path (a possible future item if the dump core grows
+a fallback). Post-Phase-4 numbers are in [performance/RESULTS.md](performance/RESULTS.md).
+
 ### Tier 1 — hot-path Rust micro-opts (collections; highest absolute time)
-- [ ] Skip redundant scalar coercion when the input is already the exact target
+- [x] Skip redundant scalar coercion when the input is already the exact target
       type. `int(x)`/`float(x)` for an *exact* `int`/`float` return `x`
       unchanged, so short-circuit `LoadElement::Int`/`Float` (and dump
       `Element::Int`/`Float`) to `value.clone()` when
@@ -90,43 +97,43 @@ raw-Rust). Ordered by measured ROI. The first item of that pass —
       `json.loads` already yields real ints/floats. Verify identity equivalence
       (int subclasses are excluded by `is_exact_instance_of`; bools already
       rejected before this point).
-- [ ] Skip `Partial::derive` per field for non-recursive elements. It is called
+- [x] Skip `Partial::derive` per field for non-recursive elements. It is called
       on every field in `run_one`, but only `Nested`/`List`/callback consume the
       sub-partial; for scalar `Native` fields it is a wasted call + match. Gate it
       on element kind (or on `partial` being non-`None`).
-- [ ] Re-profile the post-Boolean list-load and record the next hot spot in this
+- [x] Re-profile the post-Boolean list-load and record the next hot spot in this
       file *before* writing more micro-opts — don't guess twice.
 
 ### Tier 2 — shrink the fixed per-call Python overhead (small/flat schemas)
 The `dump`/`load` entry prologue is ~20–30% of a small-schema call (flat load:
 0.63µs raw Rust, 0.89µs through `_do_load`). It is constant per call, so it only
 shows up when the payload is tiny — but those are exactly the tight-loop cases.
-- [ ] Cache the load dispatch decision per instance alongside the deserializer:
+- [x] Cache the load dispatch decision per instance alongside the deserializer:
       precompute `_core_partial(self.partial)` and the has-hooks branch so the
       common `partial=None, unknown=default` call skips `_partial_is_supported` /
       `_has_load_hooks` / `_core_partial`.
-- [ ] Store the hook-aware vs direct runner as the cached object (chosen once at
+- [x] Store the hook-aware vs direct runner as the cached object (chosen once at
       compile) so `_has_load_hooks` is not consulted on every load.
-- [ ] Trim the `_patched_serialize` / `_patched_do_load` prologue (avoid
+- [x] Trim the `_patched_serialize` / `_patched_do_load` prologue (avoid
       re-reading `self.many` / `self.unknown` once args are normalized).
-- [ ] Re-benchmark flat dump/load to confirm the fixed-overhead drop.
+- [x] Re-benchmark flat dump/load to confirm the fixed-overhead drop.
 
 ### Tier 3 — widen native load coverage (turn remaining callbacks native)
-- [ ] Run `performance/analyze_paths` over a realistic API schema; list every
+- [x] Run `performance/analyze_paths` over a realistic API schema; list every
       field still on the callback path (start the audit here, then pick targets).
-- [ ] Native `Integer(strict=True)` (`numbers.Integral` check).
-- [ ] Native typed `Dict` (key field + value field applied per entry) — currently
+- [x] Native `Integer(strict=True)` (`numbers.Integral` check).
+- [x] Native typed `Dict` (key field + value field applied per entry) — currently
       only the untyped dict-copy case is native.
-- [ ] Native `Tuple` (fixed-length tuple of fields).
-- [ ] Native `Pluck` (the `Nested` subclass that plucks one field) — common in
+- [x] Native `Tuple` (fixed-length tuple of fields).
+- [x] Native `Pluck` (the `Nested` subclass that plucks one field) — common in
       API schemas.
-- [ ] Native `TimeDelta`.
-- [ ] Equivalence tests (valid + error) for each.
+- [x] Native `TimeDelta`.
+- [x] Equivalence tests (valid + error) for each.
 
 ### Tier 4 — measurement & guardrails
-- [ ] Add an API-response-shaped benchmark case (mixed bool/str/int/nested/list)
+- [x] Add an API-response-shaped benchmark case (mixed bool/str/int/nested/list)
       so real-world regressions are visible, not just the four synthetic shapes.
-- [ ] Record the per-case speedup numbers (in the benchmark docstring or a
+- [x] Record the per-case speedup numbers (in the benchmark docstring or a
       committed results file) so a regression in a later change is obvious.
 
 ### Structural ceilings — analyzed, *not* worth accelerating
