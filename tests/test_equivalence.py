@@ -826,6 +826,26 @@ def test_load_tuple_is_native():
     assert element is not None and element[0] == _compiler._L_TUPLE
 
 
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {"row": ("a", 1, 2.5)},
+        {"row": ["x", 7, 3.0]},  # list input dumps the same
+    ],
+)
+def test_dump_tuple_equivalence(obj, monkeypatch):
+    accelerated, pure = _dump_both(LoadTupleSchema, obj, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+def test_dump_tuple_is_native():
+    from marshmallow_core import _compiler
+
+    field = fields.Tuple((fields.String(), fields.Integer()))
+    element = _compiler._build_element(field, ())
+    assert element is not None and element[0] == _compiler._TUPLE
+
+
 class _ArtistSchema(Schema):
     id = fields.Integer()
     name = fields.String()

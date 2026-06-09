@@ -91,6 +91,9 @@ enum Element {
     /// TimeDelta: defer to the field's own ``_serialize`` (precision-sensitive
     /// timedelta -> float), provably identical to the callback path.
     TimeDelta { serialize: Py<PyAny> },
+    /// Tuple: serialize each position; defers (dump fallback) on a length
+    /// mismatch so Python raises the exact ``zip(strict=True)`` error.
+    Tuple(Vec<Element>),
 }
 
 enum FieldSpec {
@@ -527,6 +530,21 @@ impl Element {
                 Ok(out.into_any())
             }
             Element::Constant { constant } => Ok(constant.bind(py).clone()),
+            Element::Tuple(elements) => {
+                if value.is_none() {
+                    return Ok(py.None().into_bound(py));
+                }
+                // Defer on a non-sequence or length mismatch; pure Python then
+                // raises the exact ``zip(strict=True)`` error.
+                if !is_list_like(value) || value.len()? != elements.len() {
+                    return Err(fallback());
+                }
+                let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(elements.len());
+                for (element, each) in elements.iter().zip(value.try_iter()?) {
+                    items.push(element.apply(ctx, &each?)?);
+                }
+                Ok(PyTuple::new(py, items)?.into_any())
+            }
         }
     }
 
@@ -686,6 +704,15 @@ fn parse_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<Element> {
                 key_el: parse_opt(t.get_item(1)?)?,
                 val_el: parse_opt(t.get_item(2)?)?,
             })
+        }
+        14 => {
+            // (14, (element, element, ...))
+            let specs = t.get_item(1)?.cast_into::<PyTuple>()?;
+            let mut elements = Vec::with_capacity(specs.len());
+            for item in specs.iter() {
+                elements.push(parse_element(py, &item)?);
+            }
+            Ok(Element::Tuple(elements))
         }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown element tag {other}"
@@ -1741,7 +1768,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 11;
+const PROTOCOL_VERSION: u32 = 12;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {

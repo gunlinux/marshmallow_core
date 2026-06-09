@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 11
+_EXPECTED_PROTOCOL = 12
 
 
 class _NoFallbackError(Exception):
@@ -92,6 +92,7 @@ _DICT = 10
 _CONSTANT = 11
 _TIMEDELTA = 12
 _DICT_TYPED = 13
+_TUPLE = 14
 
 # Load element tags (a distinct tag space from the dump tags above).
 _L_PASSTHROUGH = 0
@@ -281,6 +282,18 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
         # Python and precision-sensitive; hand the field's own method to the core
         # (provably identical, like ``Decimal``).
         return (_TIMEDELTA, field._serialize)
+    if ftype is ma_fields.Tuple:
+        # ``Tuple._serialize``: ``tuple(f._serialize(each) for f, each in
+        # zip(fields, value, strict=True))``. Serialize each position natively;
+        # the core defers (dump fallback) on a length mismatch so Python raises
+        # the exact ``zip(strict=True)`` error.
+        elements = []
+        for inner in field.tuple_fields:
+            inner_element = _build_element(inner, stack)
+            if inner_element is None:
+                return None
+            elements.append(inner_element)
+        return (_TUPLE, tuple(elements))
     return None
 
 
