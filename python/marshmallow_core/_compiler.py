@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 4
+_EXPECTED_PROTOCOL = 5
 
 
 class _NoFallbackError(Exception):
@@ -104,6 +104,7 @@ _L_TEMPORAL = 8
 _L_DECIMAL = 9
 _L_DICT = 10
 _L_CONSTANT = 11
+_L_BOOLEAN = 12
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -445,6 +446,14 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
     ftype = type(field)
     if ftype is ma_fields.Raw:
         return (_L_PASSTHROUGH,)
+    if ftype is ma_fields.Boolean:
+        # ``Boolean._deserialize``: ``value in truthy -> True``, ``in falsy ->
+        # False``, else (or a ``TypeError`` from an unhashable value) ``invalid``.
+        # The empty-``truthy`` variant (``bool(value)``) is rare; defer it. Pass
+        # the field's own sets so a customised ``truthy``/``falsy`` is honoured.
+        if not field.truthy:
+            return None
+        return (_L_BOOLEAN, field.truthy, field.falsy)
     if ftype is ma_fields.String:
         return (_L_STRING,)
     if ftype is ma_fields.Integer:

@@ -744,6 +744,13 @@ enum LoadElement {
     Dict,
     /// Constant: always returns the held constant, ignoring the input value.
     Constant { constant: Py<PyAny> },
+    /// Boolean: ``value in truthy -> True``, ``value in falsy -> False``; a miss
+    /// (or a ``TypeError`` from an unhashable value) defers so Python raises the
+    /// exact ``invalid`` error. Holds the field's own ``truthy``/``falsy`` sets.
+    Boolean {
+        truthy: Py<PyAny>,
+        falsy: Py<PyAny>,
+    },
 }
 
 /// A recognized ``marshmallow.validate`` validator, modelled to reproduce only
@@ -1292,6 +1299,19 @@ impl LoadElement {
                 }
             }
             LoadElement::Constant { constant } => Ok(constant.bind(py).clone()),
+            LoadElement::Boolean { truthy, falsy } => {
+                // ``value in truthy -> True``, ``value in falsy -> False``. Any
+                // miss, or a ``TypeError`` from an unhashable value, defers so
+                // Python raises the exact ``invalid`` error (matching the
+                // ``try/except TypeError`` in ``Boolean._deserialize``).
+                if truthy.bind(py).contains(value).map_err(|_| fallback())? {
+                    Ok(PyBool::new(py, true).to_owned().into_any())
+                } else if falsy.bind(py).contains(value).map_err(|_| fallback())? {
+                    Ok(PyBool::new(py, false).to_owned().into_any())
+                } else {
+                    Err(fallback())
+                }
+            }
         }
     }
 }
@@ -1464,6 +1484,11 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             // (11, constant)
             constant: t.get_item(1)?.unbind(),
         }),
+        12 => Ok(LoadElement::Boolean {
+            // (12, truthy_set, falsy_set)
+            truthy: t.get_item(1)?.unbind(),
+            falsy: t.get_item(2)?.unbind(),
+        }),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown load element tag {other}"
         ))),
@@ -1474,7 +1499,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 4;
+const PROTOCOL_VERSION: u32 = 5;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
