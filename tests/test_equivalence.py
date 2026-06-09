@@ -812,6 +812,60 @@ def test_load_tuple_is_native():
     assert element is not None and element[0] == _compiler._L_TUPLE
 
 
+class _ArtistSchema(Schema):
+    id = fields.Integer()
+    name = fields.String()
+
+
+class LoadPluckSchema(Schema):
+    artist = fields.Pluck(_ArtistSchema, "id")
+
+
+class LoadPluckManySchema(Schema):
+    artists = fields.Pluck(_ArtistSchema, "id", many=True)
+
+
+@pytest.mark.parametrize(
+    ("factory", "data"),
+    [
+        (LoadPluckSchema, {"artist": 42}),
+        (LoadPluckSchema, {"artist": "7"}),  # coerced to int by the inner field
+        (LoadPluckSchema, {}),  # missing
+        (LoadPluckManySchema, {"artists": [1, 2, 3]}),
+        (LoadPluckManySchema, {"artists": []}),
+    ],
+)
+def test_load_pluck_equivalence(factory, data, monkeypatch):
+    accelerated, pure = _load_both(factory, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    ("factory", "data"),
+    [
+        (LoadPluckSchema, {"artist": "not-an-int"}),  # inner coercion failure
+        (LoadPluckManySchema, {"artists": 5}),  # not a collection
+        (LoadPluckManySchema, {"artists": [1, "x"]}),  # one bad element
+    ],
+)
+def test_load_pluck_errors_match_python(factory, data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        factory().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        factory().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_pluck_is_native():
+    from marshmallow_core import _compiler
+
+    element = _compiler._build_load_element(fields.Pluck(_ArtistSchema, "id"), ())
+    assert element is not None and element[0] == _compiler._L_PLUCK
+
+
 @pytest.mark.parametrize("unknown", [RAISE, EXCLUDE, INCLUDE])
 def test_load_unknown_equivalence(unknown, monkeypatch):
     class S(Schema):
