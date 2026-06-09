@@ -138,6 +138,55 @@ def _hook_obj() -> dict:
     return {"a": 5, "b": "hello world", "c": 2.5}
 
 
+# ---- API-response-shaped (realistic mixed payload) -------------------------
+# A paginated list of records mixing every common native field type — bool,
+# str, int, float, datetime, a list of scalars and a nested object — closer to
+# a real JSON API response than the single-type synthetic shapes above. This is
+# the case to watch for real-world regressions.
+
+
+class _Profile(Schema):
+    bio = fields.String()
+    verified = fields.Boolean()
+
+
+class _User(Schema):
+    id = fields.Integer(strict=True)
+    name = fields.String()
+    email = fields.String()
+    active = fields.Boolean()
+    score = fields.Float()
+    created = fields.DateTime()
+    tags = fields.List(fields.String())
+    profile = fields.Nested(_Profile)
+
+
+class ApiSchema(Schema):
+    page = fields.Integer()
+    total = fields.Integer()
+    users = fields.List(fields.Nested(_User))
+
+
+def _api_obj() -> dict:
+    return {
+        "page": 1,
+        "total": 25,
+        "users": [
+            {
+                "id": n,
+                "name": f"user-{n}",
+                "email": f"user{n}@example.com",
+                "active": bool(n % 2),
+                "score": n * 1.25,
+                "created": dt.datetime(2020, 1, 2, 3, 4, 5),
+                "tags": ["alpha", "beta", "gamma"],
+                "profile": {"bio": f"bio for {n}", "verified": n % 3 == 0},
+            }
+            for n in range(25)
+        ],
+    }
+
+
 #: name -> (schema_class, sample_dict). The sample is the *loaded* form for dump
 #: and the input form for load; for these schemas the two coincide closely
 #: enough that the same dict drives both directions.
@@ -147,4 +196,5 @@ CASES: dict[str, tuple[type[Schema], dict]] = {
     "list": (ListSchema, _list_obj()),
     "validator": (ValidatorSchema, _validator_obj()),
     "hooks": (HookSchema, _hook_obj()),
+    "api": (ApiSchema, _api_obj()),
 }
