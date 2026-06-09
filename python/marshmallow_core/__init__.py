@@ -25,4 +25,4 @@ from marshmallow_core._compiler import is_available
 from marshmallow_core._patch import install, is_installed, uninstall
 
 __all__ = ["install", "is_available", "is_installed", "uninstall"]
-__version__ = "0.1.1"
+__version__ = "0.1.2"
