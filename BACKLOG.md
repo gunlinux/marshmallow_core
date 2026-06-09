@@ -74,8 +74,8 @@ bottom within a phase.
 
 ## Per-change checklist (every code item)
 
-- [ ] Implemented in **both** `_compiler.py` and `lib.rs`
-- [ ] Dump/load tags kept in sync
-- [ ] Bumped `PROTOCOL_VERSION` + `_EXPECTED_PROTOCOL` if payload/tags changed
-- [ ] Equivalence test added (valid + error inputs)
-- [ ] Re-ran benchmark to confirm a real gain
+- [x] Implemented in **both** `_compiler.py` and `lib.rs`
+- [x] Dump/load tags kept in sync
+- [x] Bumped `PROTOCOL_VERSION` + `_EXPECTED_PROTOCOL` if payload/tags changed
+- [x] Equivalence test added (valid + error inputs)
+- [x] Re-ran benchmark to confirm a real gain
