@@ -405,6 +405,12 @@ impl Element {
                 if value.is_none() {
                     return Ok(py.None().into_bound(py));
                 }
+                // ``int(x)`` for an *exact* int returns ``x`` unchanged, so skip
+                // the Python call. ``is_exact_instance_of`` excludes ``bool`` and
+                // int subclasses, which ``int()`` would still need to coerce.
+                if !*as_string && value.is_exact_instance_of::<PyInt>() {
+                    return Ok(value.clone());
+                }
                 let r = ctx.int_fn.bind(py).call1((value,))?;
                 if *as_string {
                     Ok(r.str()?.into_any())
@@ -415,6 +421,10 @@ impl Element {
             Element::Float(as_string) => {
                 if value.is_none() {
                     return Ok(py.None().into_bound(py));
+                }
+                // ``float(x)`` for an exact float returns ``x`` unchanged.
+                if !*as_string && value.is_exact_instance_of::<PyFloat>() {
+                    return Ok(value.clone());
                 }
                 let r = ctx.float_fn.bind(py).call1((value,))?;
                 if *as_string {
@@ -1198,6 +1208,11 @@ impl LoadElement {
                 if value.is_instance_of::<pyo3::types::PyBool>() {
                     return Err(fallback()); // bools are rejected as ``invalid``
                 }
+                // ``int(x)`` for an exact int (bool already excluded above) is
+                // ``x`` — skip the Python call on the common already-parsed case.
+                if value.is_exact_instance_of::<PyInt>() {
+                    return Ok(value.clone());
+                }
                 ctx.int_fn
                     .bind(py)
                     .call1((value,))
@@ -1207,11 +1222,16 @@ impl LoadElement {
                 if value.is_instance_of::<pyo3::types::PyBool>() {
                     return Err(fallback());
                 }
-                let r = ctx
-                    .float_fn
-                    .bind(py)
-                    .call1((value,))
-                    .map_err(|e| to_fallback(py, e))?;
+                // An exact float is its own ``float(x)``; reuse it directly and
+                // run only the nan/inf guard, skipping the ``float`` call.
+                let r = if value.is_exact_instance_of::<PyFloat>() {
+                    value.clone()
+                } else {
+                    ctx.float_fn
+                        .bind(py)
+                        .call1((value,))
+                        .map_err(|e| to_fallback(py, e))?
+                };
                 if !*allow_nan {
                     let f: f64 = r.extract()?;
                     if f.is_nan() || f.is_infinite() {
