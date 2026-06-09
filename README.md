@@ -64,6 +64,30 @@ attribute writes are all accelerated. Custom `dict_class` / `get_attribute`,
 self-referential schemas, custom strptime temporal formats, and callable
 defaults always fall back to pure Python.
 
+### Where the speedup is limited
+
+Some shapes are inherently bounded — the work the core can't move into Rust
+dominates the call. These are *correct*, just not where the gains are:
+
+- **Hook-bearing loads are the weakest case (~2x, vs ~7x without hooks).** When a
+  schema has `pre_load` / `post_load` / `validates` / `validates_schema`, the core
+  runs the per-field deserialize but marshmallow's Python hook-dispatch
+  (`_invoke_load_processors`, `_invoke_field_validators`) runs around it. On a
+  small schema the core step is ~8% of the load; the remaining ~90% is that
+  Python machinery, which wraps user callbacks and cannot be moved into Rust.
+- **Small / flat schemas are capped by fixed per-call overhead (~20–30%).** The
+  `dump` / `load` entry prologue (argument normalization, the per-instance
+  serializer-cache lookup, the partial/unknown checks) is constant per call, so
+  it dominates exactly when the payload is tiny. It amortizes to near-zero as the
+  payload grows — speedup on a list of records is flat regardless of length.
+- **`loads` gains less than `load`.** JSON parsing still goes through CPython's C
+  `json.loads`; a fused Rust parser was prototyped but did not beat it, so only
+  the subsequent per-field step is accelerated.
+
+For collections of records (the common hot path) the fixed overhead vanishes and
+the speedup is steady (~7–8x). Run `performance/analyze_paths.py` to see whether a
+given schema even reaches the core, and `performance/benchmark.py` to measure it.
+
 ## Development
 
 Requires `cargo` (rustup) and [`maturin`](https://www.maturin.rs/).
