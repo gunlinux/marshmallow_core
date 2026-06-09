@@ -1219,15 +1219,42 @@ def test_load_partial_true_errors_match_python(data, monkeypatch):
     assert acc_exc.value.messages == py_exc.value.messages
 
 
-def test_load_partial_collection_defers_but_matches(monkeypatch):
-    """Collection/dotted ``partial`` keeps its (defaults-applied) semantics."""
-    accelerated, pure = _load_both(
-        PartialSchema,
-        {"id": 1, "inner": {"a": 5}},
-        monkeypatch=monkeypatch,
-        partial=("name",),
-    )
+@pytest.mark.parametrize(
+    "data,partial",
+    [
+        ({"id": 1, "inner": {"a": 5}}, ("name",)),  # name optional, default skipped
+        ({"id": 1}, ("name",)),  # nested still required -> error
+        ({"id": 1, "name": "x"}, ("inner",)),  # whole nested optional
+        ({"id": 1, "inner": {"b": 7}}, ["inner.a"]),  # dotted: nested.a optional
+        ({"id": 1, "inner": {}}, ("inner.a", "name")),  # dotted + flat
+        ({}, ("id", "name", "inner", "tags")),  # everything optional
+        ({"id": 1, "inner": {"a": "x"}}, ("name",)),  # present-but-invalid errors
+        ({"id": 1, "name": None, "inner": {"a": 5}}, ("name",)),  # null non-nullable
+    ],
+)
+def test_load_partial_collection_equivalence(data, partial, monkeypatch):
+    """Collection/dotted ``partial`` is accelerated and matches pure Python."""
+    try:
+        accelerated = PartialSchema().load(data, partial=partial)
+        acc_err = None
+    except ValidationError as exc:
+        accelerated, acc_err = None, exc.messages
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    try:
+        pure = PartialSchema().load(data, partial=partial)
+        pure_err = None
+    except ValidationError as exc:
+        pure, pure_err = None, exc.messages
     assert accelerated == pure
+    assert acc_err == pure_err
+
+
+def test_load_partial_collection_is_native():
+    schema = PartialSchema()
+    schema.load({"id": 1, "inner": {"a": 5}}, partial=("name",))  # lazy build
+    assert accel.is_available() == (
+        vars(schema).get("_mc_load_deserializer") is not None
+    )
 
 
 def test_load_partial_nested_own_option_defers(monkeypatch):

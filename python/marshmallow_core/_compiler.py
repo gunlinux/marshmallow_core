@@ -61,7 +61,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 3
+_EXPECTED_PROTOCOL = 4
 
 
 class _NoFallbackError(Exception):
@@ -512,6 +512,7 @@ def _build_load_payload(
                     False,
                     data_key,
                     out_key,
+                    attr_name,  # used for the ``attr_name in partial`` skip check
                     load_default,
                     bool(field.required),
                     bool(field.allow_none),

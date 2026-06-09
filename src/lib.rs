@@ -768,11 +768,81 @@ enum Validator {
     OneOf { choices: Py<PyAny> },
 }
 
+/// How ``load(partial=...)`` is threaded through a load: not partial, fully
+/// partial (``True``), or a collection of (possibly dotted) field names allowed
+/// to be missing at this level. Mirrors marshmallow's ``_deserialize`` handling.
+enum Partial<'py> {
+    None,
+    All,
+    Coll(Bound<'py, PyAny>),
+}
+
+impl<'py> Partial<'py> {
+    /// Interpret the ``partial`` argument the caller passed to ``run``:
+    /// ``True`` -> all fields optional; a collection -> those names optional;
+    /// anything falsy (``False``/``None``/empty) -> not partial.
+    fn from_arg(arg: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if arg.is_instance_of::<PyBool>() {
+            Ok(if arg.is_truthy()? {
+                Partial::All
+            } else {
+                Partial::None
+            })
+        } else if arg.is_none() {
+            Ok(Partial::None)
+        } else {
+            Ok(Partial::Coll(arg.clone())) // list/tuple/set/frozenset of names
+        }
+    }
+
+    /// Whether a field with attribute name ``attr_name`` may be missing here
+    /// (``partial is True or attr_name in partial``).
+    fn allows_missing(&self, attr_name: &Bound<'py, PyString>) -> PyResult<bool> {
+        match self {
+            Partial::All => Ok(true),
+            Partial::None => Ok(false),
+            Partial::Coll(c) => c.contains(attr_name),
+        }
+    }
+
+    /// The sub-partial to pass into a nested field named ``attr_name``: for a
+    /// collection, the entries prefixed ``attr_name.`` with that prefix stripped.
+    fn derive(&self, py: Python<'py>, attr_name: &Bound<'py, PyString>) -> PyResult<Partial<'py>> {
+        match self {
+            Partial::None => Ok(Partial::None),
+            Partial::All => Ok(Partial::All),
+            Partial::Coll(c) => {
+                let prefix = format!("{}.", attr_name.to_str()?);
+                let sub = PyList::empty(py);
+                for name in c.try_iter()? {
+                    let name = name?;
+                    let s = name.cast::<PyString>().map_err(|_| fallback())?;
+                    if let Some(rest) = s.to_str()?.strip_prefix(&prefix) {
+                        sub.append(rest)?;
+                    }
+                }
+                Ok(Partial::Coll(sub.into_any()))
+            }
+        }
+    }
+
+    /// The Python value to pass as a callback field's ``partial=`` kwarg, or
+    /// ``None`` to omit it (matching marshmallow for a non-partial load).
+    fn as_kwarg(&self, py: Python<'py>) -> Option<Bound<'py, PyAny>> {
+        match self {
+            Partial::All => Some(PyBool::new(py, true).to_owned().into_any()),
+            Partial::Coll(c) => Some(c.clone()),
+            Partial::None => None,
+        }
+    }
+}
+
 enum LoadFieldSpec {
     Native {
         data_key: Py<PyString>, // key read from the input mapping
         out_key: Py<PyString>,  // key written to the output dict
         out_key_parts: Option<Vec<Py<PyString>>>, // Some if dotted (set_value)
+        attr_name: Py<PyString>, // schema attribute name (for the partial check)
         load_default: Py<PyAny>,
         required: bool,
         allow_none: bool,
@@ -860,18 +930,19 @@ impl LoadDeserializer {
 
     /// Deserialize ``data``; raises ``AccelFallback`` to defer to Python.
     ///
-    /// ``partial`` mirrors ``load(partial=True)``: a field missing from the input
-    /// is skipped (no default applied, no ``required`` error), recursively into
-    /// nested schemas. Only the boolean form is modelled; collection/dotted
-    /// ``partial`` stays on the pure-Python path (handled by the caller).
-    #[pyo3(signature = (data, many, partial=false))]
+    /// ``partial`` mirrors ``load(partial=...)``: ``True`` makes every field
+    /// optional, a collection of (possibly dotted) names makes those optional,
+    /// and anything falsy is non-partial. A field missing under partial is
+    /// skipped (no default applied, no ``required`` error), recursively into
+    /// nested schemas (dotted entries select nested fields).
     fn run<'py>(
         &self,
         data: &Bound<'py, PyAny>,
         many: bool,
-        partial: bool,
+        partial: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.root.run(&self.ctx, data, many, partial)
+        let p = Partial::from_arg(partial)?;
+        self.root.run(&self.ctx, data, many, &p)
     }
 }
 
@@ -881,7 +952,7 @@ impl LoadSerializer {
         ctx: &Ctx,
         data: &Bound<'py, PyAny>,
         many: bool,
-        partial: bool,
+        partial: &Partial<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = data.py();
         if many {
@@ -903,7 +974,7 @@ impl LoadSerializer {
         &self,
         ctx: &Ctx,
         data: &Bound<'py, PyAny>,
-        partial: bool,
+        partial: &Partial<'py>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let py = data.py();
         // Python checks ``isinstance(data, Mapping)``; we only model plain dicts.
@@ -916,6 +987,7 @@ impl LoadSerializer {
                     data_key,
                     out_key,
                     out_key_parts,
+                    attr_name,
                     load_default,
                     required,
                     allow_none,
@@ -925,7 +997,7 @@ impl LoadSerializer {
                     let raw = data.get_item(data_key.bind(py))?;
                     let Some(value) = raw else {
                         // missing from input
-                        if partial {
+                        if partial.allows_missing(attr_name.bind(py))? {
                             continue; // ``partial``: skip (no default, no required)
                         }
                         if *required {
@@ -950,7 +1022,10 @@ impl LoadSerializer {
                         }
                         return Err(fallback()); // ``null`` error
                     }
-                    let result = element.apply(ctx, &value, partial)?;
+                    // The sub-partial for this field (only matters for a nested
+                    // element; cheap for the non-collection cases).
+                    let field_partial = partial.derive(py, attr_name.bind(py))?;
+                    let result = element.apply(ctx, &value, &field_partial)?;
                     // Validators run on the deserialized value (mirrors
                     // ``Field._validate(output)``); any failure or error defers
                     // to Python for the exact ``ValidationError`` message.
@@ -974,7 +1049,7 @@ impl LoadSerializer {
                     let value = match raw {
                         Some(v) => v,
                         None => {
-                            if partial {
+                            if partial.allows_missing(attr_name.bind(py))? {
                                 continue; // ``partial``: skip the missing field
                             }
                             missing.clone()
@@ -982,11 +1057,12 @@ impl LoadSerializer {
                     };
                     // Any error (ValidationError, TypeError, ...) -> fall back so
                     // Python accumulates the full, correct error structure. Pass
-                    // ``partial`` down so a callback ``Nested`` propagates it.
+                    // the sub-partial down so a callback ``Nested`` propagates it.
                     let bound = field.bind(py);
-                    let res = if partial {
+                    let field_partial = partial.derive(py, attr_name.bind(py))?;
+                    let res = if let Some(p) = field_partial.as_kwarg(py) {
                         let kwargs = PyDict::new(py);
-                        kwargs.set_item(intern!(py, "partial"), true)?;
+                        kwargs.set_item(intern!(py, "partial"), p)?;
                         bound.call_method(
                             intern!(py, "deserialize"),
                             (value, attr_name.bind(py), data),
@@ -1092,7 +1168,7 @@ impl LoadElement {
         &self,
         ctx: &Ctx,
         value: &Bound<'py, PyAny>,
-        partial: bool,
+        partial: &Partial<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = value.py();
         match self {
@@ -1259,9 +1335,9 @@ fn parse_load_field_spec(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Lo
             field: t.get_item(4)?.unbind(),
         })
     } else {
-        // (False, data_key, out_key, load_default, required, allow_none,
-        //  element, [validator, ...])
-        let validators_list = t.get_item(7)?.cast_into::<PyList>()?;
+        // (False, data_key, out_key, attr_name, load_default, required,
+        //  allow_none, element, [validator, ...])
+        let validators_list = t.get_item(8)?.cast_into::<PyList>()?;
         let mut validators = Vec::with_capacity(validators_list.len());
         for item in validators_list.iter() {
             validators.push(parse_validator(py, &item)?);
@@ -1272,10 +1348,11 @@ fn parse_load_field_spec(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Lo
             data_key: t.get_item(1)?.cast_into::<PyString>()?.unbind(),
             out_key: out_key.unbind(),
             out_key_parts,
-            load_default: t.get_item(3)?.unbind(),
-            required: t.get_item(4)?.extract()?,
-            allow_none: t.get_item(5)?.extract()?,
-            element: parse_load_element(py, &t.get_item(6)?)?,
+            attr_name: t.get_item(3)?.cast_into::<PyString>()?.unbind(),
+            load_default: t.get_item(4)?.unbind(),
+            required: t.get_item(5)?.extract()?,
+            allow_none: t.get_item(6)?.extract()?,
+            element: parse_load_element(py, &t.get_item(7)?)?,
             validators,
         })
     }
@@ -1397,7 +1474,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {

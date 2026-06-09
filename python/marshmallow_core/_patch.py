@@ -49,6 +49,31 @@ _UNSET: typing.Final = object()
 #: accelerated path (:func:`_accelerated_load`) instead of the direct core call.
 _LOAD_HOOKS = (PRE_LOAD, POST_LOAD, VALIDATES, VALIDATES_SCHEMA)
 
+#: Collection ``partial`` types the core models natively (mirrors marshmallow's
+#: ``is_collection``: an iterable of field names, excluding strings).
+_PARTIAL_COLLECTIONS = (list, tuple, set, frozenset)
+
+
+def _core_partial(partial: typing.Any) -> typing.Any:
+    """Normalise ``partial`` to what the core's ``run`` expects: ``True`` (all
+    optional), a collection of names, or ``False`` (not partial)."""
+    if partial is True:
+        return True
+    if partial and isinstance(partial, _PARTIAL_COLLECTIONS):
+        return partial
+    return False
+
+
+def _partial_is_supported(partial: typing.Any) -> bool:
+    """Whether the core can model this ``partial`` (boolean/falsy or a name
+    collection). Dotted-string entries within a collection are handled by the
+    core's ``set_value``-style prefix matching; a bare-string ``partial`` defers."""
+    return (
+        partial is True
+        or not partial
+        or isinstance(partial, _PARTIAL_COLLECTIONS)
+    )
+
 # Saved originals; ``None`` while not installed (also used by ``is_installed``).
 _orig_serialize: typing.Any = None
 _orig_do_load: typing.Any = None
@@ -112,11 +137,11 @@ def _patched_do_load(
     unknown = self.unknown if unknown is None else unknown
     if partial is None:
         partial = self.partial
-    # The core is compiled for this schema's own ``unknown`` and non-partial (or
-    # boolean ``partial=True``) config. Hook-bearing schemas use the hook-aware
-    # path (core does the per-field step, Python runs the hooks around it);
-    # hook-free schemas call the core directly.
-    if unknown == self.unknown and (partial is True or not partial):
+    # The core is compiled for this schema's own ``unknown``; ``partial`` (boolean
+    # or a name collection) is threaded as a runtime argument. Hook-bearing
+    # schemas use the hook-aware path (core does the per-field step, Python runs
+    # the hooks around it); hook-free schemas call the core directly.
+    if unknown == self.unknown and _partial_is_supported(partial):
         cache = vars(self)
         ld = cache.get("_mc_load_deserializer", _UNSET)
         if ld is _UNSET:
@@ -129,7 +154,7 @@ def _patched_do_load(
                     return _accelerated_load(
                         self, ld, data, many, partial, unknown, postprocess
                     )
-                return ld.run(data, many, partial is True)
+                return ld.run(data, many, _core_partial(partial))
             except _compiler.AccelFallback:
                 pass  # off the happy path -> unchanged pure-Python load below
     return _orig_do_load(
@@ -184,7 +209,7 @@ def _accelerated_load(
         processed_data = data
     if not errors:
         # Deserialize data — the accelerated per-field step (was _deserialize).
-        result = ld.run(processed_data, many, partial is True)
+        result = ld.run(processed_data, many, _core_partial(partial))
         # Run field-level validation
         self._invoke_field_validators(error_store=error_store, data=result, many=many)
         # Run schema-level validation

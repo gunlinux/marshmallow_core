@@ -59,9 +59,10 @@ schemas — including those with `pre_load` / `post_load` / `validates` /
 those hooks run in Python around it (mirroring marshmallow's own `_do_load`
 split). Recognized field validators (`Range` / `Length` / `OneOf`) run natively;
 any other validator, or field-level `pre_load` / `post_load`, keeps that field
-on the callback path. Collection/dotted `partial`, `unknown=INCLUDE`, custom
-`dict_class` / `get_attribute`, self-referential schemas, custom strptime
-temporal formats, and callable defaults always fall back to pure Python.
+on the callback path. `unknown=INCLUDE`, collection/dotted `partial`, and dotted
+attribute writes are all accelerated. Custom `dict_class` / `get_attribute`,
+self-referential schemas, custom strptime temporal formats, and callable
+defaults always fall back to pure Python.
 
 ## Development
 

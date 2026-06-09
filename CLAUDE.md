@@ -116,11 +116,18 @@ identical to `Field._serialize`.
   output across **valid and error** inputs (`tests/test_equivalence.py`).
 - The extension exports `PROTOCOL_VERSION`; `_compiler._EXPECTED_PROTOCOL` must
   match it. Bump both together when payload shapes/tags change.
-- **What stays pure-Python:** collection/dotted `partial` (boolean `partial=True`
-  *is* accelerated), `unknown=INCLUDE`, custom `dict_class`/`get_attribute`,
+- **What stays pure-Python:** custom `dict_class`/`get_attribute`,
   self-referential schemas, custom strptime temporal formats,
-  `NaiveDateTime`/`AwareDateTime` on load, callable defaults, field validators
-  /pre/post-load, and any field type without a native element.
+  `NaiveDateTime`/`AwareDateTime` on load, callable defaults, unrecognized field
+  validators (anything but `Range`/`Length`/`OneOf`), field-level
+  `pre_load`/`post_load`, a `Dict` with key/value fields, and any field type
+  without a native element. **Now accelerated** (Phase 1/3): `unknown=INCLUDE`,
+  collection/dotted `partial`, dotted attribute writes (`set_value`),
+  `Range`/`Length`/`OneOf` validators, `Decimal`/`Dict`/`Constant` fields,
+  schema-level load hooks (`pre_load`/`post_load`/`validates`/`validates_schema`
+  run in Python around the core's per-field step), and `dumps` (fused to JSON in
+  Rust). `loads` is accelerated via the patched load path (a fused JSON *parser*
+  was prototyped but did not beat C `json.loads`, so it ships unfused).
 
 ## Testing conventions
 

@@ -65,11 +65,12 @@ bottom within a phase.
 
 ## Phase 3 — Remaining deferrals + micro-opts
 
-- [ ] Support `unknown=INCLUDE`
-- [ ] Support collection/dotted `partial`
-- [ ] Support dotted attribute writes (`set_value`)
-- [ ] Cache `_has_load_hooks` on the class
-- [ ] Precompute the known-keys frozenset once
+- [x] Support `unknown=INCLUDE`
+- [x] Support collection/dotted `partial`
+- [x] Support dotted attribute writes (`set_value`)
+- [x] Cache `_has_load_hooks` on the class (per-class `WeakKeyDictionary`)
+- [x] Precompute the known-keys frozenset once (built per compile, held by the
+      Rust `LoadSerializer`)
 
 ## Per-change checklist (every code item)
 
