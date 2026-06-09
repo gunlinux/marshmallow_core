@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 9
+_EXPECTED_PROTOCOL = 10
 
 
 class _NoFallbackError(Exception):
@@ -90,6 +90,7 @@ _ENUM = 8
 _DECIMAL = 9
 _DICT = 10
 _CONSTANT = 11
+_TIMEDELTA = 12
 
 # Load element tags (a distinct tag space from the dump tags above).
 _L_PASSTHROUGH = 0
@@ -109,6 +110,7 @@ _L_INTEGER_STRICT = 13
 _L_DICT_TYPED = 14
 _L_TUPLE = 15
 _L_PLUCK = 16
+_L_TIMEDELTA = 17
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -260,6 +262,11 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
         return None
     if ftype is ma_fields.Constant:
         return (_CONSTANT, field.constant)
+    if ftype is ma_fields.TimeDelta:
+        # ``TimeDelta._serialize`` (timedelta -> float division) is intrinsically
+        # Python and precision-sensitive; hand the field's own method to the core
+        # (provably identical, like ``Decimal``).
+        return (_TIMEDELTA, field._serialize)
     return None
 
 
@@ -573,6 +580,11 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
                 return None
             elements.append(inner_element)
         return (_L_TUPLE, tuple(elements))
+    if ftype is ma_fields.TimeDelta:
+        # ``TimeDelta._deserialize`` (float -> timedelta, with rounding) is
+        # intrinsically Python; hand the field's own method to the core, which
+        # turns any ``ValidationError`` into a fallback (like ``Decimal``).
+        return (_L_TIMEDELTA, field._deserialize)
     return None
 
 
