@@ -16,7 +16,7 @@ classifiers = [
   "Programming Language :: Rust",
   "License :: OSI Approved :: MIT License",
 ]
-dependencies = ["marshmallow>=4,<5"]
+dependencies = ["marshmallow>=3.23,<5"]
 
 [project.urls]
 Homepage = "https://github.com/gunlinux/marshmallow_core"

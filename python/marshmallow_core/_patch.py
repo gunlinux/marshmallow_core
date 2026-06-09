@@ -15,13 +15,15 @@ Python, the core does the per-field deserialize step (the body of
 ``Schema._deserialize``), then field/schema validators and ``post_load`` run in
 Python around it. :func:`_accelerated_load` is a verbatim copy of
 ``Schema._do_load`` with the one ``self._deserialize(...)`` call replaced by the
-compiled core; it therefore pins to marshmallow 4.x's ``_do_load`` internals and
-leans on the equivalence suite. The core still raises ``AccelFallback`` for any
-per-field edge case, so the whole load re-runs the unchanged pure-Python path.
+compiled core; it therefore pins to marshmallow's ``_do_load`` internals (it
+tracks both the 3.x and 4.x shapes, branching on :data:`_MA4`) and leans on the
+equivalence suite. The core still raises ``AccelFallback`` for any per-field edge
+case, so the whole load re-runs the unchanged pure-Python path.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import typing
 import weakref
@@ -52,6 +54,17 @@ _LOAD_HOOKS = (PRE_LOAD, POST_LOAD, VALIDATES, VALIDATES_SCHEMA)
 #: Collection ``partial`` types the core models natively (mirrors marshmallow's
 #: ``is_collection``: an iterable of field names, excluding strings).
 _PARTIAL_COLLECTIONS = (list, tuple, set, frozenset)
+
+#: Whether the installed marshmallow is 4.x. Detected by feature-probing the two
+#: private hook invokers that :func:`_accelerated_load` reproduces: 4.x threads
+#: ``unknown`` through the load processors/schema validators and renamed the
+#: schema-validator ``pass_many`` argument to ``pass_collection``; 3.x does
+#: neither. We probe the signatures rather than the version string so a faithful
+#: transcription tracks the actual API.
+_MA4: typing.Final = (
+    "pass_collection"
+    in inspect.signature(Schema._invoke_schema_validators).parameters
+)
 
 
 def _core_partial(partial: typing.Any) -> typing.Any:
@@ -178,19 +191,29 @@ def _accelerated_load(
 ):
     """Run ``Schema._do_load``'s body with the core doing the per-field step.
 
-    This is a line-for-line transcription of marshmallow 4.x ``_do_load`` (after
-    the argument-normalisation prologue, which the caller already did) with the
+    This is a line-for-line transcription of ``_do_load`` (after the
+    argument-normalisation prologue, which the caller already did) with the
     single ``result = self._deserialize(...)`` call replaced by ``ld.run(...)``.
     ``ld.run`` raises :data:`_compiler.AccelFallback` for any per-field edge case,
     which propagates to the caller and re-runs the unchanged pure-Python load.
 
-    Keeping the surrounding hook/validator/post-load logic identical to stock is
-    what makes the accelerated result byte-for-byte equal — including the order
-    of accumulated errors and the ``handle_error`` callback.
+    The hook/validator invokers differ between marshmallow 3.x and 4.x: 4.x
+    threads ``unknown`` through the load processors/schema validators and renamed
+    ``pass_many`` -> ``pass_collection``. We branch on :data:`_MA4` so the
+    transcription matches whichever ``_do_load`` we patched. Keeping the
+    surrounding logic identical to stock is what makes the accelerated result
+    byte-for-byte equal — including the order of accumulated errors and the
+    ``handle_error`` callback.
     """
+    # ``unknown`` is only threaded through the hook/validator invokers on 4.x.
+    proc_unknown = {"unknown": unknown} if _MA4 else {}
+    # 4.x renamed the schema-validator collection flag ``pass_many`` ->
+    # ``pass_collection``.
+    pass_kw = "pass_collection" if _MA4 else "pass_many"
     error_store = ErrorStore()
     errors: dict = {}
     result: typing.Any = None
+    processed_data: typing.Any = data
     # Run preprocessors
     if self._hooks[PRE_LOAD]:
         try:
@@ -200,13 +223,11 @@ def _accelerated_load(
                 many=many,
                 original_data=data,
                 partial=partial,
-                unknown=unknown,
+                **proc_unknown,
             )
         except ValidationError as err:
             errors = err.normalized_messages()
             result = None
-    else:
-        processed_data = data
     if not errors:
         # Deserialize data — the accelerated per-field step (was _deserialize).
         result = ld.run(processed_data, many, _core_partial(partial))
@@ -217,23 +238,23 @@ def _accelerated_load(
             field_errors = bool(error_store.errors)
             self._invoke_schema_validators(
                 error_store=error_store,
-                pass_collection=True,
                 data=result,
                 original_data=data,
                 many=many,
                 partial=partial,
-                unknown=unknown,
                 field_errors=field_errors,
+                **{pass_kw: True},
+                **proc_unknown,
             )
             self._invoke_schema_validators(
                 error_store=error_store,
-                pass_collection=False,
                 data=result,
                 original_data=data,
                 many=many,
                 partial=partial,
-                unknown=unknown,
                 field_errors=field_errors,
+                **{pass_kw: False},
+                **proc_unknown,
             )
         errors = error_store.errors
         # Run post processors
@@ -245,7 +266,7 @@ def _accelerated_load(
                     many=many,
                     original_data=data,
                     partial=partial,
-                    unknown=unknown,
+                    **proc_unknown,
                 )
             except ValidationError as err:
                 errors = err.normalized_messages()

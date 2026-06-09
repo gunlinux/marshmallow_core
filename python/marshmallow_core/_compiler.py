@@ -39,7 +39,11 @@ import uuid
 
 from marshmallow import fields as ma_fields
 from marshmallow import validate as ma_validate
-from marshmallow.constants import EXCLUDE, INCLUDE, RAISE, missing
+
+# ``EXCLUDE``/``INCLUDE``/``RAISE``/``missing`` live in ``marshmallow.constants``
+# on marshmallow 4.x but only at the top level on 3.x; the top-level names work
+# on both, so import them there to support marshmallow >= 3.23.
+from marshmallow import EXCLUDE, INCLUDE, RAISE, missing
 from marshmallow.decorators import (
     POST_DUMP,
     POST_LOAD,
@@ -316,6 +320,15 @@ def build_dump_json_serializer(schema: Schema) -> typing.Any | None:
 # error reporting stays on the unchanged pure-Python path.
 
 
+def _field_pre_post(field: typing.Any) -> typing.Any:
+    """The field's own ``pre_load``/``post_load`` processors, or a falsy value.
+
+    Field-level ``pre_load``/``post_load`` are a marshmallow 4.x feature; 3.x
+    fields have no such attributes, so probe with ``getattr`` to support both.
+    """
+    return getattr(field, "pre_load", None) or getattr(field, "post_load", None)
+
+
 def _has_field_processors(field: typing.Any) -> bool:
     """True if a field has validators or its own pre/post-load processors.
 
@@ -325,7 +338,7 @@ def _has_field_processors(field: typing.Any) -> bool:
     recognized validators natively (see :func:`_compile_validators`) and only
     defers for ``pre_load``/``post_load``.
     """
-    return bool(field.validators or field.pre_load or field.post_load)
+    return bool(field.validators or _field_pre_post(field))
 
 
 def _has_load_pre_post(field: typing.Any) -> bool:
@@ -336,7 +349,7 @@ def _has_load_pre_post(field: typing.Any) -> bool:
     field-level ``pre_load``/``post_load`` transform the value and must run in
     Python — such a field always stays a callback.
     """
-    return bool(field.pre_load or field.post_load)
+    return bool(_field_pre_post(field))
 
 
 def _build_validator(validator: typing.Any) -> tuple | None:

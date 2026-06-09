@@ -93,7 +93,9 @@ or a **callback** (defers to the Python `Field.serialize`/`deserialize`).
 `build_dump_serializer` / `build_load_deserializer` return `None` to mean "use
 pure Python". `is_available()` gates everything (extension importable + protocol
 match + not `MARSHMALLOW_NO_ACCEL`). It reads only attributes present in stock
-marshmallow 4.x.
+marshmallow >=3.23 (across both the 3.x and 4.x lines); where the two differ
+(e.g. `marshmallow.constants` is 4.x-only, field-level `pre_load`/`post_load`
+are 4.x-only) it imports from the common location or probes with `getattr`.
 
 ### `src/lib.rs` — the PyO3 core
 
