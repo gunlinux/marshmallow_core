@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import typing
+import weakref
 
 from marshmallow import Schema, ValidationError
 from marshmallow.decorators import (
@@ -59,14 +60,33 @@ def is_installed() -> bool:
     return _orig_serialize is not None
 
 
+# ``_hooks`` is resolved once per Schema *class* (shared across instances), so we
+# cache the cheap boolean per class rather than recomputing it on every load/dump.
+# Weak keys let transient/dynamically-created schema classes be collected.
+_HAS_LOAD_HOOKS_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_HAS_DUMP_HOOKS_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
 def _has_load_hooks(schema: Schema) -> bool:
-    hooks = schema._hooks
-    return any(hooks.get(hook) for hook in _LOAD_HOOKS)
+    cls = type(schema)
+    try:
+        return _HAS_LOAD_HOOKS_CACHE[cls]
+    except KeyError:
+        hooks = schema._hooks
+        result = any(hooks.get(hook) for hook in _LOAD_HOOKS)
+        _HAS_LOAD_HOOKS_CACHE[cls] = result
+        return result
 
 
 def _has_dump_hooks(schema: Schema) -> bool:
-    hooks = schema._hooks
-    return bool(hooks.get(PRE_DUMP)) or bool(hooks.get(POST_DUMP))
+    cls = type(schema)
+    try:
+        return _HAS_DUMP_HOOKS_CACHE[cls]
+    except KeyError:
+        hooks = schema._hooks
+        result = bool(hooks.get(PRE_DUMP)) or bool(hooks.get(POST_DUMP))
+        _HAS_DUMP_HOOKS_CACHE[cls] = result
+        return result
 
 
 def _patched_serialize(self: Schema, obj: typing.Any, *, many: bool = False):

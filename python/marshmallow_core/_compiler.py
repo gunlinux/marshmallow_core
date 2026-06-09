@@ -39,7 +39,7 @@ import uuid
 
 from marshmallow import fields as ma_fields
 from marshmallow import validate as ma_validate
-from marshmallow.constants import EXCLUDE, RAISE, missing
+from marshmallow.constants import EXCLUDE, INCLUDE, RAISE, missing
 from marshmallow.decorators import (
     POST_DUMP,
     POST_LOAD,
@@ -112,7 +112,7 @@ _V_ONEOF = 2
 _ONEOF_CONTAINERS = (list, tuple, set, frozenset, dict, range, str)
 
 # Unknown-key handling codes passed to the Rust load core.
-_UNKNOWN_CODES = {RAISE: 0, EXCLUDE: 1}
+_UNKNOWN_CODES = {RAISE: 0, EXCLUDE: 1, INCLUDE: 2}
 
 # Schema-level hooks that make a schema ineligible for the native load path.
 _LOAD_HOOKS = (PRE_LOAD, POST_LOAD, VALIDATES, VALIDATES_SCHEMA)
@@ -482,7 +482,7 @@ def _build_load_payload(
         return None
     unknown_code = _UNKNOWN_CODES.get(schema.unknown if unknown is None else unknown)
     if unknown_code is None:
-        return None  # INCLUDE keeps unknown keys (set-ordered); defer
+        return None  # an unrecognized ``unknown`` option; defer
     cls = type(schema)
     if cls in stack:
         return None  # self-referential schema: break compile-time recursion
@@ -494,8 +494,8 @@ def _build_load_payload(
         data_key = field.data_key if field.data_key is not None else attr_name
         out_key = field.attribute if field.attribute is not None else attr_name
         known_keys.append(data_key)
-        if "." in out_key:
-            return None  # nested attribute writes need ``set_value``; defer
+        # A dotted ``out_key`` (e.g. ``attribute="a.b"``) is a nested write; the
+        # core reproduces ``marshmallow.utils.set_value`` (build nested dicts).
         element = None
         validators: list[tuple] = []
         load_default = field.load_default

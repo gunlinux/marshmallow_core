@@ -565,6 +565,84 @@ def test_load_unknown_equivalence(unknown, monkeypatch):
     assert accelerated == pure
 
 
+class IncludeSchema(Schema):
+    a = fields.Integer()
+    b = fields.Integer()
+
+    class Meta:
+        unknown = INCLUDE
+
+
+def test_load_include_equivalence(monkeypatch):
+    """``unknown=INCLUDE`` keeps unknown keys natively, matching pure Python."""
+    data = {"b": "2", "z": 9, "a": "1", "y": [1, 2]}
+    accelerated, pure = _load_both(IncludeSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure == {"a": 1, "b": 2, "z": 9, "y": [1, 2]}
+
+
+def test_load_include_is_native():
+    schema = IncludeSchema()
+    schema.load({"a": 1, "extra": "x"})  # trigger lazy build
+    assert accel.is_available() == (
+        vars(schema).get("_mc_load_deserializer") is not None
+    )
+
+
+def test_load_include_nested_equivalence(monkeypatch):
+    class Inner(Schema):
+        x = fields.Integer()
+
+        class Meta:
+            unknown = INCLUDE
+
+    class Outer(Schema):
+        inner = fields.Nested(Inner)
+
+        class Meta:
+            unknown = INCLUDE
+
+    data = {"inner": {"x": 1, "extra": "kept"}, "top": True}
+    accelerated, pure = _load_both(Outer, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+class DottedLoadSchema(Schema):
+    a = fields.Integer(attribute="nested.value")
+    b = fields.String(attribute="nested.deep.name")
+    c = fields.Integer()
+    when = fields.DateTime(attribute="meta.ts")  # callback field, dotted
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"a": "5", "b": "hi", "c": 1, "when": "2020-01-02T03:04:05"},
+        {"a": 7},  # only one dotted field present
+        {"c": 9},  # no dotted fields present
+    ],
+)
+def test_load_dotted_attribute_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(DottedLoadSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+def test_load_dotted_attribute_is_native():
+    schema = DottedLoadSchema()
+    schema.load({"c": 1})  # trigger lazy build
+    assert accel.is_available() == (
+        vars(schema).get("_mc_load_deserializer") is not None
+    )
+
+
+def test_load_dotted_default_and_none(monkeypatch):
+    class S(Schema):
+        a = fields.Integer(attribute="g.x", load_default=42)
+        b = fields.String(attribute="g.y", allow_none=True)
+
+    accelerated, pure = _load_both(S, {"b": None}, monkeypatch=monkeypatch)
+    assert accelerated == pure == {"g": {"x": 42, "y": None}}
+
+
 def test_load_validator_field_falls_back(monkeypatch):
     """A field with a validator must defer to Python (which runs the validator)."""
 

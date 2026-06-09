@@ -689,8 +689,9 @@ fn get_one<'py>(
 // identical to pure-Python marshmallow while accelerating the common case.
 
 const UNKNOWN_RAISE: u8 = 0;
-// EXCLUDE (1) is the only other value the builder emits; it needs no Rust-side
-// handling (unknown keys are simply ignored), so it is not named here.
+// EXCLUDE (1) needs no Rust-side handling (unknown keys are simply ignored), so
+// it is not named here.
+const UNKNOWN_INCLUDE: u8 = 2;
 
 #[inline]
 fn fallback() -> PyErr {
@@ -771,6 +772,7 @@ enum LoadFieldSpec {
     Native {
         data_key: Py<PyString>, // key read from the input mapping
         out_key: Py<PyString>,  // key written to the output dict
+        out_key_parts: Option<Vec<Py<PyString>>>, // Some if dotted (set_value)
         load_default: Py<PyAny>,
         required: bool,
         allow_none: bool,
@@ -781,8 +783,55 @@ enum LoadFieldSpec {
         data_key: Py<PyString>,
         attr_name: Py<PyString>, // passed to ``field.deserialize``
         out_key: Py<PyString>,
+        out_key_parts: Option<Vec<Py<PyString>>>,
         field: Py<PyAny>,
     },
+}
+
+/// Split ``key`` into dotted parts, or ``None`` if it contains no ``.``.
+fn split_key_parts(
+    py: Python<'_>,
+    key: &Bound<'_, PyString>,
+) -> PyResult<Option<Vec<Py<PyString>>>> {
+    let s = key.to_str()?;
+    if s.contains('.') {
+        Ok(Some(
+            s.split('.').map(|p| PyString::new(py, p).unbind()).collect(),
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Write ``value`` into ``dict`` at ``key``, reproducing
+/// ``marshmallow.utils.set_value``: a dotted key builds nested dicts. An
+/// intermediate path component that already holds a non-dict value raises
+/// ``AccelFallback`` so Python reproduces the exact ``ValueError``.
+fn set_load_value(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    key: &Bound<'_, PyString>,
+    parts: &Option<Vec<Py<PyString>>>,
+    value: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    match parts {
+        None => dict.set_item(key, value),
+        Some(parts) => {
+            let mut target = dict.clone();
+            for part in &parts[..parts.len() - 1] {
+                let p = part.bind(py);
+                target = match target.get_item(p)? {
+                    Some(existing) => existing.cast_into::<PyDict>().map_err(|_| fallback())?,
+                    None => {
+                        let nested = PyDict::new(py);
+                        target.set_item(p, &nested)?;
+                        nested
+                    }
+                };
+            }
+            target.set_item(parts[parts.len() - 1].bind(py), value)
+        }
+    }
 }
 
 /// One schema level for load: its field specs plus unknown-key handling.
@@ -866,6 +915,7 @@ impl LoadSerializer {
                 LoadFieldSpec::Native {
                     data_key,
                     out_key,
+                    out_key_parts,
                     load_default,
                     required,
                     allow_none,
@@ -883,13 +933,19 @@ impl LoadSerializer {
                         }
                         let default = load_default.bind(py);
                         if !default.is(missing) {
-                            out.set_item(out_key.bind(py), default)?;
+                            set_load_value(py, &out, out_key.bind(py), out_key_parts, default)?;
                         }
                         continue;
                     };
                     if value.is_none() {
                         if *allow_none {
-                            out.set_item(out_key.bind(py), py.None())?;
+                            set_load_value(
+                                py,
+                                &out,
+                                out_key.bind(py),
+                                out_key_parts,
+                                &py.None().into_bound(py),
+                            )?;
                             continue;
                         }
                         return Err(fallback()); // ``null`` error
@@ -905,12 +961,13 @@ impl LoadSerializer {
                             Err(e) => return Err(to_fallback(py, e)),
                         }
                     }
-                    out.set_item(out_key.bind(py), result)?;
+                    set_load_value(py, &out, out_key.bind(py), out_key_parts, &result)?;
                 }
                 LoadFieldSpec::Callback {
                     data_key,
                     attr_name,
                     out_key,
+                    out_key_parts,
                     field,
                 } => {
                     let raw = data.get_item(data_key.bind(py))?;
@@ -945,7 +1002,7 @@ impl LoadSerializer {
                     if res.is(missing) {
                         continue;
                     }
-                    out.set_item(out_key.bind(py), res)?;
+                    set_load_value(py, &out, out_key.bind(py), out_key_parts, &res)?;
                 }
             }
         }
@@ -954,6 +1011,16 @@ impl LoadSerializer {
             for key in data.keys() {
                 if !known.contains(&key)? {
                     return Err(fallback()); // unknown field
+                }
+            }
+        } else if self.unknown == UNKNOWN_INCLUDE {
+            // Copy unknown keys through with their raw values (``ret_d[key] =
+            // data[key]``). marshmallow appends them after the known fields;
+            // dict equality is order-insensitive, so input order is fine.
+            let known = self.known_keys.bind(py);
+            for (key, value) in data.iter() {
+                if !known.contains(&key)? {
+                    out.set_item(key, value)?;
                 }
             }
         }
@@ -1182,10 +1249,13 @@ fn parse_load_field_spec(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Lo
     let is_callback: bool = t.get_item(0)?.extract()?;
     if is_callback {
         // (True, data_key, attr_name, out_key, field)
+        let out_key = t.get_item(3)?.cast_into::<PyString>()?;
+        let out_key_parts = split_key_parts(py, &out_key)?;
         Ok(LoadFieldSpec::Callback {
             data_key: t.get_item(1)?.cast_into::<PyString>()?.unbind(),
             attr_name: t.get_item(2)?.cast_into::<PyString>()?.unbind(),
-            out_key: t.get_item(3)?.cast_into::<PyString>()?.unbind(),
+            out_key: out_key.unbind(),
+            out_key_parts,
             field: t.get_item(4)?.unbind(),
         })
     } else {
@@ -1196,9 +1266,12 @@ fn parse_load_field_spec(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Lo
         for item in validators_list.iter() {
             validators.push(parse_validator(py, &item)?);
         }
+        let out_key = t.get_item(2)?.cast_into::<PyString>()?;
+        let out_key_parts = split_key_parts(py, &out_key)?;
         Ok(LoadFieldSpec::Native {
             data_key: t.get_item(1)?.cast_into::<PyString>()?.unbind(),
-            out_key: t.get_item(2)?.cast_into::<PyString>()?.unbind(),
+            out_key: out_key.unbind(),
+            out_key_parts,
             load_default: t.get_item(3)?.unbind(),
             required: t.get_item(4)?.extract()?,
             allow_none: t.get_item(5)?.extract()?,
