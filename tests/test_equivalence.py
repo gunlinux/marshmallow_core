@@ -766,6 +766,52 @@ def test_dump_typed_dict_defers():
     assert _compiler._build_element(field, ()) is None
 
 
+class LoadTupleSchema(Schema):
+    row = fields.Tuple((fields.String(), fields.Integer(), fields.Float()))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"row": ["a", 1, 2.5]},
+        {"row": ("a", "7", "3.0")},  # coerced int/float
+        {},  # missing
+    ],
+)
+def test_load_tuple_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(LoadTupleSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"row": ["a", 1]},  # too short
+        {"row": ["a", 1, 2.5, 9]},  # too long
+        {"row": ["a", "x", 2.5]},  # element coercion failure
+        {"row": "abc"},  # string is not a valid tuple
+        {"row": 5},  # not a sequence
+    ],
+)
+def test_load_tuple_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        LoadTupleSchema().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        LoadTupleSchema().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_tuple_is_native():
+    from marshmallow_core import _compiler
+
+    field = fields.Tuple((fields.String(), fields.Integer()))
+    element = _compiler._build_load_element(field, ())
+    assert element is not None and element[0] == _compiler._L_TUPLE
+
+
 @pytest.mark.parametrize("unknown", [RAISE, EXCLUDE, INCLUDE])
 def test_load_unknown_equivalence(unknown, monkeypatch):
     class S(Schema):

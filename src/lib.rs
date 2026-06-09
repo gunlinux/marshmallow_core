@@ -764,6 +764,10 @@ enum LoadElement {
     },
     /// Constant: always returns the held constant, ignoring the input value.
     Constant { constant: Py<PyAny> },
+    /// Tuple: a fixed-length sequence, one element per position. Defers on a
+    /// non-sequence, a length mismatch, a ``None`` element, or any per-element
+    /// error so Python re-runs with the exact messages.
+    Tuple(Vec<LoadElement>),
     /// Boolean: ``value in truthy -> True``, ``value in falsy -> False``; a miss
     /// (or a ``TypeError`` from an unhashable value) defers so Python raises the
     /// exact ``invalid`` error. Holds the field's own ``truthy``/``falsy`` sets.
@@ -1389,6 +1393,24 @@ impl LoadElement {
                 Ok(out.into_any())
             }
             LoadElement::Constant { constant } => Ok(constant.bind(py).clone()),
+            LoadElement::Tuple(elements) => {
+                if !is_list_like(value) {
+                    return Err(fallback()); // not a sequence -> ``invalid``
+                }
+                // Length mismatch -> defer (``zip(strict=True)`` / ``validate_length``).
+                if value.len()? != elements.len() {
+                    return Err(fallback());
+                }
+                let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(elements.len());
+                for (element, each) in elements.iter().zip(value.try_iter()?) {
+                    let each = each?;
+                    if each.is_none() {
+                        return Err(fallback()); // honour allow_none in Python
+                    }
+                    items.push(element.apply(ctx, &each, partial)?);
+                }
+                Ok(PyTuple::new(py, items)?.into_any())
+            }
             LoadElement::Boolean { truthy, falsy } => {
                 // ``value in truthy -> True``, ``value in falsy -> False``. Any
                 // miss, or a ``TypeError`` from an unhashable value, defers so
@@ -1580,6 +1602,15 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             falsy: t.get_item(2)?.unbind(),
         }),
         13 => Ok(LoadElement::IntStrict), // (13,)
+        15 => {
+            // (15, (element, element, ...))
+            let specs = t.get_item(1)?.cast_into::<PyTuple>()?;
+            let mut elements = Vec::with_capacity(specs.len());
+            for item in specs.iter() {
+                elements.push(parse_load_element(py, &item)?);
+            }
+            Ok(LoadElement::Tuple(elements))
+        }
         14 => {
             // (14, key_element_or_None, value_element_or_None)
             let parse_opt = |item: Bound<'_, PyAny>| -> PyResult<Option<Box<LoadElement>>> {
@@ -1604,7 +1635,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 7;
+const PROTOCOL_VERSION: u32 = 8;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
