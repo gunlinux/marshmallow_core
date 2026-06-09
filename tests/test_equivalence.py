@@ -673,6 +673,43 @@ def test_load_boolean_custom_truthy(monkeypatch):
     assert accelerated == pure == {"flag": True}
 
 
+class LoadStrictIntSchema(Schema):
+    n = fields.Integer(strict=True)
+
+
+@pytest.mark.parametrize("data", [{"n": 5}, {"n": -1}, {"n": 0}, {}])
+def test_load_strict_int_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(LoadStrictIntSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"n": "5"},  # strict rejects str (non-strict would coerce)
+        {"n": 2.5},  # strict rejects float
+        {"n": True},  # bool rejected
+        {"n": "x"},
+    ],
+)
+def test_load_strict_int_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        LoadStrictIntSchema().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        LoadStrictIntSchema().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_strict_int_is_native():
+    from marshmallow_core import _compiler
+
+    element = _compiler._build_load_element(fields.Integer(strict=True), ())
+    assert element == (_compiler._L_INTEGER_STRICT,)
+
+
 @pytest.mark.parametrize("unknown", [RAISE, EXCLUDE, INCLUDE])
 def test_load_unknown_equivalence(unknown, monkeypatch):
     class S(Schema):

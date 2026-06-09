@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 5
+_EXPECTED_PROTOCOL = 6
 
 
 class _NoFallbackError(Exception):
@@ -105,6 +105,7 @@ _L_DECIMAL = 9
 _L_DICT = 10
 _L_CONSTANT = 11
 _L_BOOLEAN = 12
+_L_INTEGER_STRICT = 13
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -457,8 +458,11 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
     if ftype is ma_fields.String:
         return (_L_STRING,)
     if ftype is ma_fields.Integer:
-        if field.strict:  # strict needs an ``numbers.Integral`` check; defer
-            return None
+        if field.strict:
+            # ``strict`` accepts only ``numbers.Integral``. Model the common
+            # exact-``int`` case natively; an ``Integral`` subclass (e.g. numpy)
+            # or an invalid value defers so Python coerces / raises exactly.
+            return (_L_INTEGER_STRICT,)
         return (_L_INTEGER,)
     if ftype is ma_fields.Float:
         return (_L_FLOAT, bool(field.allow_nan))
