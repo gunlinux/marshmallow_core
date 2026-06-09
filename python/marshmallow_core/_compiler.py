@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 6
+_EXPECTED_PROTOCOL = 7
 
 
 class _NoFallbackError(Exception):
@@ -106,6 +106,7 @@ _L_DICT = 10
 _L_CONSTANT = 11
 _L_BOOLEAN = 12
 _L_INTEGER_STRICT = 13
+_L_DICT_TYPED = 14
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -513,13 +514,33 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
         # it to the core, which turns any ``ValidationError`` into a fallback.
         return (_L_DECIMAL, field._deserialize)
     if ftype is ma_fields.Dict:
-        if (
-            field.key_field is None
-            and field.value_field is None
-            and field.mapping_type is dict
+        if field.mapping_type is not dict:
+            return None
+        if field.key_field is None and field.value_field is None:
+            return (_L_DICT,)  # plain dict-copy
+        # Typed Dict: apply the key/value fields per entry on the happy path.
+        # Require the inner fields carry no processors/validators (so their
+        # ``deserialize`` is just ``_deserialize`` for a present, non-None value);
+        # the core falls back on a non-dict input, a ``None`` key/value, or any
+        # per-entry error so Python accumulates the exact error structure.
+        key_field, value_field = field.key_field, field.value_field
+        if (key_field is not None and _has_field_processors(key_field)) or (
+            value_field is not None and _has_field_processors(value_field)
         ):
-            return (_L_DICT,)
-        return None
+            return None
+        key_el = (
+            _build_load_element(key_field, stack) if key_field is not None else None
+        )
+        val_el = (
+            _build_load_element(value_field, stack)
+            if value_field is not None
+            else None
+        )
+        if (key_field is not None and key_el is None) or (
+            value_field is not None and val_el is None
+        ):
+            return None
+        return (_L_DICT_TYPED, key_el, val_el)
     if ftype is ma_fields.Constant:
         return (_L_CONSTANT, field.constant)
     return None

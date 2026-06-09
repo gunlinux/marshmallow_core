@@ -755,6 +755,13 @@ enum LoadElement {
     /// Dict (no key/value fields): copy a dict input via ``dict(value)``; a
     /// non-dict input defers (Python decides Mapping-or-``invalid``).
     Dict,
+    /// Typed Dict: apply the key/value field per entry (``None`` = pass through).
+    /// Defers on a non-dict input, a ``None`` key/value, or any per-entry error so
+    /// Python re-runs and accumulates the exact error structure.
+    DictTyped {
+        key_el: Option<Box<LoadElement>>,
+        val_el: Option<Box<LoadElement>>,
+    },
     /// Constant: always returns the held constant, ignoring the input value.
     Constant { constant: Py<PyAny> },
     /// Boolean: ``value in truthy -> True``, ``value in falsy -> False``; a miss
@@ -1352,6 +1359,35 @@ impl LoadElement {
                     Err(fallback()) // non-dict: defer (Mapping check / ``invalid``)
                 }
             }
+            LoadElement::DictTyped { key_el, val_el } => {
+                // Only an exact dict happy-path; a non-dict Mapping defers so
+                // Python applies its ``isinstance(_, Mapping)`` handling.
+                let dict = value.cast::<PyDict>().map_err(|_| fallback())?;
+                let out = PyDict::new(py);
+                for (k, v) in dict.iter() {
+                    // ``None`` key/value -> defer (Python honours ``allow_none``).
+                    let ko = match key_el {
+                        Some(ke) => {
+                            if k.is_none() {
+                                return Err(fallback());
+                            }
+                            ke.apply(ctx, &k, partial)?
+                        }
+                        None => k,
+                    };
+                    let vo = match val_el {
+                        Some(ve) => {
+                            if v.is_none() {
+                                return Err(fallback());
+                            }
+                            ve.apply(ctx, &v, partial)?
+                        }
+                        None => v,
+                    };
+                    out.set_item(ko, vo)?;
+                }
+                Ok(out.into_any())
+            }
             LoadElement::Constant { constant } => Ok(constant.bind(py).clone()),
             LoadElement::Boolean { truthy, falsy } => {
                 // ``value in truthy -> True``, ``value in falsy -> False``. Any
@@ -1544,6 +1580,20 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             falsy: t.get_item(2)?.unbind(),
         }),
         13 => Ok(LoadElement::IntStrict), // (13,)
+        14 => {
+            // (14, key_element_or_None, value_element_or_None)
+            let parse_opt = |item: Bound<'_, PyAny>| -> PyResult<Option<Box<LoadElement>>> {
+                if item.is_none() {
+                    Ok(None)
+                } else {
+                    Ok(Some(Box::new(parse_load_element(py, &item)?)))
+                }
+            };
+            Ok(LoadElement::DictTyped {
+                key_el: parse_opt(t.get_item(1)?)?,
+                val_el: parse_opt(t.get_item(2)?)?,
+            })
+        }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown load element tag {other}"
         ))),
@@ -1554,7 +1604,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 6;
+const PROTOCOL_VERSION: u32 = 7;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
