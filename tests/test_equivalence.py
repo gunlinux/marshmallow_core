@@ -526,6 +526,69 @@ def test_load_nested_is_native():
     assert accel.is_available() == (vars(schema).get("_mc_load_deserializer") is not None)
 
 
+class _Region:
+    def __init__(self, name):
+        self.name = name
+
+    def __eq__(self, other):
+        return isinstance(other, _Region) and other.name == self.name
+
+
+class _OverridesLoadSchema(Schema):
+    """A schema that customises ``load`` directly instead of via ``post_load``.
+
+    Mirrors ``marshmallow_dataclass`` (which overrides ``Schema.load`` to build a
+    dataclass instance and leaves ``_hooks`` empty).
+    """
+
+    name = fields.String()
+
+    def load(self, data, **kwargs):
+        return _Region(**super().load(data, **kwargs))
+
+
+class _OverridesDumpSchema(Schema):
+    """A schema that customises ``dump`` directly instead of via ``post_dump``."""
+
+    name = fields.String()
+
+    def dump(self, obj, **kwargs):
+        result = super().dump(obj, **kwargs)
+        result["dumped"] = True
+        return result
+
+
+def test_load_nested_overridden_load_uses_callback(monkeypatch):
+    """A ``Nested`` whose inner schema overrides ``load`` must use the callback
+    path so the override runs — compiling it natively would emit a plain ``dict``
+    instead of the override's instance (regression: marshmallow_dataclass)."""
+
+    class AgencySchema(Schema):
+        id = fields.Integer()
+        region = fields.Nested(_OverridesLoadSchema)
+
+    accelerated, pure = _load_both(
+        AgencySchema, {"id": 1, "region": {"name": "Moscow"}}, monkeypatch=monkeypatch
+    )
+    assert accelerated == pure
+    assert accelerated["region"] == _Region("Moscow")
+
+
+def test_dump_nested_overridden_dump_uses_callback(monkeypatch):
+    """Symmetric to the load case: a ``Nested`` whose inner schema overrides
+    ``dump`` must use the callback path (the dump core has no fallback)."""
+
+    class AgencySchema(Schema):
+        id = fields.Integer()
+        region = fields.Nested(_OverridesDumpSchema)
+
+    accelerated, pure = _dump_both(
+        AgencySchema, {"id": 1, "region": {"name": "Moscow"}}, monkeypatch=monkeypatch
+    )
+    assert accelerated == pure
+    assert accelerated["region"]["dumped"] is True
+
+
 @pytest.mark.parametrize(
     "data",
     [
