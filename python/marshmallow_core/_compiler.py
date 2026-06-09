@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 10
+_EXPECTED_PROTOCOL = 11
 
 
 class _NoFallbackError(Exception):
@@ -91,6 +91,7 @@ _DECIMAL = 9
 _DICT = 10
 _CONSTANT = 11
 _TIMEDELTA = 12
+_DICT_TYPED = 13
 
 # Load element tags (a distinct tag space from the dump tags above).
 _L_PASSTHROUGH = 0
@@ -251,15 +252,28 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
         # hand the field's own ``_serialize`` to the core (provably identical).
         return (_DECIMAL, field._serialize)
     if ftype is ma_fields.Dict:
-        # Only the plain dict-copy case (``dict(value)``) is native; per-key/value
-        # field serialization falls back to the callback path.
-        if (
-            field.key_field is None
-            and field.value_field is None
-            and field.mapping_type is dict
+        if field.mapping_type is not dict:
+            return None
+        if field.key_field is None and field.value_field is None:
+            return (_DICT,)  # plain dict-copy (``dict(value)``)
+        # Typed Dict: serialize keys/values via their fields per entry. The dump
+        # elements are provably identical to ``_serialize``; the core defers
+        # (now that dump has a fallback) on a non-dict input.
+        key_el = (
+            _build_element(field.key_field, stack)
+            if field.key_field is not None
+            else None
+        )
+        val_el = (
+            _build_element(field.value_field, stack)
+            if field.value_field is not None
+            else None
+        )
+        if (field.key_field is not None and key_el is None) or (
+            field.value_field is not None and val_el is None
         ):
-            return (_DICT,)
-        return None
+            return None
+        return (_DICT_TYPED, key_el, val_el)
     if ftype is ma_fields.Constant:
         return (_CONSTANT, field.constant)
     if ftype is ma_fields.TimeDelta:

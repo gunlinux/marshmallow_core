@@ -758,12 +758,26 @@ def test_load_typed_dict_is_native():
     assert element is not None and element[0] == _compiler._L_DICT_TYPED
 
 
-def test_dump_typed_dict_defers():
-    """The dump core has no fallback, so typed Dict dump stays a callback."""
+def test_dump_typed_dict_is_native():
+    """With the dump fallback in place, typed Dict dump compiles native."""
     from marshmallow_core import _compiler
 
     field = fields.Dict(keys=fields.String(), values=fields.Integer())
-    assert _compiler._build_element(field, ()) is None
+    element = _compiler._build_element(field, ())
+    assert element is not None and element[0] == _compiler._DICT_TYPED
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {"counts": {"a": 1, "b": 2}, "vals_only": {"x": 1.5}, "keys_only": {"k": "v"}},
+        {"counts": {}},
+        {},
+    ],
+)
+def test_dump_typed_dict_equivalence(obj, monkeypatch):
+    accelerated, pure = _dump_both(LoadTypedDictSchema, obj, monkeypatch=monkeypatch)
+    assert accelerated == pure
 
 
 class LoadTupleSchema(Schema):
