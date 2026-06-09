@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 8
+_EXPECTED_PROTOCOL = 9
 
 
 class _NoFallbackError(Exception):
@@ -108,6 +108,7 @@ _L_BOOLEAN = 12
 _L_INTEGER_STRICT = 13
 _L_DICT_TYPED = 14
 _L_TUPLE = 15
+_L_PLUCK = 16
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -468,6 +469,19 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
         return (_L_INTEGER,)
     if ftype is ma_fields.Float:
         return (_L_FLOAT, bool(field.allow_nan))
+    if ftype is ma_fields.Pluck:
+        # ``Pluck._deserialize`` wraps the scalar as ``{data_key: value}`` (per
+        # item when ``many``) and loads it through the inner ``only=(field_name,)``
+        # schema. Build a single-record payload and iterate ourselves for ``many``;
+        # the core falls back on a non-collection ``many`` input or any error.
+        inner_schema = field.schema
+        unknown = field.unknown if field.unknown is not None else inner_schema.unknown
+        payload = _build_load_payload(
+            inner_schema, many=False, unknown=unknown, stack=stack
+        )
+        if payload is None:
+            return None
+        return (_L_PLUCK, payload, field._field_data_key, bool(field.many))
     if ftype is ma_fields.Nested:
         inner_schema = field.schema
         many = bool(inner_schema.many or field.many)

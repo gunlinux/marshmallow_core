@@ -768,6 +768,13 @@ enum LoadElement {
     /// non-sequence, a length mismatch, a ``None`` element, or any per-element
     /// error so Python re-runs with the exact messages.
     Tuple(Vec<LoadElement>),
+    /// Pluck: wrap the scalar as ``{data_key: value}`` (per item when ``many``)
+    /// and run the inner ``only=(field_name,)`` schema's single-record load.
+    Pluck {
+        serializer: Box<LoadSerializer>,
+        data_key: Py<PyString>,
+        many: bool,
+    },
     /// Boolean: ``value in truthy -> True``, ``value in falsy -> False``; a miss
     /// (or a ``TypeError`` from an unhashable value) defers so Python raises the
     /// exact ``invalid`` error. Holds the field's own ``truthy``/``falsy`` sets.
@@ -1411,6 +1418,29 @@ impl LoadElement {
                 }
                 Ok(PyTuple::new(py, items)?.into_any())
             }
+            LoadElement::Pluck {
+                serializer,
+                data_key,
+                many,
+            } => {
+                let dk = data_key.bind(py);
+                if *many {
+                    if !is_list_like(value) {
+                        return Err(fallback()); // ``_test_collection`` -> ``invalid``
+                    }
+                    let out = PyList::empty(py);
+                    for v in value.try_iter()? {
+                        let tmp = PyDict::new(py);
+                        tmp.set_item(dk, v?)?;
+                        out.append(serializer.run_one(ctx, tmp.as_any(), partial)?)?;
+                    }
+                    Ok(out.into_any())
+                } else {
+                    let tmp = PyDict::new(py);
+                    tmp.set_item(dk, value)?;
+                    Ok(serializer.run_one(ctx, tmp.as_any(), partial)?.into_any())
+                }
+            }
             LoadElement::Boolean { truthy, falsy } => {
                 // ``value in truthy -> True``, ``value in falsy -> False``. Any
                 // miss, or a ``TypeError`` from an unhashable value, defers so
@@ -1602,6 +1632,15 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             falsy: t.get_item(2)?.unbind(),
         }),
         13 => Ok(LoadElement::IntStrict), // (13,)
+        16 => {
+            // (16, nested_payload, data_key, many)
+            let serializer = parse_load_serializer(py, &t.get_item(1)?)?;
+            Ok(LoadElement::Pluck {
+                serializer: Box::new(serializer),
+                data_key: t.get_item(2)?.cast_into::<PyString>()?.unbind(),
+                many: t.get_item(3)?.extract()?,
+            })
+        }
         15 => {
             // (15, (element, element, ...))
             let specs = t.get_item(1)?.cast_into::<PyTuple>()?;
@@ -1635,7 +1674,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 8;
+const PROTOCOL_VERSION: u32 = 9;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
