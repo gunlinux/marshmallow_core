@@ -48,6 +48,7 @@ _LOAD_KIND = {
     _compiler._L_DECIMAL: "decimal",
     _compiler._L_DICT: "dict",
     _compiler._L_CONSTANT: "constant",
+    _compiler._L_BOOLEAN: "boolean",
 }
 
 

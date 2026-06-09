@@ -612,6 +612,67 @@ def test_load_errors_match_python(data, monkeypatch):
     assert acc_exc.value.messages == py_exc.value.messages
 
 
+class LoadBooleanSchema(Schema):
+    flag = fields.Boolean()
+    maybe = fields.Boolean(allow_none=True)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"flag": True, "maybe": False},  # actual bools
+        {"flag": "true", "maybe": "false"},  # truthy/falsy strings
+        {"flag": 1, "maybe": 0},  # 1/0 (hash-equal to True/False)
+        {"flag": "yes", "maybe": "no"},
+        {"maybe": None},  # null on an allow_none field
+        {},  # missing, nothing required
+    ],
+)
+def test_load_boolean_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(LoadBooleanSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"flag": "maybe"},  # not in truthy/falsy -> invalid
+        {"flag": 2},  # int not in the sets
+        {"flag": [1]},  # unhashable -> TypeError -> invalid
+        {"flag": None},  # null on a non-nullable field
+    ],
+)
+def test_load_boolean_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        LoadBooleanSchema().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        LoadBooleanSchema().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_boolean_is_native():
+    """A default ``Boolean`` compiles to a native load element (regression: it
+    used to fall back to the Python callback path)."""
+    from marshmallow_core import _compiler
+
+    element = _compiler._build_load_element(fields.Boolean(), ())
+    assert element is not None
+    assert element[0] == _compiler._L_BOOLEAN
+
+
+def test_load_boolean_custom_truthy(monkeypatch):
+    """A field with customised ``truthy``/``falsy`` honours its own sets."""
+
+    class S(Schema):
+        flag = fields.Boolean(truthy={"Y"}, falsy={"N"})
+
+    accelerated, pure = _load_both(S, {"flag": "Y"}, monkeypatch=monkeypatch)
+    assert accelerated == pure == {"flag": True}
+
+
 @pytest.mark.parametrize("unknown", [RAISE, EXCLUDE, INCLUDE])
 def test_load_unknown_equivalence(unknown, monkeypatch):
     class S(Schema):
