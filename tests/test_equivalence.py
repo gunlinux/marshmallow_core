@@ -866,6 +866,57 @@ def test_load_pluck_is_native():
     assert element is not None and element[0] == _compiler._L_PLUCK
 
 
+class TimeDeltaSchema(Schema):
+    secs = fields.TimeDelta()  # precision="seconds"
+    millis = fields.TimeDelta(precision="milliseconds")
+
+
+@pytest.mark.parametrize(
+    "loaded",
+    [
+        {"secs": dt.timedelta(seconds=90), "millis": dt.timedelta(milliseconds=1500)},
+        {"secs": dt.timedelta(0), "millis": dt.timedelta(microseconds=123456)},
+    ],
+)
+def test_dump_timedelta_equivalence(loaded, monkeypatch):
+    accelerated, pure = _dump_both(TimeDeltaSchema, loaded, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"secs": 90, "millis": 1500},
+        {"secs": "1.1234567", "millis": 0},  # float-string, rounding
+        {"secs": dt.timedelta(seconds=5)},  # already a timedelta -> passthrough
+        {},
+    ],
+)
+def test_load_timedelta_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(TimeDeltaSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize("data", [{"secs": "not-a-number"}, {"secs": None}])
+def test_load_timedelta_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        TimeDeltaSchema().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        TimeDeltaSchema().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_timedelta_is_native():
+    from marshmallow_core import _compiler
+
+    field = fields.TimeDelta()
+    assert _compiler._build_element(field, ())[0] == _compiler._TIMEDELTA
+    assert _compiler._build_load_element(field, ())[0] == _compiler._L_TIMEDELTA
+
+
 @pytest.mark.parametrize("unknown", [RAISE, EXCLUDE, INCLUDE])
 def test_load_unknown_equivalence(unknown, monkeypatch):
     class S(Schema):

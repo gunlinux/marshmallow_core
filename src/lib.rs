@@ -82,6 +82,9 @@ enum Element {
     Dict,
     /// Constant: always returns the held constant, ignoring the input value.
     Constant { constant: Py<PyAny> },
+    /// TimeDelta: defer to the field's own ``_serialize`` (precision-sensitive
+    /// timedelta -> float), provably identical to the callback path.
+    TimeDelta { serialize: Py<PyAny> },
 }
 
 enum FieldSpec {
@@ -482,6 +485,12 @@ impl Element {
                     .bind(py)
                     .call1((value, py.None(), py.None()))
             }
+            Element::TimeDelta { serialize } => {
+                // Like ``Decimal``: the field's own ``_serialize`` (timedelta ->
+                // float) is precision-sensitive, so call it directly. It returns
+                // ``None`` for ``None``.
+                serialize.bind(py).call1((value, py.None(), py.None()))
+            }
             Element::Dict => {
                 if value.is_none() {
                     return Ok(py.None().into_bound(py));
@@ -631,6 +640,10 @@ fn parse_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<Element> {
             // (11, constant)
             constant: t.get_item(1)?.unbind(),
         }),
+        12 => Ok(Element::TimeDelta {
+            // (12, bound _serialize)
+            serialize: t.get_item(1)?.unbind(),
+        }),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown element tag {other}"
         ))),
@@ -752,6 +765,9 @@ enum LoadElement {
     /// Decimal: defer to the field's own ``_deserialize`` (``_validated``);
     /// any ``ValidationError`` becomes ``AccelFallback``.
     Decimal { deserialize: Py<PyAny> },
+    /// TimeDelta: defer to the field's own ``_deserialize`` (float -> timedelta);
+    /// any ``ValidationError`` becomes ``AccelFallback``.
+    TimeDelta { deserialize: Py<PyAny> },
     /// Dict (no key/value fields): copy a dict input via ``dict(value)``; a
     /// non-dict input defers (Python decides Mapping-or-``invalid``).
     Dict,
@@ -1363,6 +1379,10 @@ impl LoadElement {
                 .bind(py)
                 .call1((value, py.None(), py.None()))
                 .map_err(|e| to_fallback(py, e)),
+            LoadElement::TimeDelta { deserialize } => deserialize
+                .bind(py)
+                .call1((value, py.None(), py.None()))
+                .map_err(|e| to_fallback(py, e)),
             LoadElement::Dict => {
                 if value.is_instance_of::<PyDict>() {
                     ctx.dict_fn.bind(py).call1((value,))
@@ -1632,6 +1652,10 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             falsy: t.get_item(2)?.unbind(),
         }),
         13 => Ok(LoadElement::IntStrict), // (13,)
+        17 => Ok(LoadElement::TimeDelta {
+            // (17, bound _deserialize)
+            deserialize: t.get_item(1)?.unbind(),
+        }),
         16 => {
             // (16, nested_payload, data_key, many)
             let serializer = parse_load_serializer(py, &t.get_item(1)?)?;
@@ -1674,7 +1698,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 9;
+const PROTOCOL_VERSION: u32 = 10;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
