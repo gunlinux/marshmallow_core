@@ -148,7 +148,10 @@ def _patched_do_load(
 ):
     many = self.many if many is None else bool(many)
     unknown = self.unknown if unknown is None else unknown
-    if partial is None:
+    # Track whether the caller supplied ``partial`` so we can reuse the cached
+    # ``_core_partial(self.partial)`` on the common "use the schema default" call.
+    partial_is_default = partial is None
+    if partial_is_default:
         partial = self.partial
     # The core is compiled for this schema's own ``unknown``; ``partial`` (boolean
     # or a name collection) is threaded as a runtime argument. Hook-bearing
@@ -156,18 +159,31 @@ def _patched_do_load(
     # the hooks around it); hook-free schemas call the core directly.
     if unknown == self.unknown and _partial_is_supported(partial):
         cache = vars(self)
-        ld = cache.get("_mc_load_deserializer", _UNSET)
-        if ld is _UNSET:
-            ld = cache["_mc_load_deserializer"] = _compiler.build_load_deserializer(
-                self
+        # Cached once per instance: the compiled deserializer plus the two
+        # constants we'd otherwise recompute every load — whether the schema has
+        # load hooks, and the core form of its default ``partial``. ``None`` means
+        # "not compilable" (always pure Python); ``_UNSET`` means "not built yet".
+        plan = cache.get("_mc_load_plan", _UNSET)
+        if plan is _UNSET:
+            ld = _compiler.build_load_deserializer(self)
+            plan = cache["_mc_load_plan"] = (
+                None
+                if ld is None
+                else (ld, _has_load_hooks(self), _core_partial(self.partial))
             )
-        if ld is not None:
+        if plan is not None:
+            ld, has_hooks, default_core_partial = plan
             try:
-                if _has_load_hooks(self):
+                if has_hooks:
                     return _accelerated_load(
                         self, ld, data, many, partial, unknown, postprocess
                     )
-                return ld.run(data, many, _core_partial(partial))
+                core_partial = (
+                    default_core_partial
+                    if partial_is_default
+                    else _core_partial(partial)
+                )
+                return ld.run(data, many, core_partial)
             except _compiler.AccelFallback:
                 pass  # off the happy path -> unchanged pure-Python load below
     return _orig_do_load(

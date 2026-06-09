@@ -60,9 +60,13 @@ those hooks run in Python around it (mirroring marshmallow's own `_do_load`
 split). Recognized field validators (`Range` / `Length` / `OneOf`) run natively;
 any other validator, or field-level `pre_load` / `post_load`, keeps that field
 on the callback path. `unknown=INCLUDE`, collection/dotted `partial`, and dotted
-attribute writes are all accelerated. Custom `dict_class` / `get_attribute`,
-self-referential schemas, custom strptime temporal formats, and callable
-defaults always fall back to pure Python.
+attribute writes are all accelerated. Natively modelled fields include the
+scalars plus `Decimal`, `Dict`, `Constant`, `TimeDelta`, `Boolean` and
+`Integer(strict=True)`; on **load**, also typed `Dict` (keys/values), `Tuple`,
+and `Pluck` (these three stay on the callback path for *dump* — the dump core
+has no fallback). Custom `dict_class` / `get_attribute`, self-referential
+schemas, custom strptime temporal formats, and callable defaults always fall
+back to pure Python.
 
 ### Where the speedup is limited
 

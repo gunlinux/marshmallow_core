@@ -516,14 +516,14 @@ def test_load_enum_errors_match_python(data, monkeypatch):
 def test_load_enum_is_native():
     schema = LoadEnumSchema()
     schema.load({"by_name": "RED"})  # trigger lazy build
-    assert accel.is_available() == (vars(schema).get("_mc_load_deserializer") is not None)
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 def test_load_nested_is_native():
 
     schema = LoadContainer()
     schema.load({"people": [], "total": 0})  # trigger lazy build
-    assert accel.is_available() == (vars(schema).get("_mc_load_deserializer") is not None)
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 class _Region:
@@ -673,6 +673,250 @@ def test_load_boolean_custom_truthy(monkeypatch):
     assert accelerated == pure == {"flag": True}
 
 
+class LoadStrictIntSchema(Schema):
+    n = fields.Integer(strict=True)
+
+
+@pytest.mark.parametrize("data", [{"n": 5}, {"n": -1}, {"n": 0}, {}])
+def test_load_strict_int_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(LoadStrictIntSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"n": "5"},  # strict rejects str (non-strict would coerce)
+        {"n": 2.5},  # strict rejects float
+        {"n": True},  # bool rejected
+        {"n": "x"},
+    ],
+)
+def test_load_strict_int_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        LoadStrictIntSchema().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        LoadStrictIntSchema().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_strict_int_is_native():
+    from marshmallow_core import _compiler
+
+    element = _compiler._build_load_element(fields.Integer(strict=True), ())
+    assert element == (_compiler._L_INTEGER_STRICT,)
+
+
+class LoadTypedDictSchema(Schema):
+    counts = fields.Dict(keys=fields.String(), values=fields.Integer())
+    vals_only = fields.Dict(values=fields.Float())
+    keys_only = fields.Dict(keys=fields.String())
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"counts": {"a": 1, "b": "2"}},  # values coerced "2" -> 2
+        {"vals_only": {"x": "1.5", "y": 2}},
+        {"keys_only": {"a": "v", "b": "w"}},  # string keys pass the key field
+        {"counts": {}},  # empty
+        {},  # all missing
+    ],
+)
+def test_load_typed_dict_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(LoadTypedDictSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"counts": {"a": "not-an-int"}},  # value coercion failure
+        {"counts": [1, 2]},  # not a mapping
+        {"counts": {"a": None}},  # None value -> allow_none check in Python
+    ],
+)
+def test_load_typed_dict_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        LoadTypedDictSchema().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        LoadTypedDictSchema().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_typed_dict_is_native():
+    from marshmallow_core import _compiler
+
+    field = fields.Dict(keys=fields.String(), values=fields.Integer())
+    element = _compiler._build_load_element(field, ())
+    assert element is not None and element[0] == _compiler._L_DICT_TYPED
+
+
+def test_dump_typed_dict_defers():
+    """The dump core has no fallback, so typed Dict dump stays a callback."""
+    from marshmallow_core import _compiler
+
+    field = fields.Dict(keys=fields.String(), values=fields.Integer())
+    assert _compiler._build_element(field, ()) is None
+
+
+class LoadTupleSchema(Schema):
+    row = fields.Tuple((fields.String(), fields.Integer(), fields.Float()))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"row": ["a", 1, 2.5]},
+        {"row": ("a", "7", "3.0")},  # coerced int/float
+        {},  # missing
+    ],
+)
+def test_load_tuple_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(LoadTupleSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"row": ["a", 1]},  # too short
+        {"row": ["a", 1, 2.5, 9]},  # too long
+        {"row": ["a", "x", 2.5]},  # element coercion failure
+        {"row": "abc"},  # string is not a valid tuple
+        {"row": 5},  # not a sequence
+    ],
+)
+def test_load_tuple_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        LoadTupleSchema().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        LoadTupleSchema().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_tuple_is_native():
+    from marshmallow_core import _compiler
+
+    field = fields.Tuple((fields.String(), fields.Integer()))
+    element = _compiler._build_load_element(field, ())
+    assert element is not None and element[0] == _compiler._L_TUPLE
+
+
+class _ArtistSchema(Schema):
+    id = fields.Integer()
+    name = fields.String()
+
+
+class LoadPluckSchema(Schema):
+    artist = fields.Pluck(_ArtistSchema, "id")
+
+
+class LoadPluckManySchema(Schema):
+    artists = fields.Pluck(_ArtistSchema, "id", many=True)
+
+
+@pytest.mark.parametrize(
+    ("factory", "data"),
+    [
+        (LoadPluckSchema, {"artist": 42}),
+        (LoadPluckSchema, {"artist": "7"}),  # coerced to int by the inner field
+        (LoadPluckSchema, {}),  # missing
+        (LoadPluckManySchema, {"artists": [1, 2, 3]}),
+        (LoadPluckManySchema, {"artists": []}),
+    ],
+)
+def test_load_pluck_equivalence(factory, data, monkeypatch):
+    accelerated, pure = _load_both(factory, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    ("factory", "data"),
+    [
+        (LoadPluckSchema, {"artist": "not-an-int"}),  # inner coercion failure
+        (LoadPluckManySchema, {"artists": 5}),  # not a collection
+        (LoadPluckManySchema, {"artists": [1, "x"]}),  # one bad element
+    ],
+)
+def test_load_pluck_errors_match_python(factory, data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        factory().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        factory().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_pluck_is_native():
+    from marshmallow_core import _compiler
+
+    element = _compiler._build_load_element(fields.Pluck(_ArtistSchema, "id"), ())
+    assert element is not None and element[0] == _compiler._L_PLUCK
+
+
+class TimeDeltaSchema(Schema):
+    secs = fields.TimeDelta()  # precision="seconds"
+    millis = fields.TimeDelta(precision="milliseconds")
+
+
+@pytest.mark.parametrize(
+    "loaded",
+    [
+        {"secs": dt.timedelta(seconds=90), "millis": dt.timedelta(milliseconds=1500)},
+        {"secs": dt.timedelta(0), "millis": dt.timedelta(microseconds=123456)},
+    ],
+)
+def test_dump_timedelta_equivalence(loaded, monkeypatch):
+    accelerated, pure = _dump_both(TimeDeltaSchema, loaded, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"secs": 90, "millis": 1500},
+        {"secs": "1.1234567", "millis": 0},  # float-string, rounding
+        {"secs": dt.timedelta(seconds=5)},  # already a timedelta -> passthrough
+        {},
+    ],
+)
+def test_load_timedelta_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(TimeDeltaSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize("data", [{"secs": "not-a-number"}, {"secs": None}])
+def test_load_timedelta_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        TimeDeltaSchema().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        TimeDeltaSchema().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_timedelta_is_native():
+    from marshmallow_core import _compiler
+
+    field = fields.TimeDelta()
+    assert _compiler._build_element(field, ())[0] == _compiler._TIMEDELTA
+    assert _compiler._build_load_element(field, ())[0] == _compiler._L_TIMEDELTA
+
+
 @pytest.mark.parametrize("unknown", [RAISE, EXCLUDE, INCLUDE])
 def test_load_unknown_equivalence(unknown, monkeypatch):
     class S(Schema):
@@ -708,7 +952,7 @@ def test_load_include_is_native():
     schema = IncludeSchema()
     schema.load({"a": 1, "extra": "x"})  # trigger lazy build
     assert accel.is_available() == (
-        vars(schema).get("_mc_load_deserializer") is not None
+        vars(schema).get("_mc_load_plan") is not None
     )
 
 
@@ -754,7 +998,7 @@ def test_load_dotted_attribute_is_native():
     schema = DottedLoadSchema()
     schema.load({"c": 1})  # trigger lazy build
     assert accel.is_available() == (
-        vars(schema).get("_mc_load_deserializer") is not None
+        vars(schema).get("_mc_load_plan") is not None
     )
 
 
@@ -848,7 +1092,7 @@ def test_load_validators_is_native():
     schema = ValidatorSchema()
     schema.load({"age": 1})  # trigger lazy build
     assert accel.is_available() == (
-        vars(schema).get("_mc_load_deserializer") is not None
+        vars(schema).get("_mc_load_plan") is not None
     )
 
 
@@ -977,7 +1221,7 @@ def test_load_hooks_is_native():
     schema = HookLoadSchema()
     schema.load({"a": 1, "b": "x", "c": 2})  # trigger lazy build
     assert accel.is_available() == (
-        vars(schema).get("_mc_load_deserializer") is not None
+        vars(schema).get("_mc_load_plan") is not None
     )
 
 
@@ -1025,7 +1269,7 @@ def test_load_post_load_only_uses_core(monkeypatch):
     schema = S()
     schema.load({"i": 5})
     assert accel.is_available() == (
-        vars(schema).get("_mc_load_deserializer") is not None
+        vars(schema).get("_mc_load_plan") is not None
     )
     accelerated, pure = _load_both(S, {"i": 5}, monkeypatch=monkeypatch)
     assert accelerated == pure == {"i": 5, "doubled": 10}
@@ -1111,7 +1355,7 @@ def test_load_temporal_uuid_errors_match_python(data, monkeypatch):
 def test_load_temporal_uuid_is_native():
     schema = LoadTemporalSchema()
     schema.load({"day": "2020-01-02"})  # trigger lazy build
-    assert accel.is_available() == (vars(schema).get("_mc_load_deserializer") is not None)
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 # ---- new native field types: Decimal / Dict / Constant -------------------
@@ -1204,7 +1448,7 @@ def test_decimal_is_native():
     ld.load({"plain": "1"})
     if accel.is_available():
         assert vars(d).get("_mc_dump_serializer") is not None
-        assert vars(ld).get("_mc_load_deserializer") is not None
+        assert vars(ld).get("_mc_load_plan") is not None
 
 
 class DictSchema(Schema):
@@ -1316,7 +1560,7 @@ def test_load_partial_true_equivalence(data, monkeypatch):
 def test_load_partial_true_is_native():
     schema = PartialSchema(partial=True)
     schema.load({"id": 1})  # trigger lazy build
-    assert accel.is_available() == (vars(schema).get("_mc_load_deserializer") is not None)
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 def test_load_partial_true_default_not_applied(monkeypatch):
@@ -1377,7 +1621,7 @@ def test_load_partial_collection_is_native():
     schema = PartialSchema()
     schema.load({"id": 1, "inner": {"a": 5}}, partial=("name",))  # lazy build
     assert accel.is_available() == (
-        vars(schema).get("_mc_load_deserializer") is not None
+        vars(schema).get("_mc_load_plan") is not None
     )
 
 
@@ -1410,7 +1654,7 @@ def test_core_active_when_importable():
     assert accel.is_available()
     schema = LoadFlatSchema()
     schema.load({"i": 1})  # trigger the lazy build
-    assert vars(schema).get("_mc_load_deserializer") is not None
+    assert vars(schema).get("_mc_load_plan") is not None
 
 
 def test_protocol_version_matches():

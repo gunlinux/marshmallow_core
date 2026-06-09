@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 5
+_EXPECTED_PROTOCOL = 10
 
 
 class _NoFallbackError(Exception):
@@ -90,6 +90,7 @@ _ENUM = 8
 _DECIMAL = 9
 _DICT = 10
 _CONSTANT = 11
+_TIMEDELTA = 12
 
 # Load element tags (a distinct tag space from the dump tags above).
 _L_PASSTHROUGH = 0
@@ -105,6 +106,11 @@ _L_DECIMAL = 9
 _L_DICT = 10
 _L_CONSTANT = 11
 _L_BOOLEAN = 12
+_L_INTEGER_STRICT = 13
+_L_DICT_TYPED = 14
+_L_TUPLE = 15
+_L_PLUCK = 16
+_L_TIMEDELTA = 17
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -256,6 +262,11 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
         return None
     if ftype is ma_fields.Constant:
         return (_CONSTANT, field.constant)
+    if ftype is ma_fields.TimeDelta:
+        # ``TimeDelta._serialize`` (timedelta -> float division) is intrinsically
+        # Python and precision-sensitive; hand the field's own method to the core
+        # (provably identical, like ``Decimal``).
+        return (_TIMEDELTA, field._serialize)
     return None
 
 
@@ -457,11 +468,27 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
     if ftype is ma_fields.String:
         return (_L_STRING,)
     if ftype is ma_fields.Integer:
-        if field.strict:  # strict needs an ``numbers.Integral`` check; defer
-            return None
+        if field.strict:
+            # ``strict`` accepts only ``numbers.Integral``. Model the common
+            # exact-``int`` case natively; an ``Integral`` subclass (e.g. numpy)
+            # or an invalid value defers so Python coerces / raises exactly.
+            return (_L_INTEGER_STRICT,)
         return (_L_INTEGER,)
     if ftype is ma_fields.Float:
         return (_L_FLOAT, bool(field.allow_nan))
+    if ftype is ma_fields.Pluck:
+        # ``Pluck._deserialize`` wraps the scalar as ``{data_key: value}`` (per
+        # item when ``many``) and loads it through the inner ``only=(field_name,)``
+        # schema. Build a single-record payload and iterate ourselves for ``many``;
+        # the core falls back on a non-collection ``many`` input or any error.
+        inner_schema = field.schema
+        unknown = field.unknown if field.unknown is not None else inner_schema.unknown
+        payload = _build_load_payload(
+            inner_schema, many=False, unknown=unknown, stack=stack
+        )
+        if payload is None:
+            return None
+        return (_L_PLUCK, payload, field._field_data_key, bool(field.many))
     if ftype is ma_fields.Nested:
         inner_schema = field.schema
         many = bool(inner_schema.many or field.many)
@@ -509,15 +536,55 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
         # it to the core, which turns any ``ValidationError`` into a fallback.
         return (_L_DECIMAL, field._deserialize)
     if ftype is ma_fields.Dict:
-        if (
-            field.key_field is None
-            and field.value_field is None
-            and field.mapping_type is dict
+        if field.mapping_type is not dict:
+            return None
+        if field.key_field is None and field.value_field is None:
+            return (_L_DICT,)  # plain dict-copy
+        # Typed Dict: apply the key/value fields per entry on the happy path.
+        # Require the inner fields carry no processors/validators (so their
+        # ``deserialize`` is just ``_deserialize`` for a present, non-None value);
+        # the core falls back on a non-dict input, a ``None`` key/value, or any
+        # per-entry error so Python accumulates the exact error structure.
+        key_field, value_field = field.key_field, field.value_field
+        if (key_field is not None and _has_field_processors(key_field)) or (
+            value_field is not None and _has_field_processors(value_field)
         ):
-            return (_L_DICT,)
-        return None
+            return None
+        key_el = (
+            _build_load_element(key_field, stack) if key_field is not None else None
+        )
+        val_el = (
+            _build_load_element(value_field, stack)
+            if value_field is not None
+            else None
+        )
+        if (key_field is not None and key_el is None) or (
+            value_field is not None and val_el is None
+        ):
+            return None
+        return (_L_DICT_TYPED, key_el, val_el)
     if ftype is ma_fields.Constant:
         return (_L_CONSTANT, field.constant)
+    if ftype is ma_fields.Tuple:
+        # Fixed-length tuple of fields. Compile each position to a native element
+        # (no processors, so ``deserialize`` is ``_deserialize`` for a present,
+        # non-None value); the core falls back on a non-sequence input, a length
+        # mismatch (``zip(strict=True)``), a ``None`` element, or any per-element
+        # error so Python re-runs with the exact ``invalid``/length messages.
+        elements = []
+        for inner in field.tuple_fields:
+            if _has_field_processors(inner):
+                return None
+            inner_element = _build_load_element(inner, stack)
+            if inner_element is None:
+                return None
+            elements.append(inner_element)
+        return (_L_TUPLE, tuple(elements))
+    if ftype is ma_fields.TimeDelta:
+        # ``TimeDelta._deserialize`` (float -> timedelta, with rounding) is
+        # intrinsically Python; hand the field's own method to the core, which
+        # turns any ``ValidationError`` into a fallback (like ``Decimal``).
+        return (_L_TIMEDELTA, field._deserialize)
     return None
 
 
