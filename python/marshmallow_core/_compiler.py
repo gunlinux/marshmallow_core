@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 7
+_EXPECTED_PROTOCOL = 8
 
 
 class _NoFallbackError(Exception):
@@ -107,6 +107,7 @@ _L_CONSTANT = 11
 _L_BOOLEAN = 12
 _L_INTEGER_STRICT = 13
 _L_DICT_TYPED = 14
+_L_TUPLE = 15
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -543,6 +544,21 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
         return (_L_DICT_TYPED, key_el, val_el)
     if ftype is ma_fields.Constant:
         return (_L_CONSTANT, field.constant)
+    if ftype is ma_fields.Tuple:
+        # Fixed-length tuple of fields. Compile each position to a native element
+        # (no processors, so ``deserialize`` is ``_deserialize`` for a present,
+        # non-None value); the core falls back on a non-sequence input, a length
+        # mismatch (``zip(strict=True)``), a ``None`` element, or any per-element
+        # error so Python re-runs with the exact ``invalid``/length messages.
+        elements = []
+        for inner in field.tuple_fields:
+            if _has_field_processors(inner):
+                return None
+            inner_element = _build_load_element(inner, stack)
+            if inner_element is None:
+                return None
+            elements.append(inner_element)
+        return (_L_TUPLE, tuple(elements))
     return None
 
 
