@@ -80,6 +80,12 @@ enum Element {
     Decimal { serialize: Py<PyAny> },
     /// Dict (no key/value fields): ``dict(value)``.
     Dict,
+    /// Typed Dict: serialize keys/values via their fields per entry (``None`` =
+    /// pass through). Defers on a non-dict input (dump has a fallback).
+    DictTyped {
+        key_el: Option<Box<Element>>,
+        val_el: Option<Box<Element>>,
+    },
     /// Constant: always returns the held constant, ignoring the input value.
     Constant { constant: Py<PyAny> },
     /// TimeDelta: defer to the field's own ``_serialize`` (precision-sensitive
@@ -497,6 +503,29 @@ impl Element {
                 }
                 ctx.dict_fn.bind(py).call1((value,)) // ``self.mapping_type(value)``
             }
+            Element::DictTyped { key_el, val_el } => {
+                if value.is_none() {
+                    return Ok(py.None().into_bound(py));
+                }
+                // Non-dict input -> defer (dump fallback re-runs pure Python,
+                // which handles any ``Mapping`` or raises the same error).
+                let dict = value.cast::<PyDict>().map_err(|_| fallback())?;
+                let out = PyDict::new(py);
+                for (k, v) in dict.iter() {
+                    // Mirrors ``key_field._serialize(k, None, None)`` /
+                    // ``value_field._serialize(v, None, None)``; ``None`` = pass.
+                    let ko = match key_el {
+                        Some(ke) => ke.apply(ctx, &k)?,
+                        None => k,
+                    };
+                    let vo = match val_el {
+                        Some(ve) => ve.apply(ctx, &v)?,
+                        None => v,
+                    };
+                    out.set_item(ko, vo)?;
+                }
+                Ok(out.into_any())
+            }
             Element::Constant { constant } => Ok(constant.bind(py).clone()),
         }
     }
@@ -644,6 +673,20 @@ fn parse_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<Element> {
             // (12, bound _serialize)
             serialize: t.get_item(1)?.unbind(),
         }),
+        13 => {
+            // (13, key_element_or_None, value_element_or_None)
+            let parse_opt = |item: Bound<'_, PyAny>| -> PyResult<Option<Box<Element>>> {
+                if item.is_none() {
+                    Ok(None)
+                } else {
+                    Ok(Some(Box::new(parse_element(py, &item)?)))
+                }
+            };
+            Ok(Element::DictTyped {
+                key_el: parse_opt(t.get_item(1)?)?,
+                val_el: parse_opt(t.get_item(2)?)?,
+            })
+        }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown element tag {other}"
         ))),
@@ -1698,7 +1741,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 10;
+const PROTOCOL_VERSION: u32 = 11;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
