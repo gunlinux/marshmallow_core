@@ -1039,10 +1039,19 @@ impl LoadSerializer {
                         }
                         return Err(fallback()); // ``null`` error
                     }
-                    // The sub-partial for this field (only matters for a nested
-                    // element; cheap for the non-collection cases).
-                    let field_partial = partial.derive(py, attr_name.bind(py))?;
-                    let result = element.apply(ctx, &value, &field_partial)?;
+                    // The sub-partial for this field. ``derive`` is identity for
+                    // ``None``/``All`` (only a ``Coll`` strips the ``attr.`` prefix),
+                    // so reuse the parent partial directly off the hot path and
+                    // only call ``derive`` for the collection case.
+                    let derived;
+                    let field_partial: &Partial = match partial {
+                        Partial::Coll(_) => {
+                            derived = partial.derive(py, attr_name.bind(py))?;
+                            &derived
+                        }
+                        _ => partial,
+                    };
+                    let result = element.apply(ctx, &value, field_partial)?;
                     // Validators run on the deserialized value (mirrors
                     // ``Field._validate(output)``); any failure or error defers
                     // to Python for the exact ``ValidationError`` message.
@@ -1076,7 +1085,16 @@ impl LoadSerializer {
                     // Python accumulates the full, correct error structure. Pass
                     // the sub-partial down so a callback ``Nested`` propagates it.
                     let bound = field.bind(py);
-                    let field_partial = partial.derive(py, attr_name.bind(py))?;
+                    // Same as the native arm: ``derive`` is identity for
+                    // ``None``/``All``; only a ``Coll`` needs prefix-stripping.
+                    let derived;
+                    let field_partial: &Partial = match partial {
+                        Partial::Coll(_) => {
+                            derived = partial.derive(py, attr_name.bind(py))?;
+                            &derived
+                        }
+                        _ => partial,
+                    };
                     let res = if let Some(p) = field_partial.as_kwarg(py) {
                         let kwargs = PyDict::new(py);
                         kwargs.set_item(intern!(py, "partial"), p)?;
