@@ -82,6 +82,9 @@ enum Element {
     Dict,
     /// Constant: always returns the held constant, ignoring the input value.
     Constant { constant: Py<PyAny> },
+    /// TimeDelta: defer to the field's own ``_serialize`` (precision-sensitive
+    /// timedelta -> float), provably identical to the callback path.
+    TimeDelta { serialize: Py<PyAny> },
 }
 
 enum FieldSpec {
@@ -405,6 +408,12 @@ impl Element {
                 if value.is_none() {
                     return Ok(py.None().into_bound(py));
                 }
+                // ``int(x)`` for an *exact* int returns ``x`` unchanged, so skip
+                // the Python call. ``is_exact_instance_of`` excludes ``bool`` and
+                // int subclasses, which ``int()`` would still need to coerce.
+                if !*as_string && value.is_exact_instance_of::<PyInt>() {
+                    return Ok(value.clone());
+                }
                 let r = ctx.int_fn.bind(py).call1((value,))?;
                 if *as_string {
                     Ok(r.str()?.into_any())
@@ -415,6 +424,10 @@ impl Element {
             Element::Float(as_string) => {
                 if value.is_none() {
                     return Ok(py.None().into_bound(py));
+                }
+                // ``float(x)`` for an exact float returns ``x`` unchanged.
+                if !*as_string && value.is_exact_instance_of::<PyFloat>() {
+                    return Ok(value.clone());
                 }
                 let r = ctx.float_fn.bind(py).call1((value,))?;
                 if *as_string {
@@ -471,6 +484,12 @@ impl Element {
                 serialize
                     .bind(py)
                     .call1((value, py.None(), py.None()))
+            }
+            Element::TimeDelta { serialize } => {
+                // Like ``Decimal``: the field's own ``_serialize`` (timedelta ->
+                // float) is precision-sensitive, so call it directly. It returns
+                // ``None`` for ``None``.
+                serialize.bind(py).call1((value, py.None(), py.None()))
             }
             Element::Dict => {
                 if value.is_none() {
@@ -621,6 +640,10 @@ fn parse_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<Element> {
             // (11, constant)
             constant: t.get_item(1)?.unbind(),
         }),
+        12 => Ok(Element::TimeDelta {
+            // (12, bound _serialize)
+            serialize: t.get_item(1)?.unbind(),
+        }),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown element tag {other}"
         ))),
@@ -716,6 +739,9 @@ enum LoadElement {
     Passthrough, // Raw
     Str,         // String
     Int,         // Integer (non-strict)
+    /// Integer(strict=True): accept an exact ``int`` as-is; anything else (an
+    /// ``Integral`` subclass to coerce, or an invalid value) defers to Python.
+    IntStrict,
     Float { allow_nan: bool },
     Nested(Box<LoadSerializer>),
     /// List(inner_element, inner_allow_none) — mirrors ``inner.deserialize``.
@@ -739,11 +765,32 @@ enum LoadElement {
     /// Decimal: defer to the field's own ``_deserialize`` (``_validated``);
     /// any ``ValidationError`` becomes ``AccelFallback``.
     Decimal { deserialize: Py<PyAny> },
+    /// TimeDelta: defer to the field's own ``_deserialize`` (float -> timedelta);
+    /// any ``ValidationError`` becomes ``AccelFallback``.
+    TimeDelta { deserialize: Py<PyAny> },
     /// Dict (no key/value fields): copy a dict input via ``dict(value)``; a
     /// non-dict input defers (Python decides Mapping-or-``invalid``).
     Dict,
+    /// Typed Dict: apply the key/value field per entry (``None`` = pass through).
+    /// Defers on a non-dict input, a ``None`` key/value, or any per-entry error so
+    /// Python re-runs and accumulates the exact error structure.
+    DictTyped {
+        key_el: Option<Box<LoadElement>>,
+        val_el: Option<Box<LoadElement>>,
+    },
     /// Constant: always returns the held constant, ignoring the input value.
     Constant { constant: Py<PyAny> },
+    /// Tuple: a fixed-length sequence, one element per position. Defers on a
+    /// non-sequence, a length mismatch, a ``None`` element, or any per-element
+    /// error so Python re-runs with the exact messages.
+    Tuple(Vec<LoadElement>),
+    /// Pluck: wrap the scalar as ``{data_key: value}`` (per item when ``many``)
+    /// and run the inner ``only=(field_name,)`` schema's single-record load.
+    Pluck {
+        serializer: Box<LoadSerializer>,
+        data_key: Py<PyString>,
+        many: bool,
+    },
     /// Boolean: ``value in truthy -> True``, ``value in falsy -> False``; a miss
     /// (or a ``TypeError`` from an unhashable value) defers so Python raises the
     /// exact ``invalid`` error. Holds the field's own ``truthy``/``falsy`` sets.
@@ -1029,10 +1076,19 @@ impl LoadSerializer {
                         }
                         return Err(fallback()); // ``null`` error
                     }
-                    // The sub-partial for this field (only matters for a nested
-                    // element; cheap for the non-collection cases).
-                    let field_partial = partial.derive(py, attr_name.bind(py))?;
-                    let result = element.apply(ctx, &value, &field_partial)?;
+                    // The sub-partial for this field. ``derive`` is identity for
+                    // ``None``/``All`` (only a ``Coll`` strips the ``attr.`` prefix),
+                    // so reuse the parent partial directly off the hot path and
+                    // only call ``derive`` for the collection case.
+                    let derived;
+                    let field_partial: &Partial = match partial {
+                        Partial::Coll(_) => {
+                            derived = partial.derive(py, attr_name.bind(py))?;
+                            &derived
+                        }
+                        _ => partial,
+                    };
+                    let result = element.apply(ctx, &value, field_partial)?;
                     // Validators run on the deserialized value (mirrors
                     // ``Field._validate(output)``); any failure or error defers
                     // to Python for the exact ``ValidationError`` message.
@@ -1066,7 +1122,16 @@ impl LoadSerializer {
                     // Python accumulates the full, correct error structure. Pass
                     // the sub-partial down so a callback ``Nested`` propagates it.
                     let bound = field.bind(py);
-                    let field_partial = partial.derive(py, attr_name.bind(py))?;
+                    // Same as the native arm: ``derive`` is identity for
+                    // ``None``/``All``; only a ``Coll`` needs prefix-stripping.
+                    let derived;
+                    let field_partial: &Partial = match partial {
+                        Partial::Coll(_) => {
+                            derived = partial.derive(py, attr_name.bind(py))?;
+                            &derived
+                        }
+                        _ => partial,
+                    };
                     let res = if let Some(p) = field_partial.as_kwarg(py) {
                         let kwargs = PyDict::new(py);
                         kwargs.set_item(intern!(py, "partial"), p)?;
@@ -1198,20 +1263,43 @@ impl LoadElement {
                 if value.is_instance_of::<pyo3::types::PyBool>() {
                     return Err(fallback()); // bools are rejected as ``invalid``
                 }
+                // ``int(x)`` for an exact int (bool already excluded above) is
+                // ``x`` — skip the Python call on the common already-parsed case.
+                if value.is_exact_instance_of::<PyInt>() {
+                    return Ok(value.clone());
+                }
                 ctx.int_fn
                     .bind(py)
                     .call1((value,))
                     .map_err(|e| to_fallback(py, e))
             }
+            LoadElement::IntStrict => {
+                if value.is_instance_of::<pyo3::types::PyBool>() {
+                    return Err(fallback()); // bool rejected as ``invalid``
+                }
+                // Accept an exact int unchanged (``int(x) is x``). Defer
+                // everything else: an ``Integral`` subclass that Python would
+                // coerce, or an invalid value Python rejects with the exact error.
+                if value.is_exact_instance_of::<PyInt>() {
+                    Ok(value.clone())
+                } else {
+                    Err(fallback())
+                }
+            }
             LoadElement::Float { allow_nan } => {
                 if value.is_instance_of::<pyo3::types::PyBool>() {
                     return Err(fallback());
                 }
-                let r = ctx
-                    .float_fn
-                    .bind(py)
-                    .call1((value,))
-                    .map_err(|e| to_fallback(py, e))?;
+                // An exact float is its own ``float(x)``; reuse it directly and
+                // run only the nan/inf guard, skipping the ``float`` call.
+                let r = if value.is_exact_instance_of::<PyFloat>() {
+                    value.clone()
+                } else {
+                    ctx.float_fn
+                        .bind(py)
+                        .call1((value,))
+                        .map_err(|e| to_fallback(py, e))?
+                };
                 if !*allow_nan {
                     let f: f64 = r.extract()?;
                     if f.is_nan() || f.is_infinite() {
@@ -1291,6 +1379,10 @@ impl LoadElement {
                 .bind(py)
                 .call1((value, py.None(), py.None()))
                 .map_err(|e| to_fallback(py, e)),
+            LoadElement::TimeDelta { deserialize } => deserialize
+                .bind(py)
+                .call1((value, py.None(), py.None()))
+                .map_err(|e| to_fallback(py, e)),
             LoadElement::Dict => {
                 if value.is_instance_of::<PyDict>() {
                     ctx.dict_fn.bind(py).call1((value,))
@@ -1298,7 +1390,77 @@ impl LoadElement {
                     Err(fallback()) // non-dict: defer (Mapping check / ``invalid``)
                 }
             }
+            LoadElement::DictTyped { key_el, val_el } => {
+                // Only an exact dict happy-path; a non-dict Mapping defers so
+                // Python applies its ``isinstance(_, Mapping)`` handling.
+                let dict = value.cast::<PyDict>().map_err(|_| fallback())?;
+                let out = PyDict::new(py);
+                for (k, v) in dict.iter() {
+                    // ``None`` key/value -> defer (Python honours ``allow_none``).
+                    let ko = match key_el {
+                        Some(ke) => {
+                            if k.is_none() {
+                                return Err(fallback());
+                            }
+                            ke.apply(ctx, &k, partial)?
+                        }
+                        None => k,
+                    };
+                    let vo = match val_el {
+                        Some(ve) => {
+                            if v.is_none() {
+                                return Err(fallback());
+                            }
+                            ve.apply(ctx, &v, partial)?
+                        }
+                        None => v,
+                    };
+                    out.set_item(ko, vo)?;
+                }
+                Ok(out.into_any())
+            }
             LoadElement::Constant { constant } => Ok(constant.bind(py).clone()),
+            LoadElement::Tuple(elements) => {
+                if !is_list_like(value) {
+                    return Err(fallback()); // not a sequence -> ``invalid``
+                }
+                // Length mismatch -> defer (``zip(strict=True)`` / ``validate_length``).
+                if value.len()? != elements.len() {
+                    return Err(fallback());
+                }
+                let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(elements.len());
+                for (element, each) in elements.iter().zip(value.try_iter()?) {
+                    let each = each?;
+                    if each.is_none() {
+                        return Err(fallback()); // honour allow_none in Python
+                    }
+                    items.push(element.apply(ctx, &each, partial)?);
+                }
+                Ok(PyTuple::new(py, items)?.into_any())
+            }
+            LoadElement::Pluck {
+                serializer,
+                data_key,
+                many,
+            } => {
+                let dk = data_key.bind(py);
+                if *many {
+                    if !is_list_like(value) {
+                        return Err(fallback()); // ``_test_collection`` -> ``invalid``
+                    }
+                    let out = PyList::empty(py);
+                    for v in value.try_iter()? {
+                        let tmp = PyDict::new(py);
+                        tmp.set_item(dk, v?)?;
+                        out.append(serializer.run_one(ctx, tmp.as_any(), partial)?)?;
+                    }
+                    Ok(out.into_any())
+                } else {
+                    let tmp = PyDict::new(py);
+                    tmp.set_item(dk, value)?;
+                    Ok(serializer.run_one(ctx, tmp.as_any(), partial)?.into_any())
+                }
+            }
             LoadElement::Boolean { truthy, falsy } => {
                 // ``value in truthy -> True``, ``value in falsy -> False``. Any
                 // miss, or a ``TypeError`` from an unhashable value, defers so
@@ -1489,6 +1651,43 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             truthy: t.get_item(1)?.unbind(),
             falsy: t.get_item(2)?.unbind(),
         }),
+        13 => Ok(LoadElement::IntStrict), // (13,)
+        17 => Ok(LoadElement::TimeDelta {
+            // (17, bound _deserialize)
+            deserialize: t.get_item(1)?.unbind(),
+        }),
+        16 => {
+            // (16, nested_payload, data_key, many)
+            let serializer = parse_load_serializer(py, &t.get_item(1)?)?;
+            Ok(LoadElement::Pluck {
+                serializer: Box::new(serializer),
+                data_key: t.get_item(2)?.cast_into::<PyString>()?.unbind(),
+                many: t.get_item(3)?.extract()?,
+            })
+        }
+        15 => {
+            // (15, (element, element, ...))
+            let specs = t.get_item(1)?.cast_into::<PyTuple>()?;
+            let mut elements = Vec::with_capacity(specs.len());
+            for item in specs.iter() {
+                elements.push(parse_load_element(py, &item)?);
+            }
+            Ok(LoadElement::Tuple(elements))
+        }
+        14 => {
+            // (14, key_element_or_None, value_element_or_None)
+            let parse_opt = |item: Bound<'_, PyAny>| -> PyResult<Option<Box<LoadElement>>> {
+                if item.is_none() {
+                    Ok(None)
+                } else {
+                    Ok(Some(Box::new(parse_load_element(py, &item)?)))
+                }
+            };
+            Ok(LoadElement::DictTyped {
+                key_el: parse_opt(t.get_item(1)?)?,
+                val_el: parse_opt(t.get_item(2)?)?,
+            })
+        }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown load element tag {other}"
         ))),
@@ -1499,7 +1698,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 5;
+const PROTOCOL_VERSION: u32 = 10;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
