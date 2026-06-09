@@ -122,8 +122,12 @@ identical to `Field._serialize`.
   self-referential schemas, custom strptime temporal formats,
   `NaiveDateTime`/`AwareDateTime` on load, callable defaults, unrecognized field
   validators (anything but `Range`/`Length`/`OneOf`), field-level
-  `pre_load`/`post_load`, a `Dict` with key/value fields, and any field type
-  without a native element. **Now accelerated** (Phase 1/3): `unknown=INCLUDE`,
+  `pre_load`/`post_load`, a `Dict` with key/value fields, a `Nested` whose inner
+  schema overrides `load`/`_do_load`/`_deserialize` (load) or `dump`/`_serialize`
+  (dump) directly rather than via the hook system — e.g. `marshmallow_dataclass`,
+  which overrides `load` to build a dataclass and leaves `_hooks` empty; compiling
+  it natively would drop the instantiation — and any field type without a native
+  element. **Now accelerated** (Phase 1/3): `unknown=INCLUDE`,
   collection/dotted `partial`, dotted attribute writes (`set_value`),
   `Range`/`Length`/`OneOf` validators, `Decimal`/`Dict`/`Constant` fields,
   schema-level load hooks (`pre_load`/`post_load`/`validates`/`validates_schema`

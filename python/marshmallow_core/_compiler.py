@@ -175,6 +175,23 @@ def is_available() -> bool:
     )
 
 
+def _overrides_native_dump(schema: typing.Any) -> bool:
+    """True if ``schema`` overrides ``dump``/``_serialize`` directly.
+
+    The native nested *dump* path recurses in Rust, reproducing only marshmallow's
+    stock ``_serialize``; a schema that customizes its dump entry points outside
+    the ``pre_dump``/``post_dump`` hook system (overriding ``dump`` or
+    ``_serialize``) would be bypassed by it. Stock subclasses inherit ``Schema``'s
+    (core-patched) ``_serialize``, so the identity checks pass for them and only
+    genuine overrides are caught. The dump core has no ``AccelFallback``, so when
+    in doubt this defers to the callback path.
+    """
+    from marshmallow.schema import Schema as _Schema
+
+    cls = type(schema)
+    return cls.dump is not _Schema.dump or cls._serialize is not _Schema._serialize
+
+
 def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
     """Build the value->output ``element`` for ``field``, or ``None`` to fall back.
 
@@ -190,7 +207,11 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
     if ftype is ma_fields.Nested:
         # ``field.schema`` resolves the inner schema (applying only/exclude/many).
         inner_schema = field.schema
-        if inner_schema._hooks[PRE_DUMP] or inner_schema._hooks[POST_DUMP]:
+        if (
+            inner_schema._hooks[PRE_DUMP]
+            or inner_schema._hooks[POST_DUMP]
+            or _overrides_native_dump(inner_schema)
+        ):
             return None  # schema.dump != _serialize; must use the callback path
         payload = _build_payload(inner_schema, stack)
         if payload is None:
@@ -394,6 +415,31 @@ def _compile_validators(validators: typing.Any) -> list[tuple] | None:
     return specs
 
 
+def _overrides_native_load(schema: typing.Any) -> bool:
+    """True if ``schema`` customizes a load entry point the native path can't see.
+
+    The Rust nested-load path reproduces only marshmallow's *stock* per-field
+    deserialize (``Schema._deserialize``). A schema that overrides
+    ``load``/``_do_load``/``_deserialize`` directly — rather than via the
+    ``pre_load``/``post_load``/``validates`` hook system — would be silently
+    bypassed by it. ``marshmallow_dataclass``, for example, overrides ``load`` to
+    instantiate a dataclass, leaving ``_hooks`` empty; compiling such a
+    ``Nested`` natively would emit a plain ``dict`` instead of the instance.
+
+    Stock subclasses inherit ``Schema``'s (core-patched) ``_do_load``, so the
+    identity checks pass for them and only genuine overrides force the callback
+    path (where ``Nested.deserialize`` invokes the real ``load``).
+    """
+    from marshmallow.schema import Schema as _Schema
+
+    cls = type(schema)
+    return (
+        cls.load is not _Schema.load
+        or cls._do_load is not _Schema._do_load
+        or cls._deserialize is not _Schema._deserialize
+    )
+
+
 def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
     """Build the value->value load ``element`` for ``field``, or ``None``."""
     ftype = type(field)
@@ -486,8 +532,11 @@ def _build_load_payload(
     """
     if schema.dict_class is not dict:
         return None  # the Rust side always builds plain dicts
-    if not is_root and any(schema._hooks[hook] for hook in _LOAD_HOOKS):
-        return None  # nested load != _deserialize once hooks/validators are involved
+    if not is_root and (
+        any(schema._hooks[hook] for hook in _LOAD_HOOKS)
+        or _overrides_native_load(schema)
+    ):
+        return None  # nested load != _deserialize once hooks/an override are involved
     if not is_root and schema.partial:
         # The root's ``partial`` is threaded as a runtime flag to ``run``; a nested
         # schema's *own* ``partial`` option isn't captured by that flag (it only
