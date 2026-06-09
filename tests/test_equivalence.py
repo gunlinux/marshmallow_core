@@ -710,6 +710,62 @@ def test_load_strict_int_is_native():
     assert element == (_compiler._L_INTEGER_STRICT,)
 
 
+class LoadTypedDictSchema(Schema):
+    counts = fields.Dict(keys=fields.String(), values=fields.Integer())
+    vals_only = fields.Dict(values=fields.Float())
+    keys_only = fields.Dict(keys=fields.String())
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"counts": {"a": 1, "b": "2"}},  # values coerced "2" -> 2
+        {"vals_only": {"x": "1.5", "y": 2}},
+        {"keys_only": {"a": "v", "b": "w"}},  # string keys pass the key field
+        {"counts": {}},  # empty
+        {},  # all missing
+    ],
+)
+def test_load_typed_dict_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(LoadTypedDictSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"counts": {"a": "not-an-int"}},  # value coercion failure
+        {"counts": [1, 2]},  # not a mapping
+        {"counts": {"a": None}},  # None value -> allow_none check in Python
+    ],
+)
+def test_load_typed_dict_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        LoadTypedDictSchema().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        LoadTypedDictSchema().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_typed_dict_is_native():
+    from marshmallow_core import _compiler
+
+    field = fields.Dict(keys=fields.String(), values=fields.Integer())
+    element = _compiler._build_load_element(field, ())
+    assert element is not None and element[0] == _compiler._L_DICT_TYPED
+
+
+def test_dump_typed_dict_defers():
+    """The dump core has no fallback, so typed Dict dump stays a callback."""
+    from marshmallow_core import _compiler
+
+    field = fields.Dict(keys=fields.String(), values=fields.Integer())
+    assert _compiler._build_element(field, ()) is None
+
+
 @pytest.mark.parametrize("unknown", [RAISE, EXCLUDE, INCLUDE])
 def test_load_unknown_equivalence(unknown, monkeypatch):
     class S(Schema):
