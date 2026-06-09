@@ -72,6 +72,77 @@ bottom within a phase.
 - [x] Precompute the known-keys frozenset once (built per compile, held by the
       Rust `LoadSerializer`)
 
+## Phase 4 — Post-analysis speedup
+
+Derived from the profiling pass (Opus, marshmallow 4.3.0, via
+`performance/benchmark.py` + a layer-by-layer probe of public → patched →
+raw-Rust). Ordered by measured ROI. The first item of that pass —
+**native `Boolean` load** — is already done (list load 28.7µs → 9.5µs,
+8.0x → 23.8x; it now matches list dump). The rest, top to bottom:
+
+### Tier 1 — hot-path Rust micro-opts (collections; highest absolute time)
+- [ ] Skip redundant scalar coercion when the input is already the exact target
+      type. `int(x)`/`float(x)` for an *exact* `int`/`float` return `x`
+      unchanged, so short-circuit `LoadElement::Int`/`Float` (and dump
+      `Element::Int`/`Float`) to `value.clone()` when
+      `value.is_exact_instance_of::<PyInt/PyFloat>()` — drops a Python C-API call
+      per scalar on the common case. Especially helps `loads`, where
+      `json.loads` already yields real ints/floats. Verify identity equivalence
+      (int subclasses are excluded by `is_exact_instance_of`; bools already
+      rejected before this point).
+- [ ] Skip `Partial::derive` per field for non-recursive elements. It is called
+      on every field in `run_one`, but only `Nested`/`List`/callback consume the
+      sub-partial; for scalar `Native` fields it is a wasted call + match. Gate it
+      on element kind (or on `partial` being non-`None`).
+- [ ] Re-profile the post-Boolean list-load and record the next hot spot in this
+      file *before* writing more micro-opts — don't guess twice.
+
+### Tier 2 — shrink the fixed per-call Python overhead (small/flat schemas)
+The `dump`/`load` entry prologue is ~20–30% of a small-schema call (flat load:
+0.63µs raw Rust, 0.89µs through `_do_load`). It is constant per call, so it only
+shows up when the payload is tiny — but those are exactly the tight-loop cases.
+- [ ] Cache the load dispatch decision per instance alongside the deserializer:
+      precompute `_core_partial(self.partial)` and the has-hooks branch so the
+      common `partial=None, unknown=default` call skips `_partial_is_supported` /
+      `_has_load_hooks` / `_core_partial`.
+- [ ] Store the hook-aware vs direct runner as the cached object (chosen once at
+      compile) so `_has_load_hooks` is not consulted on every load.
+- [ ] Trim the `_patched_serialize` / `_patched_do_load` prologue (avoid
+      re-reading `self.many` / `self.unknown` once args are normalized).
+- [ ] Re-benchmark flat dump/load to confirm the fixed-overhead drop.
+
+### Tier 3 — widen native load coverage (turn remaining callbacks native)
+- [ ] Run `performance/analyze_paths` over a realistic API schema; list every
+      field still on the callback path (start the audit here, then pick targets).
+- [ ] Native `Integer(strict=True)` (`numbers.Integral` check).
+- [ ] Native typed `Dict` (key field + value field applied per entry) — currently
+      only the untyped dict-copy case is native.
+- [ ] Native `Tuple` (fixed-length tuple of fields).
+- [ ] Native `Pluck` (the `Nested` subclass that plucks one field) — common in
+      API schemas.
+- [ ] Native `TimeDelta`.
+- [ ] Equivalence tests (valid + error) for each.
+
+### Tier 4 — measurement & guardrails
+- [ ] Add an API-response-shaped benchmark case (mixed bool/str/int/nested/list)
+      so real-world regressions are visible, not just the four synthetic shapes.
+- [ ] Record the per-case speedup numbers (in the benchmark docstring or a
+      committed results file) so a regression in a later change is obvious.
+
+### Structural ceilings — analyzed, *not* worth accelerating
+Documented so they are not re-investigated:
+- **Hook-bearing loads cap at ~2x.** ~90% of the call is marshmallow's Python
+  hook dispatch (`_invoke_load_processors` ×2, `_invoke_field_validators`)
+  wrapping user callbacks; the core already runs the per-field step (~8%). Not
+  movable into Rust short of reimplementing the hook system.
+- **`loads` is bounded by CPython's C `json.loads`.** A `serde_json` parser was
+  prototyped in Phase 2 and was slower; the per-field step is already
+  accelerated. Don't retry without a fundamentally faster parser.
+- **By-design pure-Python:** custom `dict_class` / `get_attribute`,
+  self-referential schemas, custom strptime formats, callable defaults,
+  `NaiveDateTime` / `AwareDateTime` on load, and any validator outside
+  `Range` / `Length` / `OneOf` (correctness over speed).
+
 ## Per-change checklist (every code item)
 
 - [x] Implemented in **both** `_compiler.py` and `lib.rs`
