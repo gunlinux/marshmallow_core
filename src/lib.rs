@@ -726,6 +726,9 @@ enum LoadElement {
     Passthrough, // Raw
     Str,         // String
     Int,         // Integer (non-strict)
+    /// Integer(strict=True): accept an exact ``int`` as-is; anything else (an
+    /// ``Integral`` subclass to coerce, or an invalid value) defers to Python.
+    IntStrict,
     Float { allow_nan: bool },
     Nested(Box<LoadSerializer>),
     /// List(inner_element, inner_allow_none) — mirrors ``inner.deserialize``.
@@ -1236,6 +1239,19 @@ impl LoadElement {
                     .call1((value,))
                     .map_err(|e| to_fallback(py, e))
             }
+            LoadElement::IntStrict => {
+                if value.is_instance_of::<pyo3::types::PyBool>() {
+                    return Err(fallback()); // bool rejected as ``invalid``
+                }
+                // Accept an exact int unchanged (``int(x) is x``). Defer
+                // everything else: an ``Integral`` subclass that Python would
+                // coerce, or an invalid value Python rejects with the exact error.
+                if value.is_exact_instance_of::<PyInt>() {
+                    Ok(value.clone())
+                } else {
+                    Err(fallback())
+                }
+            }
             LoadElement::Float { allow_nan } => {
                 if value.is_instance_of::<pyo3::types::PyBool>() {
                     return Err(fallback());
@@ -1527,6 +1543,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             truthy: t.get_item(1)?.unbind(),
             falsy: t.get_item(2)?.unbind(),
         }),
+        13 => Ok(LoadElement::IntStrict), // (13,)
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown load element tag {other}"
         ))),
@@ -1537,7 +1554,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 5;
+const PROTOCOL_VERSION: u32 = 6;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
