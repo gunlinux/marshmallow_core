@@ -516,14 +516,14 @@ def test_load_enum_errors_match_python(data, monkeypatch):
 def test_load_enum_is_native():
     schema = LoadEnumSchema()
     schema.load({"by_name": "RED"})  # trigger lazy build
-    assert accel.is_available() == (vars(schema).get("_mc_load_deserializer") is not None)
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 def test_load_nested_is_native():
 
     schema = LoadContainer()
     schema.load({"people": [], "total": 0})  # trigger lazy build
-    assert accel.is_available() == (vars(schema).get("_mc_load_deserializer") is not None)
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 class _Region:
@@ -708,7 +708,7 @@ def test_load_include_is_native():
     schema = IncludeSchema()
     schema.load({"a": 1, "extra": "x"})  # trigger lazy build
     assert accel.is_available() == (
-        vars(schema).get("_mc_load_deserializer") is not None
+        vars(schema).get("_mc_load_plan") is not None
     )
 
 
@@ -754,7 +754,7 @@ def test_load_dotted_attribute_is_native():
     schema = DottedLoadSchema()
     schema.load({"c": 1})  # trigger lazy build
     assert accel.is_available() == (
-        vars(schema).get("_mc_load_deserializer") is not None
+        vars(schema).get("_mc_load_plan") is not None
     )
 
 
@@ -848,7 +848,7 @@ def test_load_validators_is_native():
     schema = ValidatorSchema()
     schema.load({"age": 1})  # trigger lazy build
     assert accel.is_available() == (
-        vars(schema).get("_mc_load_deserializer") is not None
+        vars(schema).get("_mc_load_plan") is not None
     )
 
 
@@ -977,7 +977,7 @@ def test_load_hooks_is_native():
     schema = HookLoadSchema()
     schema.load({"a": 1, "b": "x", "c": 2})  # trigger lazy build
     assert accel.is_available() == (
-        vars(schema).get("_mc_load_deserializer") is not None
+        vars(schema).get("_mc_load_plan") is not None
     )
 
 
@@ -1025,7 +1025,7 @@ def test_load_post_load_only_uses_core(monkeypatch):
     schema = S()
     schema.load({"i": 5})
     assert accel.is_available() == (
-        vars(schema).get("_mc_load_deserializer") is not None
+        vars(schema).get("_mc_load_plan") is not None
     )
     accelerated, pure = _load_both(S, {"i": 5}, monkeypatch=monkeypatch)
     assert accelerated == pure == {"i": 5, "doubled": 10}
@@ -1111,7 +1111,7 @@ def test_load_temporal_uuid_errors_match_python(data, monkeypatch):
 def test_load_temporal_uuid_is_native():
     schema = LoadTemporalSchema()
     schema.load({"day": "2020-01-02"})  # trigger lazy build
-    assert accel.is_available() == (vars(schema).get("_mc_load_deserializer") is not None)
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 # ---- new native field types: Decimal / Dict / Constant -------------------
@@ -1204,7 +1204,7 @@ def test_decimal_is_native():
     ld.load({"plain": "1"})
     if accel.is_available():
         assert vars(d).get("_mc_dump_serializer") is not None
-        assert vars(ld).get("_mc_load_deserializer") is not None
+        assert vars(ld).get("_mc_load_plan") is not None
 
 
 class DictSchema(Schema):
@@ -1316,7 +1316,7 @@ def test_load_partial_true_equivalence(data, monkeypatch):
 def test_load_partial_true_is_native():
     schema = PartialSchema(partial=True)
     schema.load({"id": 1})  # trigger lazy build
-    assert accel.is_available() == (vars(schema).get("_mc_load_deserializer") is not None)
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 def test_load_partial_true_default_not_applied(monkeypatch):
@@ -1377,7 +1377,7 @@ def test_load_partial_collection_is_native():
     schema = PartialSchema()
     schema.load({"id": 1, "inner": {"a": 5}}, partial=("name",))  # lazy build
     assert accel.is_available() == (
-        vars(schema).get("_mc_load_deserializer") is not None
+        vars(schema).get("_mc_load_plan") is not None
     )
 
 
@@ -1410,7 +1410,7 @@ def test_core_active_when_importable():
     assert accel.is_available()
     schema = LoadFlatSchema()
     schema.load({"i": 1})  # trigger the lazy build
-    assert vars(schema).get("_mc_load_deserializer") is not None
+    assert vars(schema).get("_mc_load_plan") is not None
 
 
 def test_protocol_version_matches():
