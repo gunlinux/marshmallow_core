@@ -28,6 +28,8 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
+use jiter::{JsonArray, JsonObject, JsonValue};
+
 create_exception!(
     _core,
     AccelFallback,
@@ -1171,6 +1173,84 @@ impl LoadDeserializer {
         let p = Partial::from_arg(partial)?;
         self.root.run(&self.ctx, data, many, &p)
     }
+
+    /// SPIKE (Design A): fused ``loads`` — parse JSON ``data`` (a ``str`` or
+    /// ``bytes``) into a jiter ``JsonValue`` tree and deserialize directly off
+    /// the tree, skipping the intermediate Python ``dict`` that ``json.loads``
+    /// would build. Output keys come from the schema (already-interned
+    /// ``out_key`` strings), so this allocates **no** per-record key strings.
+    /// Raises ``AccelFallback`` for any shape the tree walker doesn't model, so
+    /// the caller re-runs the unchanged ``json.loads`` + ``_do_load`` path.
+    fn run_json<'py>(
+        &self,
+        py: Python<'py>,
+        data: &Bound<'py, PyAny>,
+        many: bool,
+        partial: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let p = Partial::from_arg(partial)?;
+        // ``allow_inf_nan = true`` matches stdlib ``json.loads`` (accepts
+        // ``NaN``/``Infinity``); a Float field still rejects them via its own
+        // guard, deferring to Python for the exact ``special`` error.
+        if let Ok(s) = data.cast::<PyString>() {
+            let txt = s.to_str()?;
+            let jv = JsonValue::parse(txt.as_bytes(), true).map_err(|_| fallback())?;
+            self.root.run_json_tree(&self.ctx, py, &jv, many, &p)
+        } else if let Ok(b) = data.cast::<PyBytes>() {
+            let jv = JsonValue::parse(b.as_bytes(), true).map_err(|_| fallback())?;
+            self.root.run_json_tree(&self.ctx, py, &jv, many, &p)
+        } else {
+            Err(fallback())
+        }
+    }
+}
+
+/// Convert a jiter ``JsonValue`` (sub)tree into exactly the Python object
+/// ``json.loads`` would have produced for it. Parity of the fused load rests on
+/// this being byte-identical to the stdlib parser's output per leaf.
+fn json_to_py<'py>(
+    py: Python<'py>,
+    ctx: &Ctx,
+    jv: &JsonValue<'_>,
+) -> PyResult<Bound<'py, PyAny>> {
+    match jv {
+        JsonValue::Null => Ok(py.None().into_bound(py)),
+        JsonValue::Bool(b) => Ok(PyBool::new(py, *b).to_owned().into_any()),
+        JsonValue::Int(i) => Ok((*i).into_pyobject(py)?.into_any()),
+        // NB: jiter is built without `num-bigint` here, so an integer larger
+        // than i64 fails to parse and we fall back to ``json.loads`` (which
+        // handles arbitrary precision) — rare, and correct.
+        JsonValue::Float(f) => Ok((*f).into_pyobject(py)?.into_any()),
+        JsonValue::Str(s) => Ok(PyString::new(py, s.as_ref()).into_any()),
+        JsonValue::Array(a) => {
+            let out = PyList::empty(py);
+            for item in a.iter() {
+                out.append(json_to_py(py, ctx, item)?)?;
+            }
+            Ok(out.into_any())
+        }
+        JsonValue::Object(o) => {
+            // ``json.loads`` keeps the last value for a duplicated key; building
+            // the dict in order with ``set_item`` reproduces that.
+            let out = PyDict::new(py);
+            for (k, v) in o.iter() {
+                out.set_item(PyString::new(py, k.as_ref()), json_to_py(py, ctx, v)?)?;
+            }
+            Ok(out.into_any())
+        }
+    }
+}
+
+/// Last value for ``key`` in a jiter object (jiter does not dedup keys; stdlib
+/// ``json.loads`` keeps the last, so we scan to the last match).
+fn lookup_last<'a, 'j>(obj: &'a JsonObject<'j>, key: &str) -> Option<&'a JsonValue<'j>> {
+    let mut found = None;
+    for (k, v) in obj.iter() {
+        if k.as_ref() == key {
+            found = Some(v);
+        }
+    }
+    found
 }
 
 impl LoadSerializer {
@@ -1342,6 +1422,141 @@ impl LoadSerializer {
             for (key, value) in data.iter() {
                 if !known.contains(&key)? {
                     out.set_item(key, value)?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    // ---- SPIKE (Design A): jiter-tree variants of run/run_one ----------------
+
+    fn run_json_tree<'py>(
+        &self,
+        ctx: &Ctx,
+        py: Python<'py>,
+        jv: &JsonValue<'_>,
+        many: bool,
+        partial: &Partial<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if many {
+            match jv {
+                JsonValue::Array(a) => self.run_many_json(ctx, py, a, partial),
+                _ => Err(fallback()), // non-list -> Python's type handling
+            }
+        } else {
+            match jv {
+                JsonValue::Object(o) => Ok(self.run_one_json(ctx, py, o, partial)?.into_any()),
+                _ => Err(fallback()),
+            }
+        }
+    }
+
+    fn run_many_json<'py>(
+        &self,
+        ctx: &Ctx,
+        py: Python<'py>,
+        arr: &JsonArray<'_>,
+        partial: &Partial<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let out = PyList::empty(py);
+        for item in arr.iter() {
+            match item {
+                JsonValue::Object(o) => out.append(self.run_one_json(ctx, py, o, partial)?)?,
+                _ => return Err(fallback()),
+            }
+        }
+        Ok(out.into_any())
+    }
+
+    /// Deserialize one JSON object off the tree. Mirrors ``run_one`` exactly
+    /// (missing/partial/default, ``null``, validators, ``set_value``, unknown
+    /// handling) but reads fields from the jiter ``JsonObject`` instead of a
+    /// ``PyDict``, and converts only the values it keeps. Callback fields are not
+    /// modelled here — they defer the whole load to Python.
+    fn run_one_json<'py>(
+        &self,
+        ctx: &Ctx,
+        py: Python<'py>,
+        obj: &JsonObject<'_>,
+        partial: &Partial<'py>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let missing = ctx.missing.bind(py);
+        let out = PyDict::new(py);
+        for spec in &self.specs {
+            let LoadFieldSpec::Native {
+                data_key,
+                out_key,
+                out_key_parts,
+                attr_name,
+                load_default,
+                required,
+                allow_none,
+                element,
+                validators,
+            } = spec
+            else {
+                // Callback field: defer the entire load to Python.
+                return Err(fallback());
+            };
+            let dk = data_key.bind(py).to_str()?;
+            let Some(value) = lookup_last(obj, dk) else {
+                if partial.allows_missing(attr_name.bind(py))? {
+                    continue;
+                }
+                if *required {
+                    return Err(fallback());
+                }
+                let default = load_default.bind(py);
+                if !default.is(missing) {
+                    set_load_value(py, &out, out_key.bind(py), out_key_parts, default)?;
+                }
+                continue;
+            };
+            if matches!(value, JsonValue::Null) {
+                if *allow_none {
+                    set_load_value(
+                        py,
+                        &out,
+                        out_key.bind(py),
+                        out_key_parts,
+                        &py.None().into_bound(py),
+                    )?;
+                    continue;
+                }
+                return Err(fallback());
+            }
+            let derived;
+            let field_partial: &Partial = match partial {
+                Partial::Coll(_) => {
+                    derived = partial.derive(py, attr_name.bind(py))?;
+                    &derived
+                }
+                _ => partial,
+            };
+            let result = element.apply_json(py, ctx, value, field_partial)?;
+            for validator in validators {
+                match validator.check(&result) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(fallback()),
+                    Err(e) => return Err(to_fallback(py, e)),
+                }
+            }
+            set_load_value(py, &out, out_key.bind(py), out_key_parts, &result)?;
+        }
+        if self.unknown == UNKNOWN_RAISE {
+            let known = self.known_keys.bind(py);
+            for (key, _) in obj.iter() {
+                if !known.contains(PyString::new(py, key.as_ref()))? {
+                    return Err(fallback());
+                }
+            }
+        } else if self.unknown == UNKNOWN_INCLUDE {
+            let known = self.known_keys.bind(py);
+            for (key, value) in obj.iter() {
+                let pk = PyString::new(py, key.as_ref());
+                if !known.contains(&pk)? {
+                    // last-wins on duplicate unknown keys via ``set_item``.
+                    out.set_item(&pk, json_to_py(py, ctx, value)?)?;
                 }
             }
         }
@@ -1667,6 +1882,64 @@ impl LoadElement {
                 } else {
                     Err(fallback())
                 }
+            }
+        }
+    }
+}
+
+impl LoadElement {
+    /// SPIKE (Design A): deserialize a value straight off the jiter tree.
+    ///
+    /// ``Nested`` and ``List`` recurse through the tree so a list-of-records
+    /// never materialises an intermediate Python ``dict``/``list`` (the whole
+    /// point). Every other element converts the leaf with [`json_to_py`] — which
+    /// reproduces ``json.loads``'s output exactly — and runs the unchanged
+    /// [`LoadElement::apply`], so scalar parity holds by construction.
+    fn apply_json<'py>(
+        &self,
+        py: Python<'py>,
+        ctx: &Ctx,
+        jv: &JsonValue<'_>,
+        partial: &Partial<'py>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match self {
+            LoadElement::Nested(serializer) => {
+                if serializer.many {
+                    match jv {
+                        JsonValue::Array(a) => serializer.run_many_json(ctx, py, a, partial),
+                        _ => Err(fallback()),
+                    }
+                } else {
+                    match jv {
+                        JsonValue::Object(o) => {
+                            Ok(serializer.run_one_json(ctx, py, o, partial)?.into_any())
+                        }
+                        _ => Err(fallback()),
+                    }
+                }
+            }
+            LoadElement::List(inner, inner_allow_none) => match jv {
+                JsonValue::Array(a) => {
+                    let out = PyList::empty(py);
+                    for item in a.iter() {
+                        if matches!(item, JsonValue::Null) {
+                            if *inner_allow_none {
+                                out.append(py.None())?;
+                                continue;
+                            }
+                            return Err(fallback());
+                        }
+                        out.append(inner.apply_json(py, ctx, item, partial)?)?;
+                    }
+                    Ok(out.into_any())
+                }
+                _ => Err(fallback()),
+            },
+            // Scalars and the not-yet-threaded containers (Dict/Tuple/Enum/...):
+            // materialise the leaf and reuse the exact pure value-path.
+            _ => {
+                let v = json_to_py(py, ctx, jv)?;
+                self.apply(ctx, &v, partial)
             }
         }
     }

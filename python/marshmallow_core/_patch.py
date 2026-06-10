@@ -91,6 +91,7 @@ def _partial_is_supported(partial: typing.Any) -> bool:
 _orig_serialize: typing.Any = None
 _orig_do_load: typing.Any = None
 _orig_dumps: typing.Any = None
+_orig_loads: typing.Any = None
 
 
 def is_installed() -> bool:
@@ -326,27 +327,84 @@ def _patched_dumps(self: Schema, obj: typing.Any, *args, many: bool | None = Non
     return _orig_dumps(self, obj, *args, many=many, **kwargs)
 
 
+def _patched_loads(
+    self: Schema,
+    json_data: typing.Any,
+    *args,
+    many: bool | None = None,
+    partial: typing.Any = None,
+    unknown: typing.Any = None,
+    **kwargs,
+):
+    # SPIKE (Design A): fuse ``json.loads`` + the per-field load in Rust, reading
+    # straight off a jiter tree (no intermediate Python dict). Only the plain
+    # default call is fusable: extra ``render_module.loads`` args/kwargs, a
+    # non-stdlib render module, schema load hooks, a non-default ``unknown``, or
+    # an unsupported ``partial`` all defer to the stock ``loads``.
+    eff_unknown = self.unknown if unknown is None else unknown
+    eff_partial = self.partial if partial is None else partial
+    if (
+        not args
+        and not kwargs
+        and self.opts.render_module is json
+        and eff_unknown == self.unknown
+        and _partial_is_supported(eff_partial)
+    ):
+        cache = vars(self)
+        # Reuse the same compiled plan the ``_do_load`` path builds/caches.
+        plan = cache.get("_mc_load_plan", _UNSET)
+        if plan is _UNSET:
+            ld = _compiler.build_load_deserializer(self)
+            plan = cache["_mc_load_plan"] = (
+                None
+                if ld is None
+                else (ld, _has_load_hooks(self), _core_partial(self.partial))
+            )
+        if plan is not None:
+            ld, has_hooks, default_core_partial = plan
+            # Hook-bearing schemas can't fuse the JSON parse (the hooks run in
+            # Python around the per-field step), so let them take stock ``loads``.
+            if not has_hooks:
+                many_v = self.many if many is None else bool(many)
+                core_partial = (
+                    default_core_partial
+                    if partial is None
+                    else _core_partial(partial)
+                )
+                try:
+                    return ld.run_json(json_data, many_v, core_partial)
+                except _compiler.AccelFallback:
+                    pass  # any edge case -> unchanged stock loads below
+    return _orig_loads(
+        self, json_data, *args, many=many, partial=partial, unknown=unknown, **kwargs
+    )
+
+
 def install() -> None:
     """Patch the Rust core into ``marshmallow.Schema`` (idempotent)."""
-    global _orig_serialize, _orig_do_load, _orig_dumps
+    global _orig_serialize, _orig_do_load, _orig_dumps, _orig_loads
     if is_installed():
         return
     _orig_serialize = Schema._serialize
     _orig_do_load = Schema._do_load
     _orig_dumps = Schema.dumps
+    _orig_loads = Schema.loads
     Schema._serialize = _patched_serialize  # type: ignore[method-assign]
     Schema._do_load = _patched_do_load  # type: ignore[method-assign]
     Schema.dumps = _patched_dumps  # type: ignore[method-assign]
+    Schema.loads = _patched_loads  # type: ignore[method-assign]
 
 
 def uninstall() -> None:
     """Restore stock marshmallow's pure-Python ``Schema`` methods (idempotent)."""
-    global _orig_serialize, _orig_do_load, _orig_dumps
+    global _orig_serialize, _orig_do_load, _orig_dumps, _orig_loads
     if not is_installed():
         return
     Schema._serialize = _orig_serialize  # type: ignore[method-assign]
     Schema._do_load = _orig_do_load  # type: ignore[method-assign]
     Schema.dumps = _orig_dumps  # type: ignore[method-assign]
+    Schema.loads = _orig_loads  # type: ignore[method-assign]
     _orig_serialize = None
     _orig_do_load = None
     _orig_dumps = None
+    _orig_loads = None
