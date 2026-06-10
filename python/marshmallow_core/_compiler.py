@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 14
+_EXPECTED_PROTOCOL = 15
 
 
 class _NoFallbackError(Exception):
@@ -120,6 +120,9 @@ _L_DATETIME_AWARENESS = 18
 _V_RANGE = 0
 _V_LENGTH = 1
 _V_ONEOF = 2
+_V_EQUAL = 3
+_V_NONEOF = 4
+_V_CONTAINSONLY = 5
 
 # ``OneOf`` is only compiled when its ``choices`` is one of these stable, re-
 # iterable containers; a consumable iterator would behave differently on the
@@ -454,6 +457,18 @@ def _build_validator(validator: typing.Any) -> tuple | None:
         if not isinstance(validator.choices, _ONEOF_CONTAINERS):
             return None  # consumable/odd choices -> defer to Python
         return (_V_ONEOF, validator.choices)
+    if vtype is ma_validate.Equal:
+        return (_V_EQUAL, validator.comparable)
+    if vtype is ma_validate.NoneOf:
+        if not isinstance(validator.iterable, _ONEOF_CONTAINERS):
+            return None
+        return (_V_NONEOF, validator.iterable)
+    if vtype is ma_validate.ContainsOnly:
+        # ``ContainsOnly`` subclasses ``OneOf`` but the exact-type checks above
+        # skip it; model its all-in-choices rule here.
+        if not isinstance(validator.choices, _ONEOF_CONTAINERS):
+            return None
+        return (_V_CONTAINSONLY, validator.choices)
     return None
 
 
