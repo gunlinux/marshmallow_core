@@ -35,11 +35,11 @@ marshmallow_core.uninstall()    # restore the stock pure-Python methods
   payload describing every field as either **native** (run entirely in Rust) or
   a **callback** (defers to the Python `Field` method). Anything not modelled
   natively stays a callback, so output is behaviour-identical.
-- The **load** core handles only the happy path: the instant it hits any
-  error/edge case it raises an internal `AccelFallback` and marshmallow re-runs
-  the unchanged pure-Python load, so every error message and value matches
-  exactly. The **dump** core has no fallback, so each native dump element is
-  provably identical to `Field._serialize`.
+- Both cores handle the happy path and raise an internal `AccelFallback` on any
+  error/edge case, so marshmallow re-runs the unchanged pure-Python path and
+  every error message and value matches exactly. (Dump has no side effects — it
+  builds a fresh output — so it can discard a partial result and re-run safely,
+  just like load.)
 - `dumps` is **fused**: it writes JSON bytes directly in Rust, skipping the
   intermediate Python dict and the `json.dumps` pass, byte-for-byte identical to
   `json.dumps(schema.dump(obj))`. It activates for hook-free schemas using the
@@ -61,12 +61,13 @@ split). Recognized field validators (`Range` / `Length` / `OneOf`) run natively;
 any other validator, or field-level `pre_load` / `post_load`, keeps that field
 on the callback path. `unknown=INCLUDE`, collection/dotted `partial`, and dotted
 attribute writes are all accelerated. Natively modelled fields include the
-scalars plus `Decimal`, `Dict`, `Constant`, `TimeDelta`, `Boolean` and
-`Integer(strict=True)`; on **load**, also typed `Dict` (keys/values), `Tuple`,
-and `Pluck` (these three stay on the callback path for *dump* — the dump core
-has no fallback). Custom `dict_class` / `get_attribute`, self-referential
-schemas, custom strptime temporal formats, and callable defaults always fall
-back to pure Python.
+scalars plus `Decimal`, `Dict` (incl. typed keys/values), `Tuple`, `Pluck`,
+`Constant`, `TimeDelta`, `Boolean`, `Integer(strict=True)`, and
+`NaiveDateTime` / `AwareDateTime`. The dump core has an `AccelFallback` (it
+discards a partial result and re-runs pure Python on any shape it can't
+reproduce), so it accelerates the composite fields too. Custom `dict_class` /
+`get_attribute`, self-referential schemas, custom strptime temporal formats, and
+callable defaults always fall back to pure Python.
 
 ### Where the speedup is limited
 

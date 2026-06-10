@@ -133,7 +133,15 @@ def _patched_serialize(self: Schema, obj: typing.Any, *, many: bool = False):
     if ds is _UNSET:
         ds = cache["_mc_dump_serializer"] = _compiler.build_dump_serializer(self)
     if ds is not None:
-        return ds.run(obj, many)
+        try:
+            return ds.run(obj, many)
+        except _compiler.AccelFallback:
+            # An element hit a shape it can't reproduce. Dump has no side effects
+            # (it builds a fresh output and returns it), so we discard the partial
+            # result and re-run the unchanged pure-Python serialize — exactly as
+            # the load path does. A *genuine* error from a callback ``_serialize``
+            # is not an ``AccelFallback`` and still propagates unchanged.
+            pass
     return _orig_serialize(self, obj, many=many)
 
 

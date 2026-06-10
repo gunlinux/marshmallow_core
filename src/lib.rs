@@ -80,11 +80,27 @@ enum Element {
     Decimal { serialize: Py<PyAny> },
     /// Dict (no key/value fields): ``dict(value)``.
     Dict,
+    /// Typed Dict: serialize keys/values via their fields per entry (``None`` =
+    /// pass through). Defers on a non-dict input (dump has a fallback).
+    DictTyped {
+        key_el: Option<Box<Element>>,
+        val_el: Option<Box<Element>>,
+    },
     /// Constant: always returns the held constant, ignoring the input value.
     Constant { constant: Py<PyAny> },
     /// TimeDelta: defer to the field's own ``_serialize`` (precision-sensitive
     /// timedelta -> float), provably identical to the callback path.
     TimeDelta { serialize: Py<PyAny> },
+    /// Tuple: serialize each position; defers (dump fallback) on a length
+    /// mismatch so Python raises the exact ``zip(strict=True)`` error.
+    Tuple(Vec<Element>),
+    /// Pluck: dump via the inner schema, then extract ``data_key`` (``utils.pluck``
+    /// per item when ``many``).
+    Pluck {
+        serializer: Box<Serializer>,
+        data_key: Py<PyString>,
+        many: bool,
+    },
 }
 
 enum FieldSpec {
@@ -150,28 +166,57 @@ impl DumpSerializer {
 fn json_escape_into(buf: &mut String, s: &str) {
     use std::fmt::Write as _;
     buf.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => buf.push_str("\\\""),
-            '\\' => buf.push_str("\\\\"),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            '\t' => buf.push_str("\\t"),
-            '\u{8}' => buf.push_str("\\b"),
-            '\u{c}' => buf.push_str("\\f"),
-            c if ('\u{20}'..='\u{7e}').contains(&c) => buf.push(c),
-            c => {
-                let cp = c as u32;
-                if cp <= 0xFFFF {
-                    let _ = write!(buf, "\\u{cp:04x}");
-                } else {
-                    let v = cp - 0x10000;
-                    let hi = 0xD800 + (v >> 10);
-                    let lo = 0xDC00 + (v & 0x3FF);
-                    let _ = write!(buf, "\\u{hi:04x}\\u{lo:04x}");
+    // Scan bytes (not chars): a "clean" byte is printable ASCII except ``"`` and
+    // ``\``. Clean runs are bulk-copied with a single ``push_str``; only a byte
+    // needing an escape breaks the run. Byte comparisons avoid per-char decoding,
+    // so this is fast for both short and long strings. Output is byte-identical
+    // to the stdlib ``ensure_ascii=True`` encoding (the escape logic is unchanged;
+    // multi-byte UTF-8 is decoded only at the rare non-ASCII byte).
+    let bytes = s.as_bytes();
+    let mut last = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\' {
+            i += 1;
+            continue; // clean: extend the run
+        }
+        if last < i {
+            buf.push_str(&s[last..i]); // flush the clean run
+        }
+        if b < 0x80 {
+            match b {
+                b'"' => buf.push_str("\\\""),
+                b'\\' => buf.push_str("\\\\"),
+                b'\n' => buf.push_str("\\n"),
+                b'\r' => buf.push_str("\\r"),
+                b'\t' => buf.push_str("\\t"),
+                0x08 => buf.push_str("\\b"),
+                0x0c => buf.push_str("\\f"),
+                _ => {
+                    let _ = write!(buf, "\\u{b:04x}"); // other control char
                 }
             }
+            i += 1;
+        } else {
+            // Non-ASCII: decode the one char and emit ``\uXXXX`` (surrogate pair
+            // above the BMP), matching ``ensure_ascii=True``.
+            let ch = s[i..].chars().next().unwrap();
+            let cp = ch as u32;
+            if cp <= 0xFFFF {
+                let _ = write!(buf, "\\u{cp:04x}");
+            } else {
+                let v = cp - 0x10000;
+                let hi = 0xD800 + (v >> 10);
+                let lo = 0xDC00 + (v & 0x3FF);
+                let _ = write!(buf, "\\u{hi:04x}\\u{lo:04x}");
+            }
+            i += ch.len_utf8();
         }
+        last = i;
+    }
+    if last < bytes.len() {
+        buf.push_str(&s[last..]);
     }
     buf.push('"');
 }
@@ -497,7 +542,66 @@ impl Element {
                 }
                 ctx.dict_fn.bind(py).call1((value,)) // ``self.mapping_type(value)``
             }
+            Element::DictTyped { key_el, val_el } => {
+                if value.is_none() {
+                    return Ok(py.None().into_bound(py));
+                }
+                // Non-dict input -> defer (dump fallback re-runs pure Python,
+                // which handles any ``Mapping`` or raises the same error).
+                let dict = value.cast::<PyDict>().map_err(|_| fallback())?;
+                let out = PyDict::new(py);
+                for (k, v) in dict.iter() {
+                    // Mirrors ``key_field._serialize(k, None, None)`` /
+                    // ``value_field._serialize(v, None, None)``; ``None`` = pass.
+                    let ko = match key_el {
+                        Some(ke) => ke.apply(ctx, &k)?,
+                        None => k,
+                    };
+                    let vo = match val_el {
+                        Some(ve) => ve.apply(ctx, &v)?,
+                        None => v,
+                    };
+                    out.set_item(ko, vo)?;
+                }
+                Ok(out.into_any())
+            }
             Element::Constant { constant } => Ok(constant.bind(py).clone()),
+            Element::Tuple(elements) => {
+                if value.is_none() {
+                    return Ok(py.None().into_bound(py));
+                }
+                // Defer on a non-sequence or length mismatch; pure Python then
+                // raises the exact ``zip(strict=True)`` error.
+                if !is_list_like(value) || value.len()? != elements.len() {
+                    return Err(fallback());
+                }
+                let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(elements.len());
+                for (element, each) in elements.iter().zip(value.try_iter()?) {
+                    items.push(element.apply(ctx, &each?)?);
+                }
+                Ok(PyTuple::new(py, items)?.into_any())
+            }
+            Element::Pluck {
+                serializer,
+                data_key,
+                many,
+            } => {
+                if value.is_none() {
+                    return Ok(py.None().into_bound(py));
+                }
+                let dk = data_key.bind(py);
+                let ret = serializer.run(ctx, value, *many)?;
+                if *many {
+                    // ``utils.pluck(ret, key)`` == ``[d[key] for d in ret]``.
+                    let out = PyList::empty(py);
+                    for d in ret.try_iter()? {
+                        out.append(d?.get_item(dk)?)?;
+                    }
+                    Ok(out.into_any())
+                } else {
+                    ret.get_item(dk) // ``ret[data_key]``
+                }
+            }
         }
     }
 
@@ -644,6 +748,38 @@ fn parse_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<Element> {
             // (12, bound _serialize)
             serialize: t.get_item(1)?.unbind(),
         }),
+        13 => {
+            // (13, key_element_or_None, value_element_or_None)
+            let parse_opt = |item: Bound<'_, PyAny>| -> PyResult<Option<Box<Element>>> {
+                if item.is_none() {
+                    Ok(None)
+                } else {
+                    Ok(Some(Box::new(parse_element(py, &item)?)))
+                }
+            };
+            Ok(Element::DictTyped {
+                key_el: parse_opt(t.get_item(1)?)?,
+                val_el: parse_opt(t.get_item(2)?)?,
+            })
+        }
+        14 => {
+            // (14, (element, element, ...))
+            let specs = t.get_item(1)?.cast_into::<PyTuple>()?;
+            let mut elements = Vec::with_capacity(specs.len());
+            for item in specs.iter() {
+                elements.push(parse_element(py, &item)?);
+            }
+            Ok(Element::Tuple(elements))
+        }
+        15 => {
+            // (15, nested_payload, data_key, many)
+            let serializer = parse_serializer(py, &t.get_item(1)?)?;
+            Ok(Element::Pluck {
+                serializer: Box::new(serializer),
+                data_key: t.get_item(2)?.cast_into::<PyString>()?.unbind(),
+                many: t.get_item(3)?.extract()?,
+            })
+        }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown element tag {other}"
         ))),
@@ -678,6 +814,24 @@ fn get_one<'py>(
     key: &Bound<'py, PyString>,
     missing: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // Fast path for a plain ``dict`` (the common dump source): a direct lookup
+    // avoids the per-field ``hasattr(__getitem__)`` probe and the exception-based
+    // ``KeyError`` handling below. A present key returns its value (``obj[key]``);
+    // a missing key falls through to ``getattr`` exactly as marshmallow does (so a
+    // field named ``items``/``keys`` still resolves to the dict method). Only an
+    // *exact* dict takes this path; a subclass that overrides ``__getitem__`` uses
+    // the general path.
+    if obj.is_exact_instance_of::<PyDict>() {
+        let dict = obj.cast::<PyDict>()?;
+        if let Some(v) = dict.get_item(key)? {
+            return Ok(v);
+        }
+        return match obj.getattr(key) {
+            Ok(v) => Ok(v),
+            Err(e) if e.is_instance_of::<PyAttributeError>(py) => Ok(missing.clone()),
+            Err(e) => Err(e),
+        };
+    }
     if obj.hasattr(intern!(py, "__getitem__"))? {
         match obj.get_item(key) {
             Ok(v) => return Ok(v),
@@ -768,6 +922,9 @@ enum LoadElement {
     /// TimeDelta: defer to the field's own ``_deserialize`` (float -> timedelta);
     /// any ``ValidationError`` becomes ``AccelFallback``.
     TimeDelta { deserialize: Py<PyAny> },
+    /// NaiveDateTime/AwareDateTime: defer to the field's own ``_deserialize``
+    /// (parse + timezone-awareness check); any ``ValidationError`` -> fallback.
+    DatetimeAwareness { deserialize: Py<PyAny> },
     /// Dict (no key/value fields): copy a dict input via ``dict(value)``; a
     /// non-dict input defers (Python decides Mapping-or-``invalid``).
     Dict,
@@ -1383,6 +1540,10 @@ impl LoadElement {
                 .bind(py)
                 .call1((value, py.None(), py.None()))
                 .map_err(|e| to_fallback(py, e)),
+            LoadElement::DatetimeAwareness { deserialize } => deserialize
+                .bind(py)
+                .call1((value, py.None(), py.None()))
+                .map_err(|e| to_fallback(py, e)),
             LoadElement::Dict => {
                 if value.is_instance_of::<PyDict>() {
                     ctx.dict_fn.bind(py).call1((value,))
@@ -1656,6 +1817,10 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             // (17, bound _deserialize)
             deserialize: t.get_item(1)?.unbind(),
         }),
+        18 => Ok(LoadElement::DatetimeAwareness {
+            // (18, bound _deserialize)
+            deserialize: t.get_item(1)?.unbind(),
+        }),
         16 => {
             // (16, nested_payload, data_key, many)
             let serializer = parse_load_serializer(py, &t.get_item(1)?)?;
@@ -1698,7 +1863,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 10;
+const PROTOCOL_VERSION: u32 = 14;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
