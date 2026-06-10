@@ -34,6 +34,15 @@ from marshmallow import (
     validates_schema,
 )
 
+from importlib.metadata import version as _pkg_version
+
+# marshmallow's major version. The 3.x and 4.x ``fields.TimeDelta`` deserializers
+# differ: 4.x accepts float-strings and passes a ``timedelta`` through unchanged,
+# while 3.x rejects both with "Not a valid period of time.". Inputs exercising
+# those 4.x-only semantics are skipped on the 3.x line (where stock marshmallow
+# itself raises, so there is no value to compare).
+_MA_MAJOR = int(_pkg_version("marshmallow").split(".", 1)[0])
+
 
 @pytest.fixture(autouse=True)
 def _install_core():
@@ -937,12 +946,19 @@ def test_dump_timedelta_equivalence(loaded, monkeypatch):
     assert accelerated == pure
 
 
+_ma4_only = pytest.mark.skipif(
+    _MA_MAJOR < 4, reason="float-string / timedelta passthrough is marshmallow 4.x-only"
+)
+
+
 @pytest.mark.parametrize(
     "data",
     [
         {"secs": 90, "millis": 1500},
-        {"secs": "1.1234567", "millis": 0},  # float-string, rounding
-        {"secs": dt.timedelta(seconds=5)},  # already a timedelta -> passthrough
+        # float-string, rounding
+        pytest.param({"secs": "1.1234567", "millis": 0}, marks=_ma4_only),
+        # already a timedelta -> passthrough
+        pytest.param({"secs": dt.timedelta(seconds=5)}, marks=_ma4_only),
         {},
     ],
 )
