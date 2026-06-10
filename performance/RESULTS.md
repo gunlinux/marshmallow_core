@@ -7,55 +7,57 @@ this table when the core changes.
 
 - **Environment:** Apple Silicon (arm64, macOS), CPython 3.12, marshmallow 4.3.0,
   release build (`maturin build --release`), `--number 6000`.
-- **Recorded:** after Phase 5 (dump `AccelFallback`; native typed Dict / Tuple /
-  Pluck **dump**; exact-dict `get_one` fast path; native NaiveDateTime/
-  AwareDateTime load; bulk-copy JSON string escaper). Phase 4 numbers are in the
+- **Recorded:** after Phase 6 (native int formatting in the JSON writer; native
+  `Equal`/`NoneOf`/`ContainsOnly` validators). Earlier-phase numbers are in the
   git history.
 - These are indicative ratios, not guarantees; absolute numbers vary by machine.
 
 | case      | op    | stock (µs) | core (µs) | speedup |
 |-----------|-------|-----------:|----------:|--------:|
-| flat      | dump  |       2.17 |      0.56 |   3.89x |
-| flat      | load  |       4.75 |      0.42 |  11.27x |
-| flat      | dumps |       3.26 |      0.97 |   3.36x |
-| flat      | loads |       5.60 |      1.12 |   4.99x |
-| nested    | dump  |       5.45 |      0.58 |   9.32x |
-| nested    | load  |      15.61 |      0.72 |  21.60x |
-| nested    | dumps |       7.23 |      1.19 |   6.10x |
-| nested    | loads |      17.29 |      2.10 |   8.23x |
-| list      | dump  |      83.56 |      6.20 |  13.49x |
-| list      | load  |     227.66 |      8.73 |  26.06x |
-| list      | dumps |     100.31 |     12.25 |   8.19x |
-| list      | loads |     245.76 |     24.13 |  10.19x |
-| validator | dump  |       1.61 |      0.28 |   5.81x |
-| validator | load  |       4.21 |      0.40 |  10.60x |
-| validator | dumps |       2.52 |      0.59 |   4.26x |
-| validator | loads |       5.17 |      1.18 |   4.40x |
-| hooks     | dump  |       1.23 |      0.24 |   5.14x |
-| hooks     | load  |       4.58 |      2.13 |   2.15x |
-| hooks     | dumps |       2.05 |      0.50 |   4.07x |
-| hooks     | loads |       5.28 |      2.79 |   1.89x |
-| api       | dump  |     119.88 |     15.80 |   7.59x |
-| api       | load  |     314.43 |     12.42 |  25.31x |
-| api       | dumps |     143.45 |     22.04 |   6.51x |
-| api       | loads |     339.46 |     32.94 |  10.30x |
+| flat      | dump  |       2.16 |      0.55 |   3.95x |
+| flat      | load  |       4.61 |      0.41 |  11.21x |
+| flat      | dumps |       3.16 |      0.90 |   3.51x |
+| flat      | loads |       5.47 |      1.05 |   5.21x |
+| nested    | dump  |       5.39 |      0.56 |   9.63x |
+| nested    | load  |      15.13 |      0.69 |  21.99x |
+| nested    | dumps |       7.00 |      1.04 |   6.72x |
+| nested    | loads |      16.89 |      1.97 |   8.57x |
+| list      | dump  |      82.04 |      5.29 |  15.52x |
+| list      | load  |     223.52 |      7.95 |  28.11x |
+| list      | dumps |      99.80 |     10.95 |   9.12x |
+| list      | loads |     241.75 |     22.48 |  10.75x |
+| validator | dump  |       1.62 |      0.26 |   6.11x |
+| validator | load  |       4.23 |      0.39 |  10.98x |
+| validator | dumps |       2.44 |      0.53 |   4.60x |
+| validator | loads |       5.01 |      1.12 |   4.47x |
+| hooks     | dump  |       1.23 |      0.23 |   5.41x |
+| hooks     | load  |       4.52 |      2.05 |   2.21x |
+| hooks     | dumps |       2.06 |      0.48 |   4.25x |
+| hooks     | loads |       5.23 |      2.76 |   1.90x |
+| api       | dump  |     122.28 |     14.88 |   8.22x |
+| api       | load  |     316.69 |     12.21 |  25.94x |
+| api       | dumps |     144.03 |     21.06 |   6.84x |
+| api       | loads |     339.28 |     31.70 |  10.70x |
 
 ## Reading the table
 
 - **`api`** is the realistic mixed payload (paginated list of records with bool /
   str / int / float / datetime / list / nested fields) — the case to watch.
-- **load** is the strongest direction on collections (25–26x). After Phase 5,
-  **dump** caught up substantially (list dump 13.5x, api dump 7.6x) via the
-  exact-dict `get_one` fast path and the JSON escaper.
-- **hooks** is the floor (~2x): a schema with `pre_load`/`post_load`/`validates`
-  runs marshmallow's Python hook dispatch around the core's per-field step, and
-  that dispatch can't move into Rust. See "Structural ceilings" in `BACKLOG.md` /
-  `NEXTBACKLOG.md`.
-- **dumps/loads** track dump/load; `loads` is bounded by CPython's C `json.loads`.
+- **load** is the strongest direction on collections (26–28x). **dump** (Phase 5)
+  and **dumps** (Phase 6 native int formatting) have closed much of the gap.
+- **`dumps` is still ~2x `dump`** on float-heavy payloads — the remaining cost is
+  `float.__repr__` per value, which can't be matched byte-for-byte in Rust
+  (see `FAIRBACKLOG.md` Tier 1 / "not landed").
+- **hooks** is the floor (~2x): marshmallow's Python hook dispatch around the
+  core's per-field step, not movable into Rust.
+- **`loads`** is bounded by CPython's C `json.loads` (~54% of the call is parsing
+  + Python object construction, identical cost for any parser).
 
 ## Field-level wins not shown above (not in the standard cases)
 
 Measured via targeted micro-benchmarks:
 
-- typed `Dict` dump: 7.5x · `Tuple` dump: 4.1x · `Pluck(many)` dump: 6.5x
-- NaiveDateTime/AwareDateTime load: 3.1x
+- typed `Dict` dump 7.5x · `Tuple` dump 4.1x · `Pluck(many)` dump 6.5x
+- NaiveDateTime/AwareDateTime load 3.1x
+- a schema using `Equal`/`NoneOf`/`ContainsOnly` validators: load 10.4x
+  (previously callback)

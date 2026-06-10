@@ -57,9 +57,9 @@ marshmallow_core.uninstall()    # restore the stock pure-Python methods
 schemas — including those with `pre_load` / `post_load` / `validates` /
 `validates_schema` hooks: the core runs the per-field deserialize step while
 those hooks run in Python around it (mirroring marshmallow's own `_do_load`
-split). Recognized field validators (`Range` / `Length` / `OneOf`) run natively;
-any other validator, or field-level `pre_load` / `post_load`, keeps that field
-on the callback path. `unknown=INCLUDE`, collection/dotted `partial`, and dotted
+split). Recognized field validators (`Range` / `Length` / `OneOf` / `Equal` /
+`NoneOf` / `ContainsOnly`) run natively; any other validator, or field-level
+`pre_load` / `post_load`, keeps that field on the callback path. `unknown=INCLUDE`, collection/dotted `partial`, and dotted
 attribute writes are all accelerated. Natively modelled fields include the
 scalars plus `Decimal`, `Dict` (incl. typed keys/values), `Tuple`, `Pluck`,
 `Constant`, `TimeDelta`, `Boolean`, `Integer(strict=True)`, and
