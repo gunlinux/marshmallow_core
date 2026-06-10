@@ -12,8 +12,17 @@ repository = "https://github.com/gunlinux/marshmallow_core"
 name = "_core"
 crate-type = ["cdylib"]
 
+[features]
+# `extension-module` tells pyo3 not to link libpython (the host interpreter
+# provides the symbols). That is right for the built wheel — maturin enables it
+# via `[tool.maturin] features` below — but it breaks `cargo test`, whose test
+# binary has no host interpreter to borrow symbols from. Gating it behind our own
+# feature (off by default) lets `cargo test` link libpython and run the unit
+# tests, while `maturin build/develop` still produces a proper extension module.
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
-pyo3 = { version = "0.27", features = ["extension-module", "abi3-py310"] }
+pyo3 = { version = "0.27", features = ["abi3-py310"] }
 # SPIKE (Design A, fused loads): jiter's pure-Rust JSON tree. We use only
 # `JsonValue` (no pyo3/python feature), so there is no pyo3 version coupling.
 jiter = { version = "0.15", default-features = false }

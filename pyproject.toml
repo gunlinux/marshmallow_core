@@ -40,4 +40,6 @@ include = ["python"]
 [tool.maturin]
 module-name = "marshmallow_core._core"
 python-source = "python"
-features = ["pyo3/extension-module"]
+# Enables the crate's `extension-module` feature (-> `pyo3/extension-module`),
+# which is off by default so `cargo test` can link libpython. See Cargo.toml.
+features = ["extension-module"]

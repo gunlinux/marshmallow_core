@@ -2344,3 +2344,72 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("PROTOCOL_VERSION", PROTOCOL_VERSION)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the Python-free leaf functions. These run under
+    //! `cargo test` (which links libpython because the `extension-module` feature
+    //! is off — see Cargo.toml); the cross-language parity story lives in
+    //! `tests/test_equivalence.py`.
+    use super::*;
+
+    fn esc(s: &str) -> String {
+        let mut buf = String::new();
+        json_escape_into(&mut buf, s);
+        buf
+    }
+
+    #[test]
+    fn json_escape_plain_and_slash() {
+        assert_eq!(esc(""), "\"\"");
+        assert_eq!(esc("abc"), "\"abc\"");
+        // ``ensure_ascii=True`` leaves ``/`` unescaped, like stdlib json.
+        assert_eq!(esc("a/b"), "\"a/b\"");
+    }
+
+    #[test]
+    fn json_escape_short_escapes() {
+        // Quote and backslash -> ``\"`` and ``\\``.
+        assert_eq!(esc("\"\\"), "\"\\\"\\\\\"");
+        assert_eq!(esc("\n\r\t"), "\"\\n\\r\\t\"");
+        // 0x08 backspace, 0x0c form feed.
+        assert_eq!(esc("\u{08}\u{0c}"), "\"\\b\\f\"");
+    }
+
+    #[test]
+    fn json_escape_other_control_chars_are_uxxxx() {
+        assert_eq!(esc("\u{01}"), "\"\\u0001\"");
+        assert_eq!(esc("\u{1f}"), "\"\\u001f\"");
+    }
+
+    #[test]
+    fn json_escape_non_ascii_and_surrogate_pairs() {
+        assert_eq!(esc("é"), "\"\\u00e9\""); // BMP -> single \uXXXX
+        assert_eq!(esc("😀"), "\"\\ud83d\\ude00\""); // above BMP -> surrogate pair
+    }
+
+    #[test]
+    fn json_escape_mixed_clean_runs() {
+        assert_eq!(esc("hello\nworld"), "\"hello\\nworld\"");
+        assert_eq!(esc("aé b"), "\"a\\u00e9 b\"");
+    }
+
+    fn int_of(jv: Option<&JsonValue<'_>>) -> i64 {
+        match jv {
+            Some(JsonValue::Int(n)) => *n,
+            _ => panic!("expected an Int JsonValue"),
+        }
+    }
+
+    #[test]
+    fn lookup_last_keeps_the_last_duplicate() {
+        // jiter does not dedup keys; stdlib json.loads keeps the last value.
+        let data = br#"{"a": 1, "b": 2, "a": 3}"#;
+        let JsonValue::Object(obj) = JsonValue::parse(data, false).unwrap() else {
+            panic!("expected an object");
+        };
+        assert_eq!(int_of(lookup_last(&obj, "a")), 3);
+        assert_eq!(int_of(lookup_last(&obj, "b")), 2);
+        assert!(lookup_last(&obj, "missing").is_none());
+    }
+}
