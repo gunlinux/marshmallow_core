@@ -34,7 +34,10 @@ marshmallow_core.uninstall()    # restore the stock pure-Python methods
   bound schema is compiled once (cached on the instance) into a recursive
   payload describing every field as either **native** (run entirely in Rust) or
   a **callback** (defers to the Python `Field` method). Anything not modelled
-  natively stays a callback, so output is behaviour-identical.
+  natively stays a callback, so output is behaviour-identical. The compiled plan
+  is cached **per instance**, so reuse schema instances rather than constructing a
+  new `Schema()` per call — otherwise every call recompiles (stock marshmallow
+  rewards instance reuse too).
 - Both cores handle the happy path and raise an internal `AccelFallback` on any
   error/edge case, so marshmallow re-runs the unchanged pure-Python path and
   every error message and value matches exactly. (Dump has no side effects — it
@@ -68,6 +71,11 @@ discards a partial result and re-runs pure Python on any shape it can't
 reproduce), so it accelerates the composite fields too. Custom `dict_class` /
 `get_attribute`, self-referential schemas, custom strptime temporal formats, and
 callable defaults always fall back to pure Python.
+
+`install()` patches `Schema` process-wide and is intended for the standard
+GIL-enabled CPython. The free-threaded build (3.13t) is **not yet supported**:
+the install swap and the per-class hook caches aren't audited for concurrent
+access. Call `install()` once at startup before spawning workers.
 
 ### Where the speedup is limited
 

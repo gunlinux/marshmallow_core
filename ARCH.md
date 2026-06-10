@@ -9,6 +9,25 @@ Severity: **critical** = user-visible breakage of the "strictly a speedup"
 contract · **high** = real performance/maintenance liability · **medium** =
 should fix, no urgency · **low** = note for later.
 
+## Resolution status (branch `fix/arch-issues`)
+
+All of section **A** is addressed; section **B** (speed) is untouched.
+
+| Issue | Status | Where |
+|-------|--------|-------|
+| A1 truthy non-bool `many` | **fixed** | `_patch.py` coerces `bool(...)` at every boundary + regression test |
+| A2 `_accelerated_load` pins to internals | **fixed** | `install()` runs `_accel_load_supported()` tripwire; degrades hook loads on mismatch |
+| A3 hand-synced tag spaces | **fixed** | `tests/test_protocol.py` round-trips every tag + exhaustiveness guard |
+| A4 stale dump-fallback docs | **fixed** | corrected `lib.rs` header, `CLAUDE.md`, `_compiler.py` docstring, dead refs |
+| A5 no Rust unit tests | **fixed** | `#[cfg(test)]` for `json_escape_into`/`lookup_last`; `extension-module` feature-gated so `cargo test` links |
+| A6 version drift | **fixed** | `Cargo.toml` version annotated as deliberately unused |
+| A7 per-instance cache | **documented** | README: reuse schema instances (per-class cache stays rejected, by design) |
+| A8 free-threading unaudited | **documented** | README: 3.13t declared unsupported |
+
+Not done: **B1** (fused `loads` quadratic in width) and **B2** (doomed
+`run_json` for callback schemas) — the measured perf wins — plus B3/B4. B1's
+loop inversion is a non-trivial Rust change and was left for a dedicated branch.
+
 ---
 
 ## A. Architecture issues
