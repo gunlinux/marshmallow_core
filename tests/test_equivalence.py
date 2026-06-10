@@ -2100,6 +2100,46 @@ def test_loads_nested_list_equivalence(monkeypatch):
     assert fused == pure
 
 
+class LoadsContainers(Schema):
+    # Dict / typed-Dict / Tuple threaded straight off the jiter tree.
+    rows = fields.List(
+        fields.Dict(keys=fields.String(), values=fields.Integer(validate=validate.Range(min=0)))
+    )
+    pairs = fields.List(fields.Tuple((fields.Integer(), fields.String())))
+    plain = fields.Dict()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"rows": [{"a": 1, "b": 2}, {"c": 3}], "pairs": [[1, "x"], [2, "y"]], "plain": {"k": [1, 2]}}',
+        '{"rows": [{"a": 1, "a": 5}]}',  # duplicate key -> last wins
+        '{"plain": {}}',
+        "{}",
+    ],
+)
+def test_loads_threaded_containers_equivalence(payload, monkeypatch):
+    fused, pure = _loads_both(LoadsContainers, payload, monkeypatch=monkeypatch)
+    assert fused == pure
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"rows": [{"a": -1}]}',  # value validator fail
+        '{"pairs": [[1, "x", 9]]}',  # tuple length mismatch
+        '{"pairs": [[1, 2]]}',  # tuple element wrong type
+    ],
+)
+def test_loads_threaded_containers_errors_match_python(payload, monkeypatch):
+    with pytest.raises(ValidationError) as fused_exc:
+        LoadsContainers().loads(payload)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as pure_exc:
+        LoadsContainers().loads(payload)
+    assert fused_exc.value.messages == pure_exc.value.messages
+
+
 class LoadsInclude(Schema):
     class Meta:
         unknown = INCLUDE

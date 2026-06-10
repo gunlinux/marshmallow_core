@@ -1985,8 +1985,71 @@ impl LoadElement {
                 }
                 _ => Err(fallback()),
             },
-            // Scalars and the not-yet-threaded containers (Dict/Tuple/Enum/...):
-            // materialise the leaf and reuse the exact pure value-path.
+            LoadElement::Tuple(elements) => match jv {
+                JsonValue::Array(a) => {
+                    // Mirror the pure Tuple: non-sequence / length mismatch / a
+                    // ``None`` element all defer for the exact message.
+                    if a.len() != elements.len() {
+                        return Err(fallback());
+                    }
+                    let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(elements.len());
+                    for (element, item) in elements.iter().zip(a.iter()) {
+                        if matches!(item, JsonValue::Null) {
+                            return Err(fallback());
+                        }
+                        items.push(element.apply_json(py, ctx, item, partial)?);
+                    }
+                    Ok(PyTuple::new(py, items)?.into_any())
+                }
+                _ => Err(fallback()),
+            },
+            LoadElement::Dict => match jv {
+                // Plain Dict (no key/value fields) = ``dict(value)``: a fresh dict
+                // copy, which ``json_to_py`` of an object produces exactly.
+                JsonValue::Object(_) => json_to_py(py, ctx, jv),
+                _ => Err(fallback()),
+            },
+            LoadElement::DictTyped {
+                key_el,
+                key_validators,
+                val_el,
+                val_validators,
+            } => match jv {
+                JsonValue::Object(o) => {
+                    let out = PyDict::new(py);
+                    for (k, v) in o.iter() {
+                        // JSON keys are always strings; apply the key field (+its
+                        // validators) to the string key, the value field to the
+                        // value subtree. Duplicate keys overwrite (last wins, like
+                        // ``json.loads``); any per-entry failure -> fallback.
+                        let kstr = PyString::new(py, k.as_ref());
+                        let ko = match key_el {
+                            Some(ke) => {
+                                let r = ke.apply(ctx, kstr.as_any(), partial)?;
+                                check_validators(py, key_validators, &r)?;
+                                r
+                            }
+                            None => kstr.into_any(),
+                        };
+                        let vo = match val_el {
+                            Some(ve) => {
+                                if matches!(v, JsonValue::Null) {
+                                    return Err(fallback());
+                                }
+                                let r = ve.apply_json(py, ctx, v, partial)?;
+                                check_validators(py, val_validators, &r)?;
+                                r
+                            }
+                            None => json_to_py(py, ctx, v)?,
+                        };
+                        out.set_item(ko, vo)?;
+                    }
+                    Ok(out.into_any())
+                }
+                _ => Err(fallback()),
+            },
+            // Scalars and the remaining wrappers (Enum/Pluck/Decimal/...): the
+            // input is a leaf, so materialise it and reuse the exact pure path.
             _ => {
                 let v = json_to_py(py, ctx, jv)?;
                 self.apply(ctx, &v, partial)
