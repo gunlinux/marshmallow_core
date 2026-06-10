@@ -457,6 +457,39 @@ def test_load_many_equivalence(monkeypatch):
     assert accelerated == pure
 
 
+def test_truthy_nonbool_many_regression(monkeypatch):
+    """A truthy non-bool ``many`` (e.g. ``Schema(many=1)``) must not crash.
+
+    Stock marshmallow stores ``many`` raw and treats it truthily; the Rust
+    boundary takes a strict ``bool``, so every entry point must coerce it
+    (ARCH.md A1 — dump/dumps/loads previously raised ``TypeError`` here).
+    """
+
+    class S(Schema):
+        i = fields.Integer()
+        s = fields.String()
+
+    data = [{"i": 1, "s": "a"}, {"i": 2, "s": "b"}]
+    json_data = '[{"i": 1, "s": "a"}, {"i": 2, "s": "b"}]'
+
+    # Core active (autouse install); ``many=1`` is stored on the instance and
+    # reaches each patched method as a raw ``int``.
+    acc_dump = S(many=1).dump(data)
+    acc_load = S(many=1).load(data)
+    acc_dumps = S(many=1).dumps(data)
+    acc_loads = S(many=1).loads(json_data)
+
+    # Force the pure-Python path and confirm byte-for-byte equivalence.
+    monkeypatch.setattr(accel, "build_dump_serializer", lambda schema: None)
+    monkeypatch.setattr(accel, "build_dump_json_serializer", lambda schema: None)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+
+    assert acc_dump == S(many=1).dump(data)
+    assert acc_load == S(many=1).load(data)
+    assert acc_dumps == S(many=1).dumps(data)
+    assert acc_loads == S(many=1).loads(json_data)
+
+
 class LoadPerson(Schema):
     name = fields.String()
     age = fields.Integer()

@@ -131,7 +131,9 @@ def _patched_serialize(self: Schema, obj: typing.Any, *, many: bool = False):
         ds = cache["_mc_dump_serializer"] = _compiler.build_dump_serializer(self)
     if ds is not None:
         try:
-            return ds.run(obj, many)
+            # ``many`` arrives raw from ``dump`` (``self.many`` may be any truthy
+            # value, e.g. ``1``); the Rust boundary wants a real ``bool``.
+            return ds.run(obj, bool(many))
         except _compiler.AccelFallback:
             # An element hit a shape it can't reproduce. Dump has no side effects
             # (it builds a fresh output and returns it), so we discard the partial
@@ -319,7 +321,7 @@ def _patched_dumps(
             js = cache["_mc_dump_json"] = _compiler.build_dump_json_serializer(self)
         if js is not None:
             try:
-                return js.run_json(obj, self.many if many is None else bool(many))
+                return js.run_json(obj, bool(self.many) if many is None else bool(many))
             except _compiler.AccelFallback:
                 pass  # value the JSON writer can't reproduce -> stock path below
     return _orig_dumps(self, obj, *args, many=many, **kwargs)
@@ -363,7 +365,7 @@ def _patched_loads(
             # Hook-bearing schemas can't fuse the JSON parse (the hooks run in
             # Python around the per-field step), so let them take stock ``loads``.
             if not has_hooks:
-                many_v = self.many if many is None else bool(many)
+                many_v = bool(self.many) if many is None else bool(many)
                 core_partial = (
                     default_core_partial if partial is None else _core_partial(partial)
                 )
