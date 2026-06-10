@@ -67,6 +67,7 @@ enum Element {
     Nested(Box<Serializer>, bool), // Nested (bool = many)
     List(Box<Element>),  // List(inner)
     Uuid,                // UUID -> str(value)
+    IpAddr,              // IP/IPv4/IPv6/IPInterface/... -> str(value)
     /// DateTime/Date/Time: a held serialization callable, else ``value.strftime(fmt)``.
     Temporal {
         func: Option<Py<PyAny>>,
@@ -508,7 +509,7 @@ impl Element {
                 }
                 Ok(out.into_any())
             }
-            Element::Uuid => {
+            Element::Uuid | Element::IpAddr => {
                 if value.is_none() {
                     return Ok(py.None().into_bound(py));
                 }
@@ -726,6 +727,7 @@ fn parse_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<Element> {
             Ok(Element::List(Box::new(inner)))
         }
         6 => Ok(Element::Uuid),
+        16 => Ok(Element::IpAddr),
         7 => {
             // (7, func_or_None, format_str)
             let func_obj = t.get_item(1)?;
@@ -936,6 +938,9 @@ enum LoadElement {
     /// NaiveDateTime/AwareDateTime: defer to the field's own ``_deserialize``
     /// (parse + timezone-awareness check); any ``ValidationError`` -> fallback.
     DatetimeAwareness { deserialize: Py<PyAny> },
+    /// IP/IPv4/IPv6/IPInterface/...: defer to the field's own ``_deserialize``
+    /// (``ensure_text_type`` + the held ``ipaddress`` ctor); any error -> fallback.
+    IpAddr { deserialize: Py<PyAny> },
     /// Dict (no key/value fields): copy a dict input via ``dict(value)``; a
     /// non-dict input defers (Python decides Mapping-or-``invalid``).
     Dict,
@@ -944,7 +949,9 @@ enum LoadElement {
     /// Python re-runs and accumulates the exact error structure.
     DictTyped {
         key_el: Option<Box<LoadElement>>,
+        key_validators: Vec<Validator>,
         val_el: Option<Box<LoadElement>>,
+        val_validators: Vec<Validator>,
     },
     /// Constant: always returns the held constant, ignoring the input value.
     Constant { constant: Py<PyAny> },
@@ -995,6 +1002,10 @@ enum Validator {
     NoneOf { iterable: Py<PyAny> },
     /// ``ContainsOnly``: fail unless every element of ``value`` is in ``choices``.
     ContainsOnly { choices: Py<PyAny> },
+    /// Any other validator (custom callable, ``Email``/``URL``/``Regexp``, ...):
+    /// call it; a ``False`` return fails, a raise propagates — both become an
+    /// ``AccelFallback`` so Python re-runs it for the exact message.
+    Python { validator: Py<PyAny> },
 }
 
 /// How ``load(partial=...)`` is threaded through a load: not partial, fully
@@ -1564,6 +1575,23 @@ impl LoadSerializer {
     }
 }
 
+/// Run a slice of validators against ``value``; any failure or raise becomes an
+/// ``AccelFallback`` (mirrors the per-field validator loop).
+fn check_validators(
+    py: Python<'_>,
+    validators: &[Validator],
+    value: &Bound<'_, PyAny>,
+) -> PyResult<()> {
+    for validator in validators {
+        match validator.check(value) {
+            Ok(true) => {}
+            Ok(false) => return Err(fallback()),
+            Err(e) => return Err(to_fallback(py, e)),
+        }
+    }
+    Ok(())
+}
+
 impl Validator {
     /// Return ``Ok(true)`` if ``value`` passes, ``Ok(false)`` if it fails (the
     /// caller then raises ``AccelFallback``). A comparison/``len``/``in`` that
@@ -1635,6 +1663,15 @@ impl Validator {
                     }
                 }
                 Ok(true)
+            }
+            Validator::Python { validator } => {
+                // ``validator(value)``: a raise propagates (caller -> fallback);
+                // a literal ``False`` return fails (mirrors marshmallow's ``r is
+                // False`` for plain callables). Anything else passes. When in
+                // doubt this fails -> fallback, where Python is authoritative, so
+                // we never *pass* something marshmallow would reject.
+                let r = validator.bind(py).call1((value,))?;
+                Ok(!r.is(&PyBool::new(py, false)))
             }
         }
     }
@@ -1792,6 +1829,10 @@ impl LoadElement {
                 .bind(py)
                 .call1((value, py.None(), py.None()))
                 .map_err(|e| to_fallback(py, e)),
+            LoadElement::IpAddr { deserialize } => deserialize
+                .bind(py)
+                .call1((value, py.None(), py.None()))
+                .map_err(|e| to_fallback(py, e)),
             LoadElement::Dict => {
                 if value.is_instance_of::<PyDict>() {
                     ctx.dict_fn.bind(py).call1((value,))
@@ -1799,7 +1840,12 @@ impl LoadElement {
                     Err(fallback()) // non-dict: defer (Mapping check / ``invalid``)
                 }
             }
-            LoadElement::DictTyped { key_el, val_el } => {
+            LoadElement::DictTyped {
+                key_el,
+                key_validators,
+                val_el,
+                val_validators,
+            } => {
                 // Only an exact dict happy-path; a non-dict Mapping defers so
                 // Python applies its ``isinstance(_, Mapping)`` handling.
                 let dict = value.cast::<PyDict>().map_err(|_| fallback())?;
@@ -1811,7 +1857,9 @@ impl LoadElement {
                             if k.is_none() {
                                 return Err(fallback());
                             }
-                            ke.apply(ctx, &k, partial)?
+                            let r = ke.apply(ctx, &k, partial)?;
+                            check_validators(py, key_validators, &r)?;
+                            r
                         }
                         None => k,
                     };
@@ -1820,7 +1868,9 @@ impl LoadElement {
                             if v.is_none() {
                                 return Err(fallback());
                             }
-                            ve.apply(ctx, &v, partial)?
+                            let r = ve.apply(ctx, &v, partial)?;
+                            check_validators(py, val_validators, &r)?;
+                            r
                         }
                         None => v,
                     };
@@ -1935,8 +1985,71 @@ impl LoadElement {
                 }
                 _ => Err(fallback()),
             },
-            // Scalars and the not-yet-threaded containers (Dict/Tuple/Enum/...):
-            // materialise the leaf and reuse the exact pure value-path.
+            LoadElement::Tuple(elements) => match jv {
+                JsonValue::Array(a) => {
+                    // Mirror the pure Tuple: non-sequence / length mismatch / a
+                    // ``None`` element all defer for the exact message.
+                    if a.len() != elements.len() {
+                        return Err(fallback());
+                    }
+                    let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(elements.len());
+                    for (element, item) in elements.iter().zip(a.iter()) {
+                        if matches!(item, JsonValue::Null) {
+                            return Err(fallback());
+                        }
+                        items.push(element.apply_json(py, ctx, item, partial)?);
+                    }
+                    Ok(PyTuple::new(py, items)?.into_any())
+                }
+                _ => Err(fallback()),
+            },
+            LoadElement::Dict => match jv {
+                // Plain Dict (no key/value fields) = ``dict(value)``: a fresh dict
+                // copy, which ``json_to_py`` of an object produces exactly.
+                JsonValue::Object(_) => json_to_py(py, ctx, jv),
+                _ => Err(fallback()),
+            },
+            LoadElement::DictTyped {
+                key_el,
+                key_validators,
+                val_el,
+                val_validators,
+            } => match jv {
+                JsonValue::Object(o) => {
+                    let out = PyDict::new(py);
+                    for (k, v) in o.iter() {
+                        // JSON keys are always strings; apply the key field (+its
+                        // validators) to the string key, the value field to the
+                        // value subtree. Duplicate keys overwrite (last wins, like
+                        // ``json.loads``); any per-entry failure -> fallback.
+                        let kstr = PyString::new(py, k.as_ref());
+                        let ko = match key_el {
+                            Some(ke) => {
+                                let r = ke.apply(ctx, kstr.as_any(), partial)?;
+                                check_validators(py, key_validators, &r)?;
+                                r
+                            }
+                            None => kstr.into_any(),
+                        };
+                        let vo = match val_el {
+                            Some(ve) => {
+                                if matches!(v, JsonValue::Null) {
+                                    return Err(fallback());
+                                }
+                                let r = ve.apply_json(py, ctx, v, partial)?;
+                                check_validators(py, val_validators, &r)?;
+                                r
+                            }
+                            None => json_to_py(py, ctx, v)?,
+                        };
+                        out.set_item(ko, vo)?;
+                    }
+                    Ok(out.into_any())
+                }
+                _ => Err(fallback()),
+            },
+            // Scalars and the remaining wrappers (Enum/Pluck/Decimal/...): the
+            // input is a leaf, so materialise it and reuse the exact pure path.
             _ => {
                 let v = json_to_py(py, ctx, jv)?;
                 self.apply(ctx, &v, partial)
@@ -2008,6 +2121,15 @@ fn parse_load_field_spec(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Lo
 }
 
 /// Parse a validator spec tuple (see ``_compiler._build_validator``).
+/// Parse a Python list/tuple of validator specs into ``Vec<Validator>``.
+fn parse_validator_list(py: Python<'_>, list: &Bound<'_, PyAny>) -> PyResult<Vec<Validator>> {
+    let mut out = Vec::new();
+    for item in list.try_iter()? {
+        out.push(parse_validator(py, &item?)?);
+    }
+    Ok(out)
+}
+
 fn parse_validator(_py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<Validator> {
     let t = v.cast::<PyTuple>()?;
     let tag: u8 = t.get_item(0)?.extract()?;
@@ -2064,6 +2186,10 @@ fn parse_validator(_py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<Validator>
         5 => Ok(Validator::ContainsOnly {
             // (5, choices)
             choices: t.get_item(1)?.unbind(),
+        }),
+        6 => Ok(Validator::Python {
+            // (6, validator_callable)
+            validator: t.get_item(1)?.unbind(),
         }),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown validator tag {other}"
@@ -2139,6 +2265,10 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             // (18, bound _deserialize)
             deserialize: t.get_item(1)?.unbind(),
         }),
+        19 => Ok(LoadElement::IpAddr {
+            // (19, bound _deserialize)
+            deserialize: t.get_item(1)?.unbind(),
+        }),
         16 => {
             // (16, nested_payload, data_key, many)
             let serializer = parse_load_serializer(py, &t.get_item(1)?)?;
@@ -2158,7 +2288,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             Ok(LoadElement::Tuple(elements))
         }
         14 => {
-            // (14, key_element_or_None, value_element_or_None)
+            // (14, key_el_or_None, key_validators, value_el_or_None, val_validators)
             let parse_opt = |item: Bound<'_, PyAny>| -> PyResult<Option<Box<LoadElement>>> {
                 if item.is_none() {
                     Ok(None)
@@ -2168,7 +2298,9 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             };
             Ok(LoadElement::DictTyped {
                 key_el: parse_opt(t.get_item(1)?)?,
-                val_el: parse_opt(t.get_item(2)?)?,
+                key_validators: parse_validator_list(py, &t.get_item(2)?)?,
+                val_el: parse_opt(t.get_item(3)?)?,
+                val_validators: parse_validator_list(py, &t.get_item(4)?)?,
             })
         }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -2181,7 +2313,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 15;
+const PROTOCOL_VERSION: u32 = 18;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {

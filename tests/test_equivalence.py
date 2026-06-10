@@ -1810,6 +1810,225 @@ def test_load_partial_nested_own_option_defers(monkeypatch):
     assert accelerated == pure == {"id": 1, "inner": {}}
 
 
+# ---- Email/Url + arbitrary (Python-arm) validators -----------------------
+
+
+def _custom_even(v):
+    if v % 2:
+        raise ValidationError("must be even")
+
+
+def _custom_nonneg(v):
+    return v >= 0  # plain callable: a ``False`` return means fail
+
+
+class ValidatorArmSchema(Schema):
+    email = fields.Email()
+    url = fields.Url()
+    rx = fields.String(validate=validate.Regexp(r"^[a-z]+$"))
+    even = fields.Integer(validate=_custom_even)
+    nonneg = fields.Integer(validate=_custom_nonneg)
+    # native ``Range`` + a Python-arm callable on the same field
+    multi = fields.Integer(validate=[validate.Range(min=0), _custom_even])
+
+
+def test_validator_arm_is_native():
+    from marshmallow_core import _compiler
+
+    # Email/Url deserialize as String; a custom callable compiles to _V_PYTHON.
+    assert _compiler._build_load_element(fields.Email(), ())[0] == _compiler._L_STRING
+    assert _compiler._build_load_element(fields.Url(), ())[0] == _compiler._L_STRING
+    assert _compiler._build_validator(_custom_even)[0] == _compiler._V_PYTHON
+    assert _compiler._build_validator(validate.Regexp("x"))[0] == _compiler._V_PYTHON
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"email": "a@b.com", "url": "http://x.com", "rx": "abc", "even": 4, "nonneg": 3, "multi": 2},
+        {"email": "a@b.com"},  # valid subset
+        {},
+    ],
+)
+def test_load_validator_arm_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(ValidatorArmSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+_ma3_only = pytest.mark.skipif(
+    _MA_MAJOR >= 4, reason="a plain callable returning False only fails on marshmallow 3.x"
+)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"email": "not-an-email"},
+        {"url": "not a url"},
+        {"rx": "ABC"},  # regexp fail
+        {"even": 3},  # custom raise
+        # A plain callable returning False fails on 3.x but is ignored on 4.x.
+        pytest.param({"nonneg": -1}, marks=_ma3_only),
+        {"multi": -3},  # native Range fail AND python fail -> both collected
+        {"multi": 3},  # native pass, python fail
+    ],
+)
+def test_load_validator_arm_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        ValidatorArmSchema().load(data)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        ValidatorArmSchema().load(data)
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+# ---- typed Dict with inner key/value validators --------------------------
+
+
+class DictValidatedSchema(Schema):
+    d = fields.Dict(
+        keys=fields.String(validate=validate.Length(min=2)),
+        values=fields.Integer(validate=validate.Range(min=0)),
+    )
+
+
+def test_dict_inner_validators_is_native():
+    from marshmallow_core import _compiler
+
+    field = DictValidatedSchema().load_fields["d"]
+    assert _compiler._build_load_element(field, ())[0] == _compiler._L_DICT_TYPED
+
+
+@pytest.mark.parametrize("data", [{"d": {"ab": 1, "cd": 2}}, {"d": {}}, {}])
+def test_load_dict_inner_validators_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(DictValidatedSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"d": {"x": 1}},  # key too short
+        {"d": {"ab": -1}},  # value below range
+        {"d": {"x": -1}},  # both fail
+    ],
+)
+def test_load_dict_inner_validators_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        DictValidatedSchema().load(data)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        DictValidatedSchema().load(data)
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+# ---- IP family (ipaddress-backed fields) ---------------------------------
+
+import ipaddress as _ipaddress
+
+
+class IpSchema(Schema):
+    a = fields.IP()
+    b = fields.IPv4()
+    c = fields.IPv6()
+    iface = fields.IPInterface()
+    v4i = fields.IPv4Interface()
+    v6i = fields.IPv6Interface()
+
+
+_IP_LOADED = {
+    "a": _ipaddress.ip_address("1.2.3.4"),
+    "b": _ipaddress.IPv4Address("8.8.8.8"),
+    "c": _ipaddress.IPv6Address("::1"),
+    "iface": _ipaddress.ip_interface("10.0.0.1/24"),
+    "v4i": _ipaddress.IPv4Interface("192.168.0.5/16"),
+    "v6i": _ipaddress.IPv6Interface("fe80::1/64"),
+}
+
+
+def test_dump_ip_equivalence(monkeypatch):
+    accelerated, pure = _dump_both(IpSchema, _IP_LOADED, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {
+            "a": "1.2.3.4",
+            "b": "8.8.8.8",
+            "c": "::1",
+            "iface": "10.0.0.1/24",
+            "v4i": "192.168.0.5/16",
+            "v6i": "fe80::1/64",
+        },
+        {"a": _ipaddress.ip_address("5.6.7.8")},  # already an instance -> passthrough
+        {},  # all missing
+    ],
+)
+def test_load_ip_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(IpSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize("data", [{"a": "not-an-ip"}, {"b": "::1"}, {"a": None}])
+def test_load_ip_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        IpSchema().load(data)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        IpSchema().load(data)
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_loads_ip_equivalence(monkeypatch):
+    payload = '{"a": "1.2.3.4", "c": "::1", "iface": "10.0.0.1/24"}'
+    fused, pure = _loads_both(IpSchema, payload, monkeypatch=monkeypatch)
+    assert fused == pure
+
+
+# ---- custom (non-ISO) strptime temporal formats on load ------------------
+
+
+class CustomTemporalSchema(Schema):
+    when = fields.DateTime(format="%Y/%m/%d %H:%M")
+    day = fields.Date(format="%d-%m-%Y")
+    t = fields.Time(format="%H.%M.%S")
+
+
+def test_custom_temporal_is_native_load():
+    """A custom strptime format must compile to the native (held-method) load
+    element, not fall back."""
+    from marshmallow_core import _compiler
+
+    field = fields.DateTime(format="%Y/%m/%d %H:%M")
+    field._bind_to_schema("when", CustomTemporalSchema())
+    assert _compiler._build_load_element(field, ())[0] == _compiler._L_DATETIME_AWARENESS
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"when": "2020/01/02 03:04", "day": "15-06-2026", "t": "23.59.01"},
+        {"day": "15-06-2026"},  # subset
+        {},  # all missing
+    ],
+)
+def test_load_custom_temporal_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(CustomTemporalSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize("data", [{"when": "bad-format"}, {"day": "2026-06-15"}])
+def test_load_custom_temporal_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        CustomTemporalSchema().load(data)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        CustomTemporalSchema().load(data)
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
 # ---- fused loads (jiter, Design A) ---------------------------------------
 # ``loads`` parses JSON straight off a jiter tree and deserializes without the
 # intermediate Python dict ``json.loads`` would build. These mirror the
@@ -1879,6 +2098,46 @@ def test_loads_nested_list_equivalence(monkeypatch):
     )
     fused, pure = _loads_both(LoadsNested, payload, monkeypatch=monkeypatch)
     assert fused == pure
+
+
+class LoadsContainers(Schema):
+    # Dict / typed-Dict / Tuple threaded straight off the jiter tree.
+    rows = fields.List(
+        fields.Dict(keys=fields.String(), values=fields.Integer(validate=validate.Range(min=0)))
+    )
+    pairs = fields.List(fields.Tuple((fields.Integer(), fields.String())))
+    plain = fields.Dict()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"rows": [{"a": 1, "b": 2}, {"c": 3}], "pairs": [[1, "x"], [2, "y"]], "plain": {"k": [1, 2]}}',
+        '{"rows": [{"a": 1, "a": 5}]}',  # duplicate key -> last wins
+        '{"plain": {}}',
+        "{}",
+    ],
+)
+def test_loads_threaded_containers_equivalence(payload, monkeypatch):
+    fused, pure = _loads_both(LoadsContainers, payload, monkeypatch=monkeypatch)
+    assert fused == pure
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"rows": [{"a": -1}]}',  # value validator fail
+        '{"pairs": [[1, "x", 9]]}',  # tuple length mismatch
+        '{"pairs": [[1, 2]]}',  # tuple element wrong type
+    ],
+)
+def test_loads_threaded_containers_errors_match_python(payload, monkeypatch):
+    with pytest.raises(ValidationError) as fused_exc:
+        LoadsContainers().loads(payload)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as pure_exc:
+        LoadsContainers().loads(payload)
+    assert fused_exc.value.messages == pure_exc.value.messages
 
 
 class LoadsInclude(Schema):

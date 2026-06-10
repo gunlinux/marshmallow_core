@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 15
+_EXPECTED_PROTOCOL = 18
 
 
 class _NoFallbackError(Exception):
@@ -94,6 +94,7 @@ _TIMEDELTA = 12
 _DICT_TYPED = 13
 _TUPLE = 14
 _PLUCK = 15
+_IPADDR = 16
 
 # Load element tags (a distinct tag space from the dump tags above).
 _L_PASSTHROUGH = 0
@@ -115,6 +116,7 @@ _L_TUPLE = 15
 _L_PLUCK = 16
 _L_TIMEDELTA = 17
 _L_DATETIME_AWARENESS = 18
+_L_IPADDR = 19
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -123,6 +125,7 @@ _V_ONEOF = 2
 _V_EQUAL = 3
 _V_NONEOF = 4
 _V_CONTAINSONLY = 5
+_V_PYTHON = 6  # any other validator: run it in Python, failure -> AccelFallback
 
 # ``OneOf`` is only compiled when its ``choices`` is one of these stable, re-
 # iterable containers; a consumable iterator would behave differently on the
@@ -148,6 +151,21 @@ _SCALAR_KINDS: dict[type, int] = {
     ma_fields.Integer: _INTEGER,
     ma_fields.Float: _FLOAT,
 }
+
+# ``ipaddress``-backed fields. ``_serialize`` is ``str(value)`` for all of them
+# (identical to ``UUID``), and ``_deserialize`` is intrinsically Python
+# (``ensure_text_type`` + the held ``ipaddress`` constructor), so on load we hand
+# the field's own ``_deserialize`` to the core (the ``Decimal``/``TimeDelta``
+# pattern) and let any ``ValidationError`` become an ``AccelFallback``. Probed via
+# ``getattr`` so a marshmallow build missing any of them just omits it.
+_IP_TYPES: frozenset[type] = frozenset(
+    t
+    for t in (
+        getattr(ma_fields, _n, None)
+        for _n in ("IP", "IPv4", "IPv6", "IPInterface", "IPv4Interface", "IPv6Interface")
+    )
+    if t is not None
+)
 
 # Temporal field types whose ``_serialize`` is exactly ``_TemporalField._serialize``.
 _TEMPORAL_TYPES: frozenset[type] = frozenset(
@@ -255,6 +273,10 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
         return (_LIST, inner_element)
     if ftype is ma_fields.UUID:
         return (_UUID,)
+    if ftype in _IP_TYPES:
+        # ``IP*._serialize`` is ``str(value)`` (None passes through) — identical
+        # to ``UUID``; the core stringifies and defers (dump fallback) on nothing.
+        return (_IPADDR,)
     if ftype in _TEMPORAL_TYPES:
         # ``field.format`` is resolved to a concrete string once the field is
         # bound to its schema (which has happened by the first dump).
@@ -434,13 +456,15 @@ def _has_load_pre_post(field: typing.Any) -> bool:
 
 
 def _build_validator(validator: typing.Any) -> tuple | None:
-    """Compile a single ``validate`` validator into a spec tuple, or ``None``.
+    """Compile a single ``validate`` validator into a spec tuple.
 
-    Only ``Range``/``Length``/``OneOf`` (exact types) are modelled. The native
-    core reproduces only each validator's *pass/fail decision*; on failure it
-    raises :data:`AccelFallback` so Python re-runs the validator and emits the
-    exact (possibly custom) error message. Custom messages therefore need no
-    modelling here.
+    ``Range``/``Length``/``OneOf``/``Equal``/``NoneOf``/``ContainsOnly`` (exact
+    types) are modelled natively; **any other** validator (a custom callable, or a
+    built-in like ``validate.Email``/``URL``/``Regexp``) compiles to ``_V_PYTHON``,
+    which calls the validator from the core and turns a failure (a ``False`` return
+    or a raise) into :data:`AccelFallback`. The native core reproduces only each
+    validator's *pass/fail decision*; on failure Python re-runs it to emit the
+    exact (possibly custom) error message, so this never returns ``None``.
     """
     vtype = type(validator)
     if vtype is ma_validate.Range:
@@ -455,21 +479,24 @@ def _build_validator(validator: typing.Any) -> tuple | None:
         return (_V_LENGTH, validator.min, validator.max, validator.equal)
     if vtype is ma_validate.OneOf:
         if not isinstance(validator.choices, _ONEOF_CONTAINERS):
-            return None  # consumable/odd choices -> defer to Python
+            return (_V_PYTHON, validator)  # consumable/odd choices -> run in Python
         return (_V_ONEOF, validator.choices)
     if vtype is ma_validate.Equal:
         return (_V_EQUAL, validator.comparable)
     if vtype is ma_validate.NoneOf:
         if not isinstance(validator.iterable, _ONEOF_CONTAINERS):
-            return None
+            return (_V_PYTHON, validator)
         return (_V_NONEOF, validator.iterable)
     if vtype is ma_validate.ContainsOnly:
         # ``ContainsOnly`` subclasses ``OneOf`` but the exact-type checks above
         # skip it; model its all-in-choices rule here.
         if not isinstance(validator.choices, _ONEOF_CONTAINERS):
-            return None
+            return (_V_PYTHON, validator)
         return (_V_CONTAINSONLY, validator.choices)
-    return None
+    # Anything else (custom callable, Email/URL/Regexp, an OneOf/NoneOf with
+    # consumable choices, ...): run it in Python from the core; any failure or
+    # raise -> AccelFallback so Python emits the exact error.
+    return (_V_PYTHON, validator)
 
 
 def _compile_validators(validators: typing.Any) -> list[tuple] | None:
@@ -525,7 +552,10 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
         if not field.truthy:
             return None
         return (_L_BOOLEAN, field.truthy, field.falsy)
-    if ftype is ma_fields.String:
+    if ftype is ma_fields.String or ftype is ma_fields.Email or ftype is ma_fields.Url:
+        # ``Email``/``Url`` inherit ``String._deserialize`` (``ensure_text_type``);
+        # their only difference is a built-in ``validate.Email``/``URL`` validator,
+        # which now compiles via the ``_V_PYTHON`` arm.
         return (_L_STRING,)
     if ftype is ma_fields.Integer:
         if field.strict:
@@ -581,14 +611,22 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
         # ``UUID._validated``: pass through an existing UUID, else ``uuid.UUID(value)``
         # (with the 16-byte ``bytes=`` special case). Any error -> fall back.
         return (_L_UUID, uuid.UUID)
+    if ftype in _IP_TYPES:
+        # ``IP*._deserialize`` (``ensure_text_type`` + the held ``ipaddress``
+        # constructor) is intrinsically Python; hand the field's own method to the
+        # core, which turns any ``ValidationError`` into a fallback.
+        return (_L_IPADDR, field._deserialize)
     if ftype in _LOAD_TEMPORAL_TYPES:
         # ``_TemporalField._deserialize`` passes through an existing instance, else
-        # applies ``DESERIALIZATION_FUNCS[format]``. A custom strptime format (no
-        # registered func) is left to the callback path.
+        # applies ``DESERIALIZATION_FUNCS[format]``.
         data_format = field.format or field.DEFAULT_FORMAT
         func = field.DESERIALIZATION_FUNCS.get(data_format)
         if func is None:
-            return None
+            # Custom strptime format (no registered ISO func): the parse is an
+            # intrinsically-Python ``datetime.strptime``. Hand the field's own
+            # ``_deserialize`` to the core (the held-method pattern shared with
+            # ``Decimal``/``TimeDelta``); any ``ValidationError`` -> fallback.
+            return (_L_DATETIME_AWARENESS, field._deserialize)
         internal_type = getattr(dt, field.OBJ_TYPE)
         return (_L_TEMPORAL, internal_type, func)
     if ftype is ma_fields.NaiveDateTime or ftype is ma_fields.AwareDateTime:
@@ -607,13 +645,14 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
         if field.key_field is None and field.value_field is None:
             return (_L_DICT,)  # plain dict-copy
         # Typed Dict: apply the key/value fields per entry on the happy path.
-        # Require the inner fields carry no processors/validators (so their
-        # ``deserialize`` is just ``_deserialize`` for a present, non-None value);
-        # the core falls back on a non-dict input, a ``None`` key/value, or any
-        # per-entry error so Python accumulates the exact error structure.
+        # Inner ``pre_load``/``post_load`` *transform* the value and must run in
+        # Python, so they still defer; inner *validators* compile (natively or via
+        # the ``_V_PYTHON`` arm) and run per entry. The core falls back on a
+        # non-dict input, a ``None`` key/value, or any per-entry error so Python
+        # accumulates the exact error structure.
         key_field, value_field = field.key_field, field.value_field
-        if (key_field is not None and _has_field_processors(key_field)) or (
-            value_field is not None and _has_field_processors(value_field)
+        if (key_field is not None and _has_load_pre_post(key_field)) or (
+            value_field is not None and _has_load_pre_post(value_field)
         ):
             return None
         key_el = (
@@ -628,7 +667,17 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
             value_field is not None and val_el is None
         ):
             return None
-        return (_L_DICT_TYPED, key_el, val_el)
+        key_vals = (
+            tuple(_compile_validators(key_field.validators) or ())
+            if key_field is not None
+            else ()
+        )
+        val_vals = (
+            tuple(_compile_validators(value_field.validators) or ())
+            if value_field is not None
+            else ()
+        )
+        return (_L_DICT_TYPED, key_el, key_vals, val_el, val_vals)
     if ftype is ma_fields.Constant:
         return (_L_CONSTANT, field.constant)
     if ftype is ma_fields.Tuple:
