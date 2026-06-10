@@ -1810,6 +1810,78 @@ def test_load_partial_nested_own_option_defers(monkeypatch):
     assert accelerated == pure == {"id": 1, "inner": {}}
 
 
+# ---- Email/Url + arbitrary (Python-arm) validators -----------------------
+
+
+def _custom_even(v):
+    if v % 2:
+        raise ValidationError("must be even")
+
+
+def _custom_nonneg(v):
+    return v >= 0  # plain callable: a ``False`` return means fail
+
+
+class ValidatorArmSchema(Schema):
+    email = fields.Email()
+    url = fields.Url()
+    rx = fields.String(validate=validate.Regexp(r"^[a-z]+$"))
+    even = fields.Integer(validate=_custom_even)
+    nonneg = fields.Integer(validate=_custom_nonneg)
+    # native ``Range`` + a Python-arm callable on the same field
+    multi = fields.Integer(validate=[validate.Range(min=0), _custom_even])
+
+
+def test_validator_arm_is_native():
+    from marshmallow_core import _compiler
+
+    # Email/Url deserialize as String; a custom callable compiles to _V_PYTHON.
+    assert _compiler._build_load_element(fields.Email(), ())[0] == _compiler._L_STRING
+    assert _compiler._build_load_element(fields.Url(), ())[0] == _compiler._L_STRING
+    assert _compiler._build_validator(_custom_even)[0] == _compiler._V_PYTHON
+    assert _compiler._build_validator(validate.Regexp("x"))[0] == _compiler._V_PYTHON
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"email": "a@b.com", "url": "http://x.com", "rx": "abc", "even": 4, "nonneg": 3, "multi": 2},
+        {"email": "a@b.com"},  # valid subset
+        {},
+    ],
+)
+def test_load_validator_arm_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(ValidatorArmSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+_ma3_only = pytest.mark.skipif(
+    _MA_MAJOR >= 4, reason="a plain callable returning False only fails on marshmallow 3.x"
+)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"email": "not-an-email"},
+        {"url": "not a url"},
+        {"rx": "ABC"},  # regexp fail
+        {"even": 3},  # custom raise
+        # A plain callable returning False fails on 3.x but is ignored on 4.x.
+        pytest.param({"nonneg": -1}, marks=_ma3_only),
+        {"multi": -3},  # native Range fail AND python fail -> both collected
+        {"multi": 3},  # native pass, python fail
+    ],
+)
+def test_load_validator_arm_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        ValidatorArmSchema().load(data)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        ValidatorArmSchema().load(data)
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
 # ---- IP family (ipaddress-backed fields) ---------------------------------
 
 import ipaddress as _ipaddress
@@ -1886,17 +1958,12 @@ class CustomTemporalSchema(Schema):
 
 def test_custom_temporal_is_native_load():
     """A custom strptime format must compile to the native (held-method) load
-    path, not fall back."""
-    monkeypatch_install = marshmallow_core.is_installed()
-    if not monkeypatch_install:
-        marshmallow_core.install()
-    try:
-        from marshmallow_core import _compiler
+    element, not fall back."""
+    from marshmallow_core import _compiler
 
-        assert _compiler.build_load_deserializer(CustomTemporalSchema()) is not None
-    finally:
-        if not monkeypatch_install:
-            marshmallow_core.uninstall()
+    field = fields.DateTime(format="%Y/%m/%d %H:%M")
+    field._bind_to_schema("when", CustomTemporalSchema())
+    assert _compiler._build_load_element(field, ())[0] == _compiler._L_DATETIME_AWARENESS
 
 
 @pytest.mark.parametrize(
