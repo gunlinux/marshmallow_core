@@ -105,9 +105,14 @@ extension `marshmallow_core._core` (`[lib] name = "_core"`, `module-name =
 instant it hits any error/edge case it raises `AccelFallback` and Python re-runs
 the unchanged pure-Python load, so every message/value matches exactly.
 `KeyboardInterrupt`/`SystemExit` from a callback propagate unchanged (never
-converted to `AccelFallback`). The **dump core has no `AccelFallback`** — it
-can't defer mid-serialization — so every native dump element must be provably
-identical to `Field._serialize`.
+converted to `AccelFallback`). The **dump core has only a *limited*
+`AccelFallback`**: a few elements raise it for a shape they can't reproduce (a
+`Tuple` length mismatch, a non-dict `DictTyped`, a value the JSON writer can't
+encode) and `_patched_serialize` discards the partial result and re-runs pure
+Python (safe — dump has no side effects). It is **not** a general safety net,
+though: an element that silently produces the *wrong* value is never caught, so
+every native dump element must still be provably identical to `Field._serialize`
+for every input it accepts, and must defer on any shape it does not.
 
 ### Invariants when changing the core
 

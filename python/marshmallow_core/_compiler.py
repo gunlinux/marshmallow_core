@@ -1,33 +1,29 @@
-"""Optional Rust acceleration for the ``dump`` (serialization) path.
+"""Optional Rust acceleration for the ``dump`` and ``load`` paths.
 
 This module compiles a bound :class:`~marshmallow.Schema` into a Rust-backed
-``DumpSerializer`` that replaces the per-object Python ``_serialize`` loop. It is
-strictly optional: if the ``_marshmallow_core`` extension is not installed (or is
-disabled via ``MARSHMALLOW_NO_ACCEL``), :func:`build_dump_serializer` returns
-``None`` and marshmallow uses its pure-Python path unchanged.
+``DumpSerializer`` / ``LoadDeserializer`` (and their JSON-fused ``run_json``
+variants) that replace the per-object Python ``_serialize`` / ``_deserialize``
+loops. It is strictly optional: if the ``marshmallow_core._core`` extension is not
+installed (or is disabled via ``MARSHMALLOW_NO_ACCEL``), the ``build_*`` entry
+points return ``None`` and marshmallow uses its pure-Python path unchanged.
 
-A schema is compiled into a recursive *payload* (see the wire format below).
-Every field becomes either a *native* serializer (formatted entirely in Rust) or
-a *callback* that defers to the Python ``Field.serialize`` method, so accelerated
-output is identical to pure-Python output. Natively supported:
+A schema is compiled into a recursive *payload*. Every field becomes either a
+*native* serializer/deserializer (handled entirely in Rust) or a *callback* that
+defers to the Python ``Field.serialize``/``Field.deserialize`` method, so
+accelerated output is identical to pure-Python output. The dump and load tag
+spaces are distinct integers (see the ``_*`` / ``_L_*`` / ``_V_*`` constants
+below) and are kept in lock-step with ``src/lib.rs``; ``PROTOCOL_VERSION`` /
+:data:`_EXPECTED_PROTOCOL` gate a stale build. The exact tuple shapes are
+documented inline at each ``_build_*`` / ``parse_*`` site rather than duplicated
+here, since they evolve together.
 
-* scalars (exact type): ``Raw``, ``Boolean``, ``String``, ``Integer``, ``Float``;
-* ``Nested`` (exact type) whose inner schema is itself compilable and has no
-  ``pre_dump``/``post_dump`` hooks — the nested schema is recursed in Rust;
-* ``List`` (exact type) whose element field is natively supported.
-
-Everything else (``Method``, ``Function``, ``DateTime``, ``UUID``, ``Email``,
-``Enum``, callable ``dump_default``, a schema overriding ``get_attribute``, ...)
-falls back to the callback path.
-
-Wire format passed to ``DumpSerializer(payload, missing)``:
-
-* ``payload`` = ``(accessor, [field_spec, ...])`` — one schema level.
-* ``field_spec`` native   = ``(False, output_key, key, dump_default, element)``.
-* ``field_spec`` callback = ``(True, output_key, attr_name, field)``.
-* ``element`` scalar = ``(kind:int, as_string:bool)`` with ``kind`` in 0..=3.
-* ``element`` nested = ``(4, payload, many:bool)``.
-* ``element`` list   = ``(5, element)``.
+Roughly, the natively-handled field set is the stock scalar/collection/temporal
+types; everything else (``Method``/``Function``, callable defaults, a schema
+overriding ``get_attribute``/``dict_class`` or its ``load``/``dump`` entry points,
+field-level ``pre_load``/``post_load``, any field type without a native element)
+falls back to the callback path. On *load* the Rust core additionally raises
+``AccelFallback`` for any error/edge case so error messages stay byte-identical;
+on *dump* the fallback is limited (see ``src/lib.rs``).
 """
 
 from __future__ import annotations
@@ -62,7 +58,7 @@ except ImportError:  # pragma: no cover - extension is optional
     _core = None  # type: ignore[assignment]
 
 #: Wire-format/ABI version this module speaks. Must match the extension's
-#: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
+#: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``marshmallow_core._core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
 _EXPECTED_PROTOCOL = 18

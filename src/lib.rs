@@ -1,6 +1,6 @@
 //! Rust acceleration core for marshmallow's `dump` (serialization) path.
 //!
-//! A `DumpSerializer` is compiled (see `marshmallow._accel`) from a bound
+//! A `DumpSerializer` is compiled (see `marshmallow_core._compiler`) from a bound
 //! `Schema` and replaces the per-object Python `_serialize` loop. The model is
 //! recursive:
 //!
@@ -13,11 +13,16 @@
 //! Anything the Rust side does not model natively stays a callback, so the
 //! accelerated output is behaviour-identical to pure-Python marshmallow.
 //!
-//! WARNING: unlike the load path (below), the dump path has **no `AccelFallback`
-//! safety net** — a `DumpSerializer` cannot defer to Python mid-serialization.
-//! Every native dump `Element` must therefore be *provably* identical to the
-//! corresponding `Field._serialize`, and every new one needs a `_dump_both`
-//! equivalence test (`tests/test_accel.py`). When in doubt, leave it a callback.
+//! The dump path has a **limited `AccelFallback`**: a few elements raise it for a
+//! shape they can't reproduce (a `Tuple` length mismatch, a non-dict `DictTyped`
+//! input, a value `write_json_value` cannot encode), and the caller discards the
+//! partial result and re-runs pure Python — safe because dump has no side effects.
+//! But it is *not* a general safety net: an element that silently produces the
+//! *wrong* value is never caught. So every native dump `Element` must be
+//! *provably* identical to the corresponding `Field._serialize` for every input
+//! it accepts, deferring (raising `AccelFallback`) on any shape it does not, and
+//! every new one needs a `_dump_both` equivalence test (`tests/test_equivalence.py`).
+//! When in doubt, leave it a callback.
 
 use pyo3::create_exception;
 use pyo3::exceptions::{
@@ -141,7 +146,7 @@ pub struct DumpSerializer {
 
 #[pymethods]
 impl DumpSerializer {
-    /// ``payload`` is ``(accessor, [field_spec, ...])``; see ``marshmallow._accel``.
+    /// ``payload`` is ``(accessor, [field_spec, ...])``; see ``marshmallow_core._compiler``.
     #[new]
     fn new(py: Python<'_>, payload: &Bound<'_, PyAny>, missing: Py<PyAny>) -> PyResult<Self> {
         let ctx = Ctx::new(py, missing)?;
@@ -2325,7 +2330,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
     }
 }
 
-/// Wire-format/ABI version of the payloads exchanged with ``marshmallow._accel``.
+/// Wire-format/ABI version of the payloads exchanged with ``marshmallow_core._compiler``.
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
