@@ -236,7 +236,16 @@ fn write_json_value(buf: &mut String, value: &Bound<'_, PyAny>) -> PyResult<()> 
         return Ok(());
     }
     if value.is_exact_instance_of::<PyInt>() {
-        buf.push_str(value.str()?.to_str()?); // ``int.__repr__``
+        use std::fmt::Write as _;
+        // Format in Rust when it fits a machine integer (byte-identical to
+        // ``int.__repr__``); arbitrary-precision ints fall back to ``str()``.
+        if let Ok(n) = value.extract::<i64>() {
+            let _ = write!(buf, "{n}");
+        } else if let Ok(n) = value.extract::<i128>() {
+            let _ = write!(buf, "{n}");
+        } else {
+            buf.push_str(value.str()?.to_str()?); // big int -> ``int.__repr__``
+        }
         return Ok(());
     }
     if value.is_exact_instance_of::<PyFloat>() {
