@@ -119,26 +119,30 @@ identical to `Field._serialize`.
 - The extension exports `PROTOCOL_VERSION`; `_compiler._EXPECTED_PROTOCOL` must
   match it. Bump both together when payload shapes/tags change.
 - **What stays pure-Python:** custom `dict_class`/`get_attribute`,
-  self-referential schemas, custom strptime temporal formats,
-  callable defaults, unrecognized field
-  validators (anything but `Range`/`Length`/`OneOf`), field-level
-  `pre_load`/`post_load`, a `Dict` with key/value fields, a `Nested` whose inner
+  self-referential schemas, callable defaults, field-level `pre_load`/`post_load`,
+  `Function`/`Method` (the work *is* a Python call), a `Nested` whose inner
   schema overrides `load`/`_do_load`/`_deserialize` (load) or `dump`/`_serialize`
   (dump) directly rather than via the hook system — e.g. `marshmallow_dataclass`,
   which overrides `load` to build a dataclass and leaves `_hooks` empty; compiling
   it natively would drop the instantiation — and any field type without a native
   element. **Now accelerated** (Phase 1/3): `unknown=INCLUDE`,
   collection/dotted `partial`, dotted attribute writes (`set_value`),
-  `Range`/`Length`/`OneOf` validators, `Decimal`/`Dict`/`Constant` fields,
+  `Range`/`Length`/`OneOf`/`Equal`/`NoneOf`/`ContainsOnly` validators (and **any
+  other validator** — custom callables, `Email`/`URL`/`Regexp` — via the
+  `_V_PYTHON` arm, which runs it in the core and falls back on failure),
+  `Decimal`/`Dict`/`Constant` fields (typed `Dict` including inner key/value
+  *validators*), the `IP`/`IPv4`/`IPv6`/`IPInterface` family, `Email`/`Url` load,
+  custom (non-ISO) strptime temporal formats on load,
   schema-level load hooks (`pre_load`/`post_load`/`validates`/`validates_schema`
   run in Python around the core's per-field step), `dumps` (fused to JSON in
   Rust), and `loads` (**fused**: `_patched_loads` parses JSON with the pure-Rust
   `jiter` tree and deserializes straight off it via `LoadDeserializer.run_json`,
   skipping the intermediate Python dict `json.loads` would build — 1.2–1.8× over
-  the prior `json.loads` + accelerated load. It defers to stock `loads` for
-  callback fields, load hooks, a non-`json` render module, extra kwargs, or
-  big-int payloads, since jiter is built without `num-bigint` to keep its pyo3
-  optional dep out of our build).
+  the prior `json.loads` + accelerated load. `Nested`/`List`/`Dict`/typed-`Dict`/
+  `Tuple` are threaded through the tree so a list-of-records never materialises an
+  intermediate. It defers to stock `loads` for callback fields, load hooks, a
+  non-`json` render module, extra kwargs, or big-int payloads, since jiter is
+  built without `num-bigint` to keep its pyo3 optional dep out of our build).
 
 ## Testing conventions
 
