@@ -1,5 +1,7 @@
 [package]
 name = "marshmallow_core"
+# Unused for distribution: the published wheel's version comes from
+# pyproject.toml (maturin reads it there). Kept at 0.1.0 deliberately.
 version = "0.1.0"
 edition = "2021"
 description = "Rust acceleration core for marshmallow serialization (separate, opt-in package)"
