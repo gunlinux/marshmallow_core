@@ -236,7 +236,16 @@ fn write_json_value(buf: &mut String, value: &Bound<'_, PyAny>) -> PyResult<()> 
         return Ok(());
     }
     if value.is_exact_instance_of::<PyInt>() {
-        buf.push_str(value.str()?.to_str()?); // ``int.__repr__``
+        use std::fmt::Write as _;
+        // Format in Rust when it fits a machine integer (byte-identical to
+        // ``int.__repr__``); arbitrary-precision ints fall back to ``str()``.
+        if let Ok(n) = value.extract::<i64>() {
+            let _ = write!(buf, "{n}");
+        } else if let Ok(n) = value.extract::<i128>() {
+            let _ = write!(buf, "{n}");
+        } else {
+            buf.push_str(value.str()?.to_str()?); // big int -> ``int.__repr__``
+        }
         return Ok(());
     }
     if value.is_exact_instance_of::<PyFloat>() {
@@ -977,6 +986,13 @@ enum Validator {
     },
     /// ``OneOf``: fail unless ``value in choices``.
     OneOf { choices: Py<PyAny> },
+    /// ``Equal``: fail unless ``value == comparable``.
+    Equal { comparable: Py<PyAny> },
+    /// ``NoneOf``: fail if ``value in iterable`` (a ``TypeError`` from ``in``
+    /// passes, mirroring marshmallow's ``except TypeError``).
+    NoneOf { iterable: Py<PyAny> },
+    /// ``ContainsOnly``: fail unless every element of ``value`` is in ``choices``.
+    ContainsOnly { choices: Py<PyAny> },
 }
 
 /// How ``load(partial=...)`` is threaded through a load: not partial, fully
@@ -1388,6 +1404,23 @@ impl Validator {
                 Ok(true)
             }
             Validator::OneOf { choices } => choices.bind(py).contains(value),
+            Validator::Equal { comparable } => value.eq(comparable.bind(py)),
+            Validator::NoneOf { iterable } => match iterable.bind(py).contains(value) {
+                Ok(found) => Ok(!found), // pass iff not present
+                // ``NoneOf`` swallows only ``TypeError`` (unhashable/incomparable)
+                // and passes; any other error propagates (-> fallback).
+                Err(e) if e.is_instance_of::<PyTypeError>(py) => Ok(true),
+                Err(e) => Err(e),
+            },
+            Validator::ContainsOnly { choices } => {
+                let ch = choices.bind(py);
+                for val in value.try_iter()? {
+                    if !ch.contains(&val?)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
         }
     }
 }
@@ -1747,6 +1780,18 @@ fn parse_validator(_py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<Validator>
                 choices: t.get_item(1)?.unbind(),
             })
         }
+        3 => Ok(Validator::Equal {
+            // (3, comparable)
+            comparable: t.get_item(1)?.unbind(),
+        }),
+        4 => Ok(Validator::NoneOf {
+            // (4, iterable)
+            iterable: t.get_item(1)?.unbind(),
+        }),
+        5 => Ok(Validator::ContainsOnly {
+            // (5, choices)
+            choices: t.get_item(1)?.unbind(),
+        }),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown validator tag {other}"
         ))),
@@ -1863,7 +1908,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 14;
+const PROTOCOL_VERSION: u32 = 15;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
