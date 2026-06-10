@@ -785,6 +785,24 @@ fn get_one<'py>(
     key: &Bound<'py, PyString>,
     missing: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // Fast path for a plain ``dict`` (the common dump source): a direct lookup
+    // avoids the per-field ``hasattr(__getitem__)`` probe and the exception-based
+    // ``KeyError`` handling below. A present key returns its value (``obj[key]``);
+    // a missing key falls through to ``getattr`` exactly as marshmallow does (so a
+    // field named ``items``/``keys`` still resolves to the dict method). Only an
+    // *exact* dict takes this path; a subclass that overrides ``__getitem__`` uses
+    // the general path.
+    if obj.is_exact_instance_of::<PyDict>() {
+        let dict = obj.cast::<PyDict>()?;
+        if let Some(v) = dict.get_item(key)? {
+            return Ok(v);
+        }
+        return match obj.getattr(key) {
+            Ok(v) => Ok(v),
+            Err(e) if e.is_instance_of::<PyAttributeError>(py) => Ok(missing.clone()),
+            Err(e) => Err(e),
+        };
+    }
     if obj.hasattr(intern!(py, "__getitem__"))? {
         match obj.get_item(key) {
             Ok(v) => return Ok(v),
