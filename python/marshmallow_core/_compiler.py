@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 16
+_EXPECTED_PROTOCOL = 17
 
 
 class _NoFallbackError(Exception):
@@ -125,6 +125,7 @@ _V_ONEOF = 2
 _V_EQUAL = 3
 _V_NONEOF = 4
 _V_CONTAINSONLY = 5
+_V_PYTHON = 6  # any other validator: run it in Python, failure -> AccelFallback
 
 # ``OneOf`` is only compiled when its ``choices`` is one of these stable, re-
 # iterable containers; a consumable iterator would behave differently on the
@@ -455,13 +456,15 @@ def _has_load_pre_post(field: typing.Any) -> bool:
 
 
 def _build_validator(validator: typing.Any) -> tuple | None:
-    """Compile a single ``validate`` validator into a spec tuple, or ``None``.
+    """Compile a single ``validate`` validator into a spec tuple.
 
-    Only ``Range``/``Length``/``OneOf`` (exact types) are modelled. The native
-    core reproduces only each validator's *pass/fail decision*; on failure it
-    raises :data:`AccelFallback` so Python re-runs the validator and emits the
-    exact (possibly custom) error message. Custom messages therefore need no
-    modelling here.
+    ``Range``/``Length``/``OneOf``/``Equal``/``NoneOf``/``ContainsOnly`` (exact
+    types) are modelled natively; **any other** validator (a custom callable, or a
+    built-in like ``validate.Email``/``URL``/``Regexp``) compiles to ``_V_PYTHON``,
+    which calls the validator from the core and turns a failure (a ``False`` return
+    or a raise) into :data:`AccelFallback`. The native core reproduces only each
+    validator's *pass/fail decision*; on failure Python re-runs it to emit the
+    exact (possibly custom) error message, so this never returns ``None``.
     """
     vtype = type(validator)
     if vtype is ma_validate.Range:
@@ -476,21 +479,24 @@ def _build_validator(validator: typing.Any) -> tuple | None:
         return (_V_LENGTH, validator.min, validator.max, validator.equal)
     if vtype is ma_validate.OneOf:
         if not isinstance(validator.choices, _ONEOF_CONTAINERS):
-            return None  # consumable/odd choices -> defer to Python
+            return (_V_PYTHON, validator)  # consumable/odd choices -> run in Python
         return (_V_ONEOF, validator.choices)
     if vtype is ma_validate.Equal:
         return (_V_EQUAL, validator.comparable)
     if vtype is ma_validate.NoneOf:
         if not isinstance(validator.iterable, _ONEOF_CONTAINERS):
-            return None
+            return (_V_PYTHON, validator)
         return (_V_NONEOF, validator.iterable)
     if vtype is ma_validate.ContainsOnly:
         # ``ContainsOnly`` subclasses ``OneOf`` but the exact-type checks above
         # skip it; model its all-in-choices rule here.
         if not isinstance(validator.choices, _ONEOF_CONTAINERS):
-            return None
+            return (_V_PYTHON, validator)
         return (_V_CONTAINSONLY, validator.choices)
-    return None
+    # Anything else (custom callable, Email/URL/Regexp, an OneOf/NoneOf with
+    # consumable choices, ...): run it in Python from the core; any failure or
+    # raise -> AccelFallback so Python emits the exact error.
+    return (_V_PYTHON, validator)
 
 
 def _compile_validators(validators: typing.Any) -> list[tuple] | None:
@@ -546,7 +552,10 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
         if not field.truthy:
             return None
         return (_L_BOOLEAN, field.truthy, field.falsy)
-    if ftype is ma_fields.String:
+    if ftype is ma_fields.String or ftype is ma_fields.Email or ftype is ma_fields.Url:
+        # ``Email``/``Url`` inherit ``String._deserialize`` (``ensure_text_type``);
+        # their only difference is a built-in ``validate.Email``/``URL`` validator,
+        # which now compiles via the ``_V_PYTHON`` arm.
         return (_L_STRING,)
     if ftype is ma_fields.Integer:
         if field.strict:

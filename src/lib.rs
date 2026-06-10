@@ -1000,6 +1000,10 @@ enum Validator {
     NoneOf { iterable: Py<PyAny> },
     /// ``ContainsOnly``: fail unless every element of ``value`` is in ``choices``.
     ContainsOnly { choices: Py<PyAny> },
+    /// Any other validator (custom callable, ``Email``/``URL``/``Regexp``, ...):
+    /// call it; a ``False`` return fails, a raise propagates — both become an
+    /// ``AccelFallback`` so Python re-runs it for the exact message.
+    Python { validator: Py<PyAny> },
 }
 
 /// How ``load(partial=...)`` is threaded through a load: not partial, fully
@@ -1641,6 +1645,15 @@ impl Validator {
                 }
                 Ok(true)
             }
+            Validator::Python { validator } => {
+                // ``validator(value)``: a raise propagates (caller -> fallback);
+                // a literal ``False`` return fails (mirrors marshmallow's ``r is
+                // False`` for plain callables). Anything else passes. When in
+                // doubt this fails -> fallback, where Python is authoritative, so
+                // we never *pass* something marshmallow would reject.
+                let r = validator.bind(py).call1((value,))?;
+                Ok(!r.is(&PyBool::new(py, false)))
+            }
         }
     }
 }
@@ -2074,6 +2087,10 @@ fn parse_validator(_py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<Validator>
             // (5, choices)
             choices: t.get_item(1)?.unbind(),
         }),
+        6 => Ok(Validator::Python {
+            // (6, validator_callable)
+            validator: t.get_item(1)?.unbind(),
+        }),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown validator tag {other}"
         ))),
@@ -2194,7 +2211,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 16;
+const PROTOCOL_VERSION: u32 = 17;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
