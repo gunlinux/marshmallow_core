@@ -17,8 +17,12 @@ Python around it. :func:`_accelerated_load` is a verbatim copy of
 ``Schema._do_load`` with the one ``self._deserialize(...)`` call replaced by the
 compiled core; it therefore pins to marshmallow's ``_do_load`` internals (it
 tracks both the 3.x and 4.x shapes, branching on :data:`_MA4`) and leans on the
-equivalence suite. The core still raises ``AccelFallback`` for any per-field edge
-case, so the whole load re-runs the unchanged pure-Python path.
+equivalence suite. To bound that coupling, :func:`install` runs
+:func:`_accel_load_supported` — a structural check of the private invokers the
+transcription calls — and on a mismatch (an untested marshmallow) routes
+hook-bearing schemas to the pure-Python load instead. The core still raises
+``AccelFallback`` for any per-field edge case, so the whole load re-runs the
+unchanged pure-Python path.
 """
 
 from __future__ import annotations
@@ -55,15 +59,74 @@ _LOAD_HOOKS = (PRE_LOAD, POST_LOAD, VALIDATES, VALIDATES_SCHEMA)
 #: ``is_collection``: an iterable of field names, excluding strings).
 _PARTIAL_COLLECTIONS = (list, tuple, set, frozenset)
 
+
+def _schema_validator_params() -> frozenset[str]:
+    """Parameter names of ``Schema._invoke_schema_validators`` (empty if absent).
+
+    Used both to detect the 4.x rename below and by :func:`_accel_load_supported`.
+    Defensive (``getattr``/``try``) so an exotic build missing or re-shaping the
+    method degrades the accelerated hook path instead of crashing at import.
+    """
+    method = getattr(Schema, "_invoke_schema_validators", None)
+    if method is None:
+        return frozenset()
+    try:
+        return frozenset(inspect.signature(method).parameters)
+    except (TypeError, ValueError):
+        return frozenset()
+
+
 #: Whether the installed marshmallow is 4.x. Detected by feature-probing the two
 #: private hook invokers that :func:`_accelerated_load` reproduces: 4.x threads
 #: ``unknown`` through the load processors/schema validators and renamed the
 #: schema-validator ``pass_many`` argument to ``pass_collection``; 3.x does
 #: neither. We probe the signatures rather than the version string so a faithful
 #: transcription tracks the actual API.
-_MA4: typing.Final = (
-    "pass_collection" in inspect.signature(Schema._invoke_schema_validators).parameters
-)
+_MA4: typing.Final = "pass_collection" in _schema_validator_params()
+
+
+#: Set by :func:`install`: whether the running marshmallow's private ``_do_load``
+#: internals match what :func:`_accelerated_load` transcribes. See
+#: :func:`_accel_load_supported`.
+_ACCEL_LOAD_VERIFIED: bool = False
+
+#: The private ``Schema`` invokers :func:`_accelerated_load` calls, each mapped to
+#: the keyword parameters the transcription passes. If a future marshmallow
+#: renames one or drops a parameter, the transcription would diverge silently —
+#: so :func:`install` verifies this shape and, on a mismatch, routes hook-bearing
+#: schemas to the pure-Python load (correct, just unaccelerated).
+_ACCEL_LOAD_INVOKERS: typing.Final = {
+    "_invoke_load_processors": frozenset({"many", "original_data", "partial"}),
+    "_invoke_field_validators": frozenset({"error_store", "data", "many"}),
+    "_invoke_schema_validators": frozenset(
+        {"error_store", "data", "original_data", "many", "partial", "field_errors"}
+    ),
+}
+
+
+def _accel_load_supported() -> bool:
+    """Whether :func:`_accelerated_load`'s transcription matches this marshmallow.
+
+    Checks that every private invoker it calls exists and still accepts the
+    keyword arguments the transcription passes (a robust proxy for "the
+    ``_do_load`` body we mirror is unchanged", without false-positiving on benign
+    comment/whitespace edits the way a source hash would). On any mismatch the
+    accelerated hook path is disabled; the pure-Python path is always correct.
+    """
+    for name, needed in _ACCEL_LOAD_INVOKERS.items():
+        method = getattr(Schema, name, None)
+        if method is None:
+            return False
+        try:
+            params = frozenset(inspect.signature(method).parameters)
+        except (TypeError, ValueError):
+            return False
+        if not needed <= params:
+            return False
+    # The schema-validator collection flag is ``pass_collection`` (4.x) or
+    # ``pass_many`` (3.x); the transcription branches on :data:`_MA4` for it.
+    sv_params = _schema_validator_params()
+    return "pass_collection" in sv_params or "pass_many" in sv_params
 
 
 def _core_partial(partial: typing.Any) -> typing.Any:
@@ -182,6 +245,11 @@ def _patched_do_load(
             ld, has_hooks, default_core_partial = plan
             try:
                 if has_hooks:
+                    # On a marshmallow whose ``_do_load`` internals we haven't
+                    # verified, don't trust the transcription: defer to the
+                    # unchanged pure-Python load below (ARCH.md A2).
+                    if not _ACCEL_LOAD_VERIFIED:
+                        raise _compiler.AccelFallback
                     return _accelerated_load(
                         self, ld, data, many, partial, unknown, postprocess
                     )
@@ -381,8 +449,12 @@ def _patched_loads(
 def install() -> None:
     """Patch the Rust core into ``marshmallow.Schema`` (idempotent)."""
     global _orig_serialize, _orig_do_load, _orig_dumps, _orig_loads
+    global _ACCEL_LOAD_VERIFIED
     if is_installed():
         return
+    # Verify the transcribed ``_do_load`` internals before trusting the
+    # accelerated hook path; on a mismatch hook-bearing schemas use pure Python.
+    _ACCEL_LOAD_VERIFIED = _accel_load_supported()
     _orig_serialize = Schema._serialize
     _orig_do_load = Schema._do_load
     _orig_dumps = Schema.dumps

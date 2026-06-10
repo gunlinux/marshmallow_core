@@ -1420,6 +1420,37 @@ def test_load_hooks_is_native():
     assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
+def test_accel_load_supported_for_installed_marshmallow():
+    """The transcription tripwire must pass against the marshmallow under test
+    (otherwise the accelerated hook path is silently disabled in CI)."""
+    from marshmallow_core import _patch
+
+    assert _patch._accel_load_supported() is True
+    assert _patch._ACCEL_LOAD_VERIFIED is True  # set by the autouse install()
+
+
+def test_unverified_accel_load_falls_back_to_pure(monkeypatch):
+    """When the ``_do_load`` internals look untested, a hook-bearing schema must
+    still load correctly via the pure-Python path (ARCH.md A2 tripwire)."""
+    from marshmallow_core import _patch
+
+    monkeypatch.setattr(_patch, "_ACCEL_LOAD_VERIFIED", False)
+    # Equivalence still holds — the accelerated branch just isn't taken.
+    accelerated, pure = _load_both(
+        HookLoadSchema, {"a": 5, "b": "x", "c": 3}, monkeypatch=monkeypatch
+    )
+    assert accelerated == pure
+    assert accelerated == {"a": 5, "b": "x", "c": 3, "seen": ["a", "b", "c"]}
+
+
+def test_accel_load_supported_detects_missing_invoker(monkeypatch):
+    """A removed/renamed private invoker trips the tripwire (returns False)."""
+    from marshmallow_core import _patch
+
+    monkeypatch.delattr(Schema, "_invoke_field_validators", raising=True)
+    assert _patch._accel_load_supported() is False
+
+
 def test_load_pre_load_validation_error_matches(monkeypatch):
     """A ``pre_load`` that raises must produce identical errors via both paths."""
 
