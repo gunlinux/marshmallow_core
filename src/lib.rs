@@ -893,6 +893,9 @@ enum LoadElement {
     /// TimeDelta: defer to the field's own ``_deserialize`` (float -> timedelta);
     /// any ``ValidationError`` becomes ``AccelFallback``.
     TimeDelta { deserialize: Py<PyAny> },
+    /// NaiveDateTime/AwareDateTime: defer to the field's own ``_deserialize``
+    /// (parse + timezone-awareness check); any ``ValidationError`` -> fallback.
+    DatetimeAwareness { deserialize: Py<PyAny> },
     /// Dict (no key/value fields): copy a dict input via ``dict(value)``; a
     /// non-dict input defers (Python decides Mapping-or-``invalid``).
     Dict,
@@ -1508,6 +1511,10 @@ impl LoadElement {
                 .bind(py)
                 .call1((value, py.None(), py.None()))
                 .map_err(|e| to_fallback(py, e)),
+            LoadElement::DatetimeAwareness { deserialize } => deserialize
+                .bind(py)
+                .call1((value, py.None(), py.None()))
+                .map_err(|e| to_fallback(py, e)),
             LoadElement::Dict => {
                 if value.is_instance_of::<PyDict>() {
                     ctx.dict_fn.bind(py).call1((value,))
@@ -1781,6 +1788,10 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             // (17, bound _deserialize)
             deserialize: t.get_item(1)?.unbind(),
         }),
+        18 => Ok(LoadElement::DatetimeAwareness {
+            // (18, bound _deserialize)
+            deserialize: t.get_item(1)?.unbind(),
+        }),
         16 => {
             // (16, nested_payload, data_key, many)
             let serializer = parse_load_serializer(py, &t.get_item(1)?)?;
@@ -1823,7 +1834,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 13;
+const PROTOCOL_VERSION: u32 = 14;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {

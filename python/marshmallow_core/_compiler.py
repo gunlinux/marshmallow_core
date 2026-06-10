@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 13
+_EXPECTED_PROTOCOL = 14
 
 
 class _NoFallbackError(Exception):
@@ -114,6 +114,7 @@ _L_DICT_TYPED = 14
 _L_TUPLE = 15
 _L_PLUCK = 16
 _L_TIMEDELTA = 17
+_L_DATETIME_AWARENESS = 18
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -575,6 +576,12 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
             return None
         internal_type = getattr(dt, field.OBJ_TYPE)
         return (_L_TEMPORAL, internal_type, func)
+    if ftype is ma_fields.NaiveDateTime or ftype is ma_fields.AwareDateTime:
+        # These wrap ``DateTime._deserialize`` with a timezone-awareness check
+        # (and adjust/raise). That logic is intrinsically Python; hand the field's
+        # own ``_deserialize`` to the core, which turns any ``ValidationError``
+        # into a fallback (the ``Decimal``/``TimeDelta`` pattern).
+        return (_L_DATETIME_AWARENESS, field._deserialize)
     if ftype is ma_fields.Decimal:
         # ``Decimal._deserialize`` (``_validated``) is intrinsically Python; hand
         # it to the core, which turns any ``ValidationError`` into a fallback.

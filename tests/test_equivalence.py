@@ -971,6 +971,56 @@ def test_timedelta_is_native():
     assert _compiler._build_load_element(field, ())[0] == _compiler._L_TIMEDELTA
 
 
+class AwarenessSchema(Schema):
+    naive = fields.NaiveDateTime()
+    aware = fields.AwareDateTime()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"naive": "2020-01-02T03:04:05", "aware": "2020-01-02T03:04:05+00:00"},
+        {"naive": "2020-06-01T12:00:00"},
+        {},
+    ],
+)
+def test_load_awareness_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(AwarenessSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"naive": "2020-01-02T03:04:05+00:00"},  # aware input -> naive field errors
+        {"aware": "2020-01-02T03:04:05"},  # naive input -> aware field errors
+        {"naive": "not-a-date"},
+    ],
+)
+def test_load_awareness_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        AwarenessSchema().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        AwarenessSchema().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_awareness_is_native():
+    from marshmallow_core import _compiler
+
+    assert (
+        _compiler._build_load_element(fields.NaiveDateTime(), ())[0]
+        == _compiler._L_DATETIME_AWARENESS
+    )
+    assert (
+        _compiler._build_load_element(fields.AwareDateTime(), ())[0]
+        == _compiler._L_DATETIME_AWARENESS
+    )
+
+
 @pytest.mark.parametrize("unknown", [RAISE, EXCLUDE, INCLUDE])
 def test_load_unknown_equivalence(unknown, monkeypatch):
     class S(Schema):
