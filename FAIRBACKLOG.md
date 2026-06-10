@@ -8,6 +8,15 @@ We are now in **diminishing-returns territory**: the big per-element loops (load
 and dump) and the JSON string escaper are done. The remaining work is incremental
 formatting/coverage micro-opts plus standing ceilings. **Profile before building.**
 
+**Status: Phase 6 complete.** Landed: native **int** formatting in the JSON
+writer (Tier 1); native **Equal/NoneOf/ContainsOnly** validators (Tier 3, listed
+below as part of "more native validators"). **Investigated, not landed:** native
+float formatting (Tier 1 — no byte-identical parity with `repr`), native datetime
+isoformat dump (Tier 2 — blocked by abi3: datetime C accessors aren't in the
+limited ABI), preallocation (Tier 4 — presized-dict ctor is private), SIMD parser
+(spike — object construction dominates `loads`, same as Phase 2). See each item's
+note. Numbers: list `dumps` 12.25→10.95µs; api `dumps` 22.04→21.06µs.
+
 **The new signal:** `dumps` is consistently **~2x `dump`** even though the fused
 writer skips the intermediate dict — list `dumps` 12.25µs vs `dump` 6.20µs; api
 22.04 vs 15.80; flat 0.97 vs 0.56. Building the JSON *string* costs more than
@@ -24,18 +33,21 @@ starts.
 (`value.str()` for ints, `value.repr()` for floats). For a record list that is
 hundreds of Python calls. Format in Rust instead.
 
-- [ ] **Profile `run_json`** (api/list) to confirm the per-scalar formatting cost
+- [x] **Profile `run_json`** (api/list) to confirm the per-scalar formatting cost
       before writing code — record the split (formatting vs structure vs escaping).
-- [ ] **Native `int` formatting** (safe): if the value fits `i64`/`u64`, format
+- [x] **Native `int` formatting** (safe): if the value fits `i64`/`u64`, format
       with `itoa` directly; arbitrary-precision ints fall back to `value.str()`.
       Integer text is identical across Python and Rust, so this is byte-safe.
-- [ ] **Native `float` formatting** (*spike, risky*): Python/`json` use
+- [~] **Native `float` formatting** (*spike — NOT LANDED*): no byte-identical parity
+      with Python `repr`/json (`1.0` vs `1`, `1e+16` vs ryu `1e16`, `1e-05` vs `1e-5`,
+      fixed/scientific threshold); a mismatch is wrong-but-valid JSON with no fallback.
+      Floats keep `value.repr()`. Original note: Python/`json` use
       `float.__repr__` (shortest round-trip). `ryu` is shortest round-trip too but
       its *formatting* differs (`1e20` vs Python `1e+20`, exponent threshold,
       `-0.0`, `inf`/`nan` already special-cased). Land only if a normalization
       layer is **byte-identical** to `repr` across a fuzz corpus; otherwise keep
       `value.repr()` (no regression — the win is the int path).
-- [ ] Equivalence: the existing `dumps` tests already assert byte-identity; add a
+- [x] Equivalence: the existing `dumps` tests already assert byte-identity; add a
       numeric fuzz case (large ints, negatives, floats incl. `1e16`, `0.1`, `-0.0`).
 
 ## Tier 2 — native datetime `isoformat` dump (with fallback)
@@ -45,7 +57,8 @@ DateTime dump calls the field's serialization func (`utils.isoformat` →
 field is one per record). The dump core now has an `AccelFallback`, so this can be
 attempted safely.
 
-- [ ] Build the ISO string in Rust from `PyDateTime` components for the common
+- [~] (NOT LANDED — blocked by abi3: datetime C accessors absent from the limited
+      ABI; getattr-based extraction would be slower than `isoformat()`.) Build the ISO string in Rust from `PyDateTime` components for the common
       case (naive or fixed-offset, default format), and **defer** (fallback) on
       anything fiddly (custom format, unusual tz, microsecond-trimming edge cases)
       so the output stays byte-identical to `isoformat()`.
@@ -58,24 +71,27 @@ Only `Range`/`Length`/`OneOf` are native; the rest force the field onto the
 callback path. These are cheap set/equality checks; on failure they defer so the
 exact (possibly custom) message is reproduced.
 
-- [ ] `Equal` (`value == comparable`), `NoneOf` (`value not in iterable`),
+- [x] `Equal` (`value == comparable`), `NoneOf` (`value not in iterable`),
       `ContainsOnly` (`set(value) <= set(choices)`). All decision-only, like the
       existing validators.
 - [ ] `Regexp` — only if the pattern is trivial enough for guaranteed parity;
       otherwise skip (cf. the Email/URL spike in NEXTBACKLOG).
-- [ ] Equivalence: pass + fail inputs for each.
+- [x] Equivalence: pass + fail inputs for each.
 
 ## Tier 4 — profile-guided micro-opts
 
 - [ ] Profile api `load` (12.4µs) and `dump` (15.8µs); record the next hot spot
       here before guessing.
-- [ ] Preallocate output `PyDict`/`PyList` capacity where the size is known
+- [~] (NOT LANDED — presized-dict ctor `_PyDict_NewPresized` is private/not in
+      pyo3; list preallocation marginal.) Preallocate output `PyDict`/`PyList` capacity where the size is known
       (record count, field count) — the item deferred from Phase 5 Tier 2. Only if
       the profile shows allocation/rehash cost.
 
 ## Spikes — probably not, but bounded by measurement
 
-- [ ] **SIMD JSON parser for `loads`.** `loads` (10x) trails `load` (25x) because
+- [~] **SIMD JSON parser for `loads` — NOT LANDED.** Measured: `json.loads` is ~54%
+      of api `loads`, much of it Python object construction (same cost for any
+      parser); SIMD speeds only tokenizing. Same conclusion as Phase 2. Original note: `loads` (10x) trails `load` (25x) because
       it is `json.loads` (C) + the accelerated load; the C parse is the floor. The
       Phase 2 `serde_json` parser lost to C `json.loads`. A *SIMD* parser
       (`simd-json`) *might* win, but it is a heavy dependency and must be
