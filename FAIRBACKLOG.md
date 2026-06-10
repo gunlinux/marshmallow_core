@@ -89,14 +89,26 @@ exact (possibly custom) message is reproduced.
 
 ## Spikes — probably not, but bounded by measurement
 
-- [~] **SIMD JSON parser for `loads` — NOT LANDED.** Measured: `json.loads` is ~54%
-      of api `loads`, much of it Python object construction (same cost for any
-      parser); SIMD speeds only tokenizing. Same conclusion as Phase 2. Original note: `loads` (10x) trails `load` (25x) because
-      it is `json.loads` (C) + the accelerated load; the C parse is the floor. The
-      Phase 2 `serde_json` parser lost to C `json.loads`. A *SIMD* parser
-      (`simd-json`) *might* win, but it is a heavy dependency and must be
-      byte/precision-identical (big ints, float round-trip, key order, dup keys,
-      error messages). Spike behind a benchmark; do not ship a regression.
+- [x] **Fused `loads` via jiter (Design A) — LANDED.** The earlier spikes had the
+      framing wrong: they measured a *tokenizer* swap (Phase 2 `serde_json`, the
+      SIMD idea) that still materialised the full Python dict `json.loads` builds,
+      so they could not beat C `json.loads`. The actual cost is that intermediate
+      dict — built once by `json.loads`, read back out and discarded by
+      `_do_load`. pydantic-core avoids it by parsing to a cheap *Rust* tree
+      (jiter's `JsonValue`, keys borrowed as `Cow<str>`, no `PyObject`s) and
+      constructing only the kept fields. We mirror that: `_patched_loads` parses
+      with `jiter::JsonValue` and deserialises off the tree
+      (`LoadDeserializer.run_json`), threading the tree through `Nested`/`List` so
+      a list-of-records never materialises an intermediate. Output keys come from
+      the schema (already-interned `out_key`s), so it allocates **zero** per-record
+      key strings — the win json.loads can't match. Scalars convert leaf→Python via
+      `json_to_py` and run the unchanged `apply`, so parity holds by construction.
+      Measured **1.2–1.8× over the prior accelerated `loads`** (flat 1.04→0.64µs
+      1.62×; api 32.4→27.4µs 1.21×; list 25→18µs ~1.3×); ~8.5–14× over stock.
+      Defers to stock `loads` for callback fields, hooks, non-`json` render module,
+      extra kwargs, and big ints (jiter built without `num-bigint` to keep its
+      optional pyo3 0.28 dep out of our pyo3 0.27 build). Equivalence + error
+      parity covered in `tests/test_equivalence.py` (`test_loads_*`).
 
 ## Structural ceilings — still not worth chasing
 
