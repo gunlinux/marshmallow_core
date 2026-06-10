@@ -86,9 +86,7 @@ def _print_table(name: str, results: dict[str, tuple[float, float]]) -> None:
     for op in ("dump", "load", "dumps", "loads"):
         stock, core = results[op]
         ratio = stock / core if core else float("inf")
-        print(
-            f"  {op:<7} {stock * 1e6:>12.2f} {core * 1e6:>12.2f} {ratio:>8.2f}x"
-        )
+        print(f"  {op:<7} {stock * 1e6:>12.2f} {core * 1e6:>12.2f} {ratio:>8.2f}x")
 
 
 def main(argv: list[str] | None = None) -> None:

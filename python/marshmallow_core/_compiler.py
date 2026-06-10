@@ -57,7 +57,7 @@ if typing.TYPE_CHECKING:
     from marshmallow.schema import Schema
 
 try:
-    from marshmallow_core import _core
+    from marshmallow_core import _core  # type: ignore[attr-defined]
 except ImportError:  # pragma: no cover - extension is optional
     _core = None  # type: ignore[assignment]
 
@@ -162,7 +162,14 @@ _IP_TYPES: frozenset[type] = frozenset(
     t
     for t in (
         getattr(ma_fields, _n, None)
-        for _n in ("IP", "IPv4", "IPv6", "IPInterface", "IPv4Interface", "IPv6Interface")
+        for _n in (
+            "IP",
+            "IPv4",
+            "IPv6",
+            "IPInterface",
+            "IPv4Interface",
+            "IPv6Interface",
+        )
     )
     if t is not None
 )
@@ -659,9 +666,7 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
             _build_load_element(key_field, stack) if key_field is not None else None
         )
         val_el = (
-            _build_load_element(value_field, stack)
-            if value_field is not None
-            else None
+            _build_load_element(value_field, stack) if value_field is not None else None
         )
         if (key_field is not None and key_el is None) or (
             value_field is not None and val_el is None

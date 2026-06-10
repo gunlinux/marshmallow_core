@@ -62,8 +62,7 @@ _PARTIAL_COLLECTIONS = (list, tuple, set, frozenset)
 #: neither. We probe the signatures rather than the version string so a faithful
 #: transcription tracks the actual API.
 _MA4: typing.Final = (
-    "pass_collection"
-    in inspect.signature(Schema._invoke_schema_validators).parameters
+    "pass_collection" in inspect.signature(Schema._invoke_schema_validators).parameters
 )
 
 
@@ -81,11 +80,8 @@ def _partial_is_supported(partial: typing.Any) -> bool:
     """Whether the core can model this ``partial`` (boolean/falsy or a name
     collection). Dotted-string entries within a collection are handled by the
     core's ``set_value``-style prefix matching; a bare-string ``partial`` defers."""
-    return (
-        partial is True
-        or not partial
-        or isinstance(partial, _PARTIAL_COLLECTIONS)
-    )
+    return partial is True or not partial or isinstance(partial, _PARTIAL_COLLECTIONS)
+
 
 # Saved originals; ``None`` while not installed (also used by ``is_installed``).
 _orig_serialize: typing.Any = None
@@ -155,7 +151,7 @@ def _patched_do_load(
     unknown: typing.Any = None,
     postprocess: bool = True,
 ):
-    many = self.many if many is None else bool(many)
+    many = bool(self.many) if many is None else bool(many)
     unknown = self.unknown if unknown is None else unknown
     # Track whether the caller supplied ``partial`` so we can reuse the cached
     # ``_core_partial(self.partial)`` on the common "use the schema default" call.
@@ -281,7 +277,7 @@ def _accelerated_load(
                 **{pass_kw: False},
                 **proc_unknown,
             )
-        errors = error_store.errors
+        errors = error_store.errors  # type: ignore[assignment]
         # Run post processors
         if not errors and postprocess and self._hooks[POST_LOAD]:
             try:
@@ -303,7 +299,9 @@ def _accelerated_load(
     return result
 
 
-def _patched_dumps(self: Schema, obj: typing.Any, *args, many: bool | None = None, **kwargs):
+def _patched_dumps(
+    self: Schema, obj: typing.Any, *args, many: bool | None = None, **kwargs
+):
     # Only fuse the default ``json.dumps`` call: any extra positional/keyword
     # argument (indent=, sort_keys=, cls=, ...) or a non-stdlib render module
     # could change the output, so defer to ``dump`` + ``render_module.dumps``.
@@ -367,9 +365,7 @@ def _patched_loads(
             if not has_hooks:
                 many_v = self.many if many is None else bool(many)
                 core_partial = (
-                    default_core_partial
-                    if partial is None
-                    else _core_partial(partial)
+                    default_core_partial if partial is None else _core_partial(partial)
                 )
                 try:
                     return ld.run_json(json_data, many_v, core_partial)

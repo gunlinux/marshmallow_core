@@ -328,7 +328,7 @@ def test_dumps_unicode_and_floats_equivalence(monkeypatch):
         f = fields.Float()
         big = fields.Float()
 
-    obj = {"s": "héllo \U0001F600 / world", "f": 0.1, "big": 2.5e20}
+    obj = {"s": "héllo \U0001f600 / world", "f": 0.1, "big": 2.5e20}
     fused, stock = _dumps_both(S, obj, monkeypatch=monkeypatch)
     assert fused == stock
 
@@ -1071,9 +1071,7 @@ def test_load_include_equivalence(monkeypatch):
 def test_load_include_is_native():
     schema = IncludeSchema()
     schema.load({"a": 1, "extra": "x"})  # trigger lazy build
-    assert accel.is_available() == (
-        vars(schema).get("_mc_load_plan") is not None
-    )
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 def test_load_include_nested_equivalence(monkeypatch):
@@ -1117,9 +1115,7 @@ def test_load_dotted_attribute_equivalence(data, monkeypatch):
 def test_load_dotted_attribute_is_native():
     schema = DottedLoadSchema()
     schema.load({"c": 1})  # trigger lazy build
-    assert accel.is_available() == (
-        vars(schema).get("_mc_load_plan") is not None
-    )
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 def test_load_dotted_default_and_none(monkeypatch):
@@ -1211,9 +1207,7 @@ def test_load_validators_error_match_python(data, monkeypatch):
 def test_load_validators_is_native():
     schema = ValidatorSchema()
     schema.load({"age": 1})  # trigger lazy build
-    assert accel.is_available() == (
-        vars(schema).get("_mc_load_plan") is not None
-    )
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 def test_load_unrecognized_validator_falls_back(monkeypatch):
@@ -1390,9 +1384,7 @@ def test_load_hooks_error_match_python(data, monkeypatch):
 def test_load_hooks_is_native():
     schema = HookLoadSchema()
     schema.load({"a": 1, "b": "x", "c": 2})  # trigger lazy build
-    assert accel.is_available() == (
-        vars(schema).get("_mc_load_plan") is not None
-    )
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 def test_load_pre_load_validation_error_matches(monkeypatch):
@@ -1438,9 +1430,7 @@ def test_load_post_load_only_uses_core(monkeypatch):
 
     schema = S()
     schema.load({"i": 5})
-    assert accel.is_available() == (
-        vars(schema).get("_mc_load_plan") is not None
-    )
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
     accelerated, pure = _load_both(S, {"i": 5}, monkeypatch=monkeypatch)
     assert accelerated == pure == {"i": 5, "doubled": 10}
 
@@ -1790,9 +1780,7 @@ def test_load_partial_collection_equivalence(data, partial, monkeypatch):
 def test_load_partial_collection_is_native():
     schema = PartialSchema()
     schema.load({"id": 1, "inner": {"a": 5}}, partial=("name",))  # lazy build
-    assert accel.is_available() == (
-        vars(schema).get("_mc_load_plan") is not None
-    )
+    assert accel.is_available() == (vars(schema).get("_mc_load_plan") is not None)
 
 
 def test_load_partial_nested_own_option_defers(monkeypatch):
@@ -1845,7 +1833,14 @@ def test_validator_arm_is_native():
 @pytest.mark.parametrize(
     "data",
     [
-        {"email": "a@b.com", "url": "http://x.com", "rx": "abc", "even": 4, "nonneg": 3, "multi": 2},
+        {
+            "email": "a@b.com",
+            "url": "http://x.com",
+            "rx": "abc",
+            "even": 4,
+            "nonneg": 3,
+            "multi": 2,
+        },
         {"email": "a@b.com"},  # valid subset
         {},
     ],
@@ -1856,7 +1851,8 @@ def test_load_validator_arm_equivalence(data, monkeypatch):
 
 
 _ma3_only = pytest.mark.skipif(
-    _MA_MAJOR >= 4, reason="a plain callable returning False only fails on marshmallow 3.x"
+    _MA_MAJOR >= 4,
+    reason="a plain callable returning False only fails on marshmallow 3.x",
 )
 
 
@@ -2003,7 +1999,9 @@ def test_custom_temporal_is_native_load():
 
     field = fields.DateTime(format="%Y/%m/%d %H:%M")
     field._bind_to_schema("when", CustomTemporalSchema())
-    assert _compiler._build_load_element(field, ())[0] == _compiler._L_DATETIME_AWARENESS
+    assert (
+        _compiler._build_load_element(field, ())[0] == _compiler._L_DATETIME_AWARENESS
+    )
 
 
 @pytest.mark.parametrize(
@@ -2076,7 +2074,9 @@ def test_loads_many_equivalence(monkeypatch):
 
 
 def test_loads_partial_equivalence(monkeypatch):
-    fused, pure = _loads_both(LoadsFlat, '{"i": 1}', partial=True, monkeypatch=monkeypatch)
+    fused, pure = _loads_both(
+        LoadsFlat, '{"i": 1}', partial=True, monkeypatch=monkeypatch
+    )
     assert fused == pure
 
 
@@ -2103,7 +2103,9 @@ def test_loads_nested_list_equivalence(monkeypatch):
 class LoadsContainers(Schema):
     # Dict / typed-Dict / Tuple threaded straight off the jiter tree.
     rows = fields.List(
-        fields.Dict(keys=fields.String(), values=fields.Integer(validate=validate.Range(min=0)))
+        fields.Dict(
+            keys=fields.String(), values=fields.Integer(validate=validate.Range(min=0))
+        )
     )
     pairs = fields.List(fields.Tuple((fields.Integer(), fields.String())))
     plain = fields.Dict()
@@ -2157,13 +2159,17 @@ class LoadsExclude(Schema):
 @pytest.mark.parametrize("factory", [LoadsInclude, LoadsExclude])
 def test_loads_unknown_equivalence(factory, monkeypatch):
     fused, pure = _loads_both(
-        factory, '{"i": 1, "extra": "yo", "n": 3, "extra": "last"}', monkeypatch=monkeypatch
+        factory,
+        '{"i": 1, "extra": "yo", "n": 3, "extra": "last"}',
+        monkeypatch=monkeypatch,
     )
     assert fused == pure
 
 
 def test_loads_bytes_input_equivalence(monkeypatch):
-    fused, pure = _loads_both(LoadsFlat, b'{"i": 7, "s": "hi"}', monkeypatch=monkeypatch)
+    fused, pure = _loads_both(
+        LoadsFlat, b'{"i": 7, "s": "hi"}', monkeypatch=monkeypatch
+    )
     assert fused == pure
 
 

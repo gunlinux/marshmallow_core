@@ -60,14 +60,14 @@ impl Ctx {
 
 /// A value -> serialized-output transform (mirrors a field's ``_serialize``).
 enum Element {
-    Passthrough,         // Raw, Boolean
-    Str,                 // String, Email, Url
-    Int(bool),           // Integer (bool = as_string)
-    Float(bool),         // Float (bool = as_string)
+    Passthrough,                   // Raw, Boolean
+    Str,                           // String, Email, Url
+    Int(bool),                     // Integer (bool = as_string)
+    Float(bool),                   // Float (bool = as_string)
     Nested(Box<Serializer>, bool), // Nested (bool = many)
-    List(Box<Element>),  // List(inner)
-    Uuid,                // UUID -> str(value)
-    IpAddr,              // IP/IPv4/IPv6/IPInterface/... -> str(value)
+    List(Box<Element>),            // List(inner)
+    Uuid,                          // UUID -> str(value)
+    IpAddr,                        // IP/IPv4/IPv6/IPInterface/... -> str(value)
     /// DateTime/Date/Time: a held serialization callable, else ``value.strftime(fmt)``.
     Temporal {
         func: Option<Py<PyAny>>,
@@ -80,7 +80,9 @@ enum Element {
     },
     /// Decimal: defer to the field's own ``_serialize`` (intrinsically Python
     /// ``decimal`` formatting), provably identical to the callback path.
-    Decimal { serialize: Py<PyAny> },
+    Decimal {
+        serialize: Py<PyAny>,
+    },
     /// Dict (no key/value fields): ``dict(value)``.
     Dict,
     /// Typed Dict: serialize keys/values via their fields per entry (``None`` =
@@ -90,10 +92,14 @@ enum Element {
         val_el: Option<Box<Element>>,
     },
     /// Constant: always returns the held constant, ignoring the input value.
-    Constant { constant: Py<PyAny> },
+    Constant {
+        constant: Py<PyAny>,
+    },
     /// TimeDelta: defer to the field's own ``_serialize`` (precision-sensitive
     /// timedelta -> float), provably identical to the callback path.
-    TimeDelta { serialize: Py<PyAny> },
+    TimeDelta {
+        serialize: Py<PyAny>,
+    },
     /// Tuple: serialize each position; defers (dump fallback) on a length
     /// mismatch so Python raises the exact ``zip(strict=True)`` error.
     Tuple(Vec<Element>),
@@ -331,10 +337,9 @@ impl Serializer {
                     output_key,
                     field,
                 } => {
-                    let val = field.bind(py).call_method1(
-                        intern!(py, "serialize"),
-                        (name.bind(py), obj, accessor),
-                    )?;
+                    let val = field
+                        .bind(py)
+                        .call_method1(intern!(py, "serialize"), (name.bind(py), obj, accessor))?;
                     if val.is(missing) {
                         continue;
                     }
@@ -402,10 +407,9 @@ impl Serializer {
                     output_key,
                     field,
                 } => {
-                    let val = field.bind(py).call_method1(
-                        intern!(py, "serialize"),
-                        (name.bind(py), obj, accessor),
-                    )?;
+                    let val = field
+                        .bind(py)
+                        .call_method1(intern!(py, "serialize"), (name.bind(py), obj, accessor))?;
                     if val.is(missing) {
                         continue;
                     }
@@ -538,9 +542,7 @@ impl Element {
             Element::Decimal { serialize } => {
                 // ``_serialize`` itself returns ``None`` for ``None``; calling it
                 // is byte-for-byte the callback path's ``_serialize``.
-                serialize
-                    .bind(py)
-                    .call1((value, py.None(), py.None()))
+                serialize.bind(py).call1((value, py.None(), py.None()))
             }
             Element::TimeDelta { serialize } => {
                 // Like ``Decimal``: the field's own ``_serialize`` (timedelta ->
@@ -909,7 +911,9 @@ enum LoadElement {
     /// Integer(strict=True): accept an exact ``int`` as-is; anything else (an
     /// ``Integral`` subclass to coerce, or an invalid value) defers to Python.
     IntStrict,
-    Float { allow_nan: bool },
+    Float {
+        allow_nan: bool,
+    },
     Nested(Box<LoadSerializer>),
     /// List(inner_element, inner_allow_none) — mirrors ``inner.deserialize``.
     List(Box<LoadElement>, bool),
@@ -922,7 +926,9 @@ enum LoadElement {
     },
     /// UUID: pass through an existing ``uuid.UUID``, else ``uuid.UUID(value)``
     /// (with the 16-byte ``bytes=`` special case).
-    Uuid { uuid_class: Py<PyAny> },
+    Uuid {
+        uuid_class: Py<PyAny>,
+    },
     /// DateTime/Date/Time: pass through an existing instance of ``internal_type``,
     /// else apply the held ``DESERIALIZATION_FUNCS[format]`` callable.
     Temporal {
@@ -931,16 +937,24 @@ enum LoadElement {
     },
     /// Decimal: defer to the field's own ``_deserialize`` (``_validated``);
     /// any ``ValidationError`` becomes ``AccelFallback``.
-    Decimal { deserialize: Py<PyAny> },
+    Decimal {
+        deserialize: Py<PyAny>,
+    },
     /// TimeDelta: defer to the field's own ``_deserialize`` (float -> timedelta);
     /// any ``ValidationError`` becomes ``AccelFallback``.
-    TimeDelta { deserialize: Py<PyAny> },
+    TimeDelta {
+        deserialize: Py<PyAny>,
+    },
     /// NaiveDateTime/AwareDateTime: defer to the field's own ``_deserialize``
     /// (parse + timezone-awareness check); any ``ValidationError`` -> fallback.
-    DatetimeAwareness { deserialize: Py<PyAny> },
+    DatetimeAwareness {
+        deserialize: Py<PyAny>,
+    },
     /// IP/IPv4/IPv6/IPInterface/...: defer to the field's own ``_deserialize``
     /// (``ensure_text_type`` + the held ``ipaddress`` ctor); any error -> fallback.
-    IpAddr { deserialize: Py<PyAny> },
+    IpAddr {
+        deserialize: Py<PyAny>,
+    },
     /// Dict (no key/value fields): copy a dict input via ``dict(value)``; a
     /// non-dict input defers (Python decides Mapping-or-``invalid``).
     Dict,
@@ -954,7 +968,9 @@ enum LoadElement {
         val_validators: Vec<Validator>,
     },
     /// Constant: always returns the held constant, ignoring the input value.
-    Constant { constant: Py<PyAny> },
+    Constant {
+        constant: Py<PyAny>,
+    },
     /// Tuple: a fixed-length sequence, one element per position. Defers on a
     /// non-sequence, a length mismatch, a ``None`` element, or any per-element
     /// error so Python re-runs with the exact messages.
@@ -1079,10 +1095,10 @@ impl<'py> Partial<'py> {
 
 enum LoadFieldSpec {
     Native {
-        data_key: Py<PyString>, // key read from the input mapping
-        out_key: Py<PyString>,  // key written to the output dict
+        data_key: Py<PyString>,                   // key read from the input mapping
+        out_key: Py<PyString>,                    // key written to the output dict
         out_key_parts: Option<Vec<Py<PyString>>>, // Some if dotted (set_value)
-        attr_name: Py<PyString>, // schema attribute name (for the partial check)
+        attr_name: Py<PyString>,                  // schema attribute name (for the partial check)
         load_default: Py<PyAny>,
         required: bool,
         allow_none: bool,
@@ -1106,7 +1122,9 @@ fn split_key_parts(
     let s = key.to_str()?;
     if s.contains('.') {
         Ok(Some(
-            s.split('.').map(|p| PyString::new(py, p).unbind()).collect(),
+            s.split('.')
+                .map(|p| PyString::new(py, p).unbind())
+                .collect(),
         ))
     } else {
         Ok(None)
@@ -1148,7 +1166,7 @@ fn set_load_value(
 struct LoadSerializer {
     specs: Vec<LoadFieldSpec>,
     many: bool,
-    unknown: u8, // UNKNOWN_RAISE | UNKNOWN_EXCLUDE
+    unknown: u8,           // UNKNOWN_RAISE | UNKNOWN_EXCLUDE
     known_keys: Py<PyAny>, // frozenset of data keys (only consulted when RAISE)
 }
 
@@ -1219,11 +1237,7 @@ impl LoadDeserializer {
 /// Convert a jiter ``JsonValue`` (sub)tree into exactly the Python object
 /// ``json.loads`` would have produced for it. Parity of the fused load rests on
 /// this being byte-identical to the stdlib parser's output per leaf.
-fn json_to_py<'py>(
-    py: Python<'py>,
-    ctx: &Ctx,
-    jv: &JsonValue<'_>,
-) -> PyResult<Bound<'py, PyAny>> {
+fn json_to_py<'py>(py: Python<'py>, jv: &JsonValue<'_>) -> PyResult<Bound<'py, PyAny>> {
     match jv {
         JsonValue::Null => Ok(py.None().into_bound(py)),
         JsonValue::Bool(b) => Ok(PyBool::new(py, *b).to_owned().into_any()),
@@ -1236,7 +1250,7 @@ fn json_to_py<'py>(
         JsonValue::Array(a) => {
             let out = PyList::empty(py);
             for item in a.iter() {
-                out.append(json_to_py(py, ctx, item)?)?;
+                out.append(json_to_py(py, item)?)?;
             }
             Ok(out.into_any())
         }
@@ -1245,7 +1259,7 @@ fn json_to_py<'py>(
             // the dict in order with ``set_item`` reproduces that.
             let out = PyDict::new(py);
             for (k, v) in o.iter() {
-                out.set_item(PyString::new(py, k.as_ref()), json_to_py(py, ctx, v)?)?;
+                out.set_item(PyString::new(py, k.as_ref()), json_to_py(py, v)?)?;
             }
             Ok(out.into_any())
         }
@@ -1567,7 +1581,7 @@ impl LoadSerializer {
                 let pk = PyString::new(py, key.as_ref());
                 if !known.contains(&pk)? {
                     // last-wins on duplicate unknown keys via ``set_item``.
-                    out.set_item(&pk, json_to_py(py, ctx, value)?)?;
+                    out.set_item(&pk, json_to_py(py, value)?)?;
                 }
             }
         }
@@ -1671,7 +1685,7 @@ impl Validator {
                 // doubt this fails -> fallback, where Python is authoritative, so
                 // we never *pass* something marshmallow would reject.
                 let r = validator.bind(py).call1((value,))?;
-                Ok(!r.is(&PyBool::new(py, false)))
+                Ok(!r.is(PyBool::new(py, false)))
             }
         }
     }
@@ -1815,7 +1829,9 @@ impl LoadElement {
                 if value.is_instance(internal_type.bind(py))? {
                     return Ok(value.clone()); // already a datetime/date/time
                 }
-                func.bind(py).call1((value,)).map_err(|e| to_fallback(py, e))
+                func.bind(py)
+                    .call1((value,))
+                    .map_err(|e| to_fallback(py, e))
             }
             LoadElement::Decimal { deserialize } => deserialize
                 .bind(py)
@@ -2006,7 +2022,7 @@ impl LoadElement {
             LoadElement::Dict => match jv {
                 // Plain Dict (no key/value fields) = ``dict(value)``: a fresh dict
                 // copy, which ``json_to_py`` of an object produces exactly.
-                JsonValue::Object(_) => json_to_py(py, ctx, jv),
+                JsonValue::Object(_) => json_to_py(py, jv),
                 _ => Err(fallback()),
             },
             LoadElement::DictTyped {
@@ -2040,7 +2056,7 @@ impl LoadElement {
                                 check_validators(py, val_validators, &r)?;
                                 r
                             }
-                            None => json_to_py(py, ctx, v)?,
+                            None => json_to_py(py, v)?,
                         };
                         out.set_item(ko, vo)?;
                     }
@@ -2051,7 +2067,7 @@ impl LoadElement {
             // Scalars and the remaining wrappers (Enum/Pluck/Decimal/...): the
             // input is a leaf, so materialise it and reuse the exact pure path.
             _ => {
-                let v = json_to_py(py, ctx, jv)?;
+                let v = json_to_py(py, jv)?;
                 self.apply(ctx, &v, partial)
             }
         }

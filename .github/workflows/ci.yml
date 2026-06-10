@@ -10,6 +10,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  quality:
+    name: code quality (lint + types)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install dev dependencies
+        run: make dev
+
+      - name: Lint (ruff + clippy + rustfmt)
+        run: make lint
+
+      - name: Type-check (pyright)
+        run: make types
+
   test:
     name: test (py${{ matrix.python-version }}, ma${{ matrix.marshmallow }})
     runs-on: ubuntu-latest

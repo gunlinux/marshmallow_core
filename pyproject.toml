@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "marshmallow_core"
-version = "0.1.8"
+version = "0.1.9"
 description = "Rust acceleration core for marshmallow serialization, installed as a separate, opt-in package."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,18 @@ Source = "https://github.com/gunlinux/marshmallow_core"
 
 [project.optional-dependencies]
 test = ["pytest"]
+
+[dependency-groups]
+dev = ["pytest", "ruff", "pyright"]
+
+[tool.ruff.lint.per-file-ignores]
+# The equivalence suite groups imports beside the section they exercise.
+"tests/*" = ["E402"]
+
+[tool.pyright]
+# Type-check the shipped library. The test suite subscripts marshmallow's
+# loosely-typed load()/dump() results, which is inherent noise, not bugs.
+include = ["python"]
 
 [tool.maturin]
 module-name = "marshmallow_core._core"
