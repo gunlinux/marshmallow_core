@@ -166,28 +166,57 @@ impl DumpSerializer {
 fn json_escape_into(buf: &mut String, s: &str) {
     use std::fmt::Write as _;
     buf.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => buf.push_str("\\\""),
-            '\\' => buf.push_str("\\\\"),
-            '\n' => buf.push_str("\\n"),
-            '\r' => buf.push_str("\\r"),
-            '\t' => buf.push_str("\\t"),
-            '\u{8}' => buf.push_str("\\b"),
-            '\u{c}' => buf.push_str("\\f"),
-            c if ('\u{20}'..='\u{7e}').contains(&c) => buf.push(c),
-            c => {
-                let cp = c as u32;
-                if cp <= 0xFFFF {
-                    let _ = write!(buf, "\\u{cp:04x}");
-                } else {
-                    let v = cp - 0x10000;
-                    let hi = 0xD800 + (v >> 10);
-                    let lo = 0xDC00 + (v & 0x3FF);
-                    let _ = write!(buf, "\\u{hi:04x}\\u{lo:04x}");
+    // Scan bytes (not chars): a "clean" byte is printable ASCII except ``"`` and
+    // ``\``. Clean runs are bulk-copied with a single ``push_str``; only a byte
+    // needing an escape breaks the run. Byte comparisons avoid per-char decoding,
+    // so this is fast for both short and long strings. Output is byte-identical
+    // to the stdlib ``ensure_ascii=True`` encoding (the escape logic is unchanged;
+    // multi-byte UTF-8 is decoded only at the rare non-ASCII byte).
+    let bytes = s.as_bytes();
+    let mut last = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\' {
+            i += 1;
+            continue; // clean: extend the run
+        }
+        if last < i {
+            buf.push_str(&s[last..i]); // flush the clean run
+        }
+        if b < 0x80 {
+            match b {
+                b'"' => buf.push_str("\\\""),
+                b'\\' => buf.push_str("\\\\"),
+                b'\n' => buf.push_str("\\n"),
+                b'\r' => buf.push_str("\\r"),
+                b'\t' => buf.push_str("\\t"),
+                0x08 => buf.push_str("\\b"),
+                0x0c => buf.push_str("\\f"),
+                _ => {
+                    let _ = write!(buf, "\\u{b:04x}"); // other control char
                 }
             }
+            i += 1;
+        } else {
+            // Non-ASCII: decode the one char and emit ``\uXXXX`` (surrogate pair
+            // above the BMP), matching ``ensure_ascii=True``.
+            let ch = s[i..].chars().next().unwrap();
+            let cp = ch as u32;
+            if cp <= 0xFFFF {
+                let _ = write!(buf, "\\u{cp:04x}");
+            } else {
+                let v = cp - 0x10000;
+                let hi = 0xD800 + (v >> 10);
+                let lo = 0xDC00 + (v & 0x3FF);
+                let _ = write!(buf, "\\u{hi:04x}\\u{lo:04x}");
+            }
+            i += ch.len_utf8();
         }
+        last = i;
+    }
+    if last < bytes.len() {
+        buf.push_str(&s[last..]);
     }
     buf.push('"');
 }
