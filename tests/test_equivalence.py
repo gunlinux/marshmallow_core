@@ -1882,6 +1882,46 @@ def test_load_validator_arm_errors_match_python(data, monkeypatch):
     assert acc_exc.value.messages == py_exc.value.messages
 
 
+# ---- typed Dict with inner key/value validators --------------------------
+
+
+class DictValidatedSchema(Schema):
+    d = fields.Dict(
+        keys=fields.String(validate=validate.Length(min=2)),
+        values=fields.Integer(validate=validate.Range(min=0)),
+    )
+
+
+def test_dict_inner_validators_is_native():
+    from marshmallow_core import _compiler
+
+    field = DictValidatedSchema().load_fields["d"]
+    assert _compiler._build_load_element(field, ())[0] == _compiler._L_DICT_TYPED
+
+
+@pytest.mark.parametrize("data", [{"d": {"ab": 1, "cd": 2}}, {"d": {}}, {}])
+def test_load_dict_inner_validators_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(DictValidatedSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"d": {"x": 1}},  # key too short
+        {"d": {"ab": -1}},  # value below range
+        {"d": {"x": -1}},  # both fail
+    ],
+)
+def test_load_dict_inner_validators_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        DictValidatedSchema().load(data)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        DictValidatedSchema().load(data)
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
 # ---- IP family (ipaddress-backed fields) ---------------------------------
 
 import ipaddress as _ipaddress

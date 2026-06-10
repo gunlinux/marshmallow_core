@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 17
+_EXPECTED_PROTOCOL = 18
 
 
 class _NoFallbackError(Exception):
@@ -645,13 +645,14 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
         if field.key_field is None and field.value_field is None:
             return (_L_DICT,)  # plain dict-copy
         # Typed Dict: apply the key/value fields per entry on the happy path.
-        # Require the inner fields carry no processors/validators (so their
-        # ``deserialize`` is just ``_deserialize`` for a present, non-None value);
-        # the core falls back on a non-dict input, a ``None`` key/value, or any
-        # per-entry error so Python accumulates the exact error structure.
+        # Inner ``pre_load``/``post_load`` *transform* the value and must run in
+        # Python, so they still defer; inner *validators* compile (natively or via
+        # the ``_V_PYTHON`` arm) and run per entry. The core falls back on a
+        # non-dict input, a ``None`` key/value, or any per-entry error so Python
+        # accumulates the exact error structure.
         key_field, value_field = field.key_field, field.value_field
-        if (key_field is not None and _has_field_processors(key_field)) or (
-            value_field is not None and _has_field_processors(value_field)
+        if (key_field is not None and _has_load_pre_post(key_field)) or (
+            value_field is not None and _has_load_pre_post(value_field)
         ):
             return None
         key_el = (
@@ -666,7 +667,17 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
             value_field is not None and val_el is None
         ):
             return None
-        return (_L_DICT_TYPED, key_el, val_el)
+        key_vals = (
+            tuple(_compile_validators(key_field.validators) or ())
+            if key_field is not None
+            else ()
+        )
+        val_vals = (
+            tuple(_compile_validators(value_field.validators) or ())
+            if value_field is not None
+            else ()
+        )
+        return (_L_DICT_TYPED, key_el, key_vals, val_el, val_vals)
     if ftype is ma_fields.Constant:
         return (_L_CONSTANT, field.constant)
     if ftype is ma_fields.Tuple:
