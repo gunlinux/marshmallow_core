@@ -1875,6 +1875,53 @@ def test_loads_ip_equivalence(monkeypatch):
     assert fused == pure
 
 
+# ---- custom (non-ISO) strptime temporal formats on load ------------------
+
+
+class CustomTemporalSchema(Schema):
+    when = fields.DateTime(format="%Y/%m/%d %H:%M")
+    day = fields.Date(format="%d-%m-%Y")
+    t = fields.Time(format="%H.%M.%S")
+
+
+def test_custom_temporal_is_native_load():
+    """A custom strptime format must compile to the native (held-method) load
+    path, not fall back."""
+    monkeypatch_install = marshmallow_core.is_installed()
+    if not monkeypatch_install:
+        marshmallow_core.install()
+    try:
+        from marshmallow_core import _compiler
+
+        assert _compiler.build_load_deserializer(CustomTemporalSchema()) is not None
+    finally:
+        if not monkeypatch_install:
+            marshmallow_core.uninstall()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"when": "2020/01/02 03:04", "day": "15-06-2026", "t": "23.59.01"},
+        {"day": "15-06-2026"},  # subset
+        {},  # all missing
+    ],
+)
+def test_load_custom_temporal_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(CustomTemporalSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize("data", [{"when": "bad-format"}, {"day": "2026-06-15"}])
+def test_load_custom_temporal_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        CustomTemporalSchema().load(data)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        CustomTemporalSchema().load(data)
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
 # ---- fused loads (jiter, Design A) ---------------------------------------
 # ``loads`` parses JSON straight off a jiter tree and deserializes without the
 # intermediate Python dict ``json.loads`` would build. These mirror the

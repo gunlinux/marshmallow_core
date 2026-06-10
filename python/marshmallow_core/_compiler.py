@@ -609,12 +609,15 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
         return (_L_IPADDR, field._deserialize)
     if ftype in _LOAD_TEMPORAL_TYPES:
         # ``_TemporalField._deserialize`` passes through an existing instance, else
-        # applies ``DESERIALIZATION_FUNCS[format]``. A custom strptime format (no
-        # registered func) is left to the callback path.
+        # applies ``DESERIALIZATION_FUNCS[format]``.
         data_format = field.format or field.DEFAULT_FORMAT
         func = field.DESERIALIZATION_FUNCS.get(data_format)
         if func is None:
-            return None
+            # Custom strptime format (no registered ISO func): the parse is an
+            # intrinsically-Python ``datetime.strptime``. Hand the field's own
+            # ``_deserialize`` to the core (the held-method pattern shared with
+            # ``Decimal``/``TimeDelta``); any ``ValidationError`` -> fallback.
+            return (_L_DATETIME_AWARENESS, field._deserialize)
         internal_type = getattr(dt, field.OBJ_TYPE)
         return (_L_TEMPORAL, internal_type, func)
     if ftype is ma_fields.NaiveDateTime or ftype is ma_fields.AwareDateTime:
