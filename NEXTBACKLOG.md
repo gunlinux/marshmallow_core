@@ -4,6 +4,14 @@ Successor to [BACKLOG.md](BACKLOG.md) Phase 4 (now complete). Derived from the
 post-Phase-4 numbers in [performance/RESULTS.md](performance/RESULTS.md). Ordered
 by measured ROI.
 
+**Status: Phase 5 complete.** Landed: dump `AccelFallback` (Tier 1); native typed
+`Dict` / `Tuple` / `Pluck` **dump** (Tier 1); exact-dict `get_one` fast path
+(Tier 2); native NaiveDateTime/AwareDateTime load (Tier 4); bulk-copy JSON string
+escaper (Tier 5). **Investigated, not landed:** per-class payload cache (Tier 3)
+and the native regex validator (Tier 4) — see the notes on those items. Post-Phase-5
+numbers are in [performance/RESULTS.md](performance/RESULTS.md): list dump
+8.6→6.2µs (13.5x), api dump 20.1→15.8µs (7.6x).
+
 **The new signal:** Phase 4 optimised *load* heavily, so **dump is now the
 slower direction on collections** — `api` dump 20.1µs vs load 12.2µs; `list` dump
 8.6µs vs load 7.7µs. Dump is where the absolute time now sits, and it is the most
@@ -20,28 +28,28 @@ output), so on an edge case it could **discard the partial output and re-run the
 pure-Python dump** — exactly what the load core already does. Adding this single
 mechanism unlocks a whole class of deferred work.
 
-- [ ] Add `AccelFallback` to the dump path: `DumpSerializer.run` raises it on any
+- [x] Add `AccelFallback` to the dump path: `DumpSerializer.run` raises it on any
       element it can't handle; `_patched_serialize` catches it and calls
       `_orig_serialize`. Propagate `KeyboardInterrupt`/`SystemExit` unchanged (as
       load does via `to_fallback`).
-- [ ] Audit every dump `Element::apply` arm: an unhandled shape must raise
+- [x] Audit every dump `Element::apply` arm: an unhandled shape must raise
       `AccelFallback`, **never** a wrong/partial result. This is the correctness
       crux — write equivalence tests that force each defer.
-- [ ] With the fallback in place, make **typed `Dict` / `Tuple` / `Pluck` dump
+- [x] With the fallback in place, make **typed `Dict` / `Tuple` / `Pluck` dump
       native** (the three Phase 4 load-only fields) — apply key/value/positional
       elements, defer on a non-mapping / length-mismatch / per-entry error.
-- [ ] Re-benchmark `api`/`list` dump; this is the main Phase 5 win.
+- [x] Re-benchmark `api`/`list` dump; this is the main Phase 5 win.
 
 ## Tier 2 — dump hot-path micro-opts (collections)
 
-- [ ] `get_one` runs `obj.hasattr("__getitem__")` **per field** (in `get_value`).
+- [x] `get_one` runs `obj.hasattr("__getitem__")` **per field** (in `get_value`).
       For the common dict source that is a wasted attribute lookup on every field.
       Detect "this object is a dict" **once** per `run_one` and take a direct
       `get_item` path, falling back to the `hasattr`/`getattr` probe only for
       non-dict objects. Likely the single biggest dump micro-win.
-- [ ] Profile `api` dump (samply / cargo-flamegraph against a Python harness) and
+- [x] Profile `api` dump (samply / cargo-flamegraph against a Python harness) and
       record the next hot spot here **before** further guessing.
-- [ ] Preallocate output `PyDict`/`PyList` capacity where the size is known
+- [ ] (deferred) Preallocate output `PyDict`/`PyList` capacity where the size is known
       (record count, field count) to cut rehashing/reallocation.
 
 ## Tier 3 — amortise first-call compilation
@@ -49,6 +57,16 @@ mechanism unlocks a whole class of deferred work.
 The per-schema payload is built lazily on first `dump`/`load` and cached **per
 instance**. Apps that create a fresh `Schema()` per request pay the compile every
 time.
+
+> **Investigated, NOT landed.** Compile cost is real (~36µs for the `api` schema,
+> ~3x a warm load) but only matters for the create-fresh-instance-per-request
+> pattern (marshmallow itself advises reusing instances). A per-class cache is a
+> **correctness hazard**: the compiled object captures *instance*-bound
+> references — `Method`/`Function`/callback fields invoke methods on their own
+> schema instance, `Decimal`/`TimeDelta`/awareness elements hold instance-bound
+> `_serialize`/`_deserialize`, and context differs per instance. Safe sharing is
+> limited to fully-structural schemas, and proving that per schema is complex.
+> Skipped per the "no correctness risk" rule.
 
 - [ ] Add a per-**class** payload cache keyed on the structural inputs that change
       the payload (`only`, `exclude`, `dict_class`, `partial`-shape, field
@@ -60,12 +78,19 @@ time.
 
 ## Tier 4 — widen native coverage (remaining callbacks)
 
-- [ ] `NaiveDateTime` / `AwareDateTime` on **load** (currently deferred for the
+- [x] `NaiveDateTime` / `AwareDateTime` on **load** (currently deferred for the
       timezone normalisation) — model the common tz cases, defer the rest.
 - [ ] `Email` / `URL` (String subclasses): the value passes through; only their
       regex validator differs. A native "regex validator" element (compile the
       pattern once, match in Rust) would turn these native — *spike first*, regex
       parity with Python `re` is the risk.
+      > **Spiked, NOT landed.** marshmallow's Email/URL validators combine
+      > Unicode-aware regexes (`\w` + `_UNICODE_LETTERS` from `unicodedata`), IDNA
+      > `encode("idna")`, and a domain whitelist. Byte-identical parity with the
+      > Rust `regex` crate can't be guaranteed, and a **false positive** (Rust
+      > matches what Python rejects) silently accepts invalid data — the load
+      > fallback only catches false *negatives*. Also needs a heavy new dep.
+      > Skipped per the "byte-identical parity" rule (cf. the Phase 2 JSON parser).
 - [ ] `IPv4` / `IPv6` / `IP` / `IPInterface` — niche; do only if a real workload
       asks.
 - [ ] Equivalence tests (valid + error) for each.
@@ -76,11 +101,11 @@ time.
 vs dump 8.6µs). `loads` stays bounded by C `json.loads` (a Rust parser lost in
 Phase 2 — don't retry).
 
-- [ ] Profile the JSON writer; check float formatting (must match `json.dumps`
+- [ ] (done for escaping; float fmt left) Profile the JSON writer; check float formatting (must match `json.dumps`
       exactly — `repr`-style shortest round-trip). If it is the cost, evaluate a
       shortest-round-trip formatter (e.g. ryu) **only if** byte-identical to
       `json.dumps`.
-- [ ] Tighten string escaping (bulk-copy ASCII runs, escape only when needed).
+- [x] Tighten string escaping (bulk-copy ASCII runs, escape only when needed).
 
 ---
 
