@@ -1810,6 +1810,71 @@ def test_load_partial_nested_own_option_defers(monkeypatch):
     assert accelerated == pure == {"id": 1, "inner": {}}
 
 
+# ---- IP family (ipaddress-backed fields) ---------------------------------
+
+import ipaddress as _ipaddress
+
+
+class IpSchema(Schema):
+    a = fields.IP()
+    b = fields.IPv4()
+    c = fields.IPv6()
+    iface = fields.IPInterface()
+    v4i = fields.IPv4Interface()
+    v6i = fields.IPv6Interface()
+
+
+_IP_LOADED = {
+    "a": _ipaddress.ip_address("1.2.3.4"),
+    "b": _ipaddress.IPv4Address("8.8.8.8"),
+    "c": _ipaddress.IPv6Address("::1"),
+    "iface": _ipaddress.ip_interface("10.0.0.1/24"),
+    "v4i": _ipaddress.IPv4Interface("192.168.0.5/16"),
+    "v6i": _ipaddress.IPv6Interface("fe80::1/64"),
+}
+
+
+def test_dump_ip_equivalence(monkeypatch):
+    accelerated, pure = _dump_both(IpSchema, _IP_LOADED, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {
+            "a": "1.2.3.4",
+            "b": "8.8.8.8",
+            "c": "::1",
+            "iface": "10.0.0.1/24",
+            "v4i": "192.168.0.5/16",
+            "v6i": "fe80::1/64",
+        },
+        {"a": _ipaddress.ip_address("5.6.7.8")},  # already an instance -> passthrough
+        {},  # all missing
+    ],
+)
+def test_load_ip_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(IpSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize("data", [{"a": "not-an-ip"}, {"b": "::1"}, {"a": None}])
+def test_load_ip_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        IpSchema().load(data)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        IpSchema().load(data)
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_loads_ip_equivalence(monkeypatch):
+    payload = '{"a": "1.2.3.4", "c": "::1", "iface": "10.0.0.1/24"}'
+    fused, pure = _loads_both(IpSchema, payload, monkeypatch=monkeypatch)
+    assert fused == pure
+
+
 # ---- fused loads (jiter, Design A) ---------------------------------------
 # ``loads`` parses JSON straight off a jiter tree and deserializes without the
 # intermediate Python dict ``json.loads`` would build. These mirror the

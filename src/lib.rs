@@ -67,6 +67,7 @@ enum Element {
     Nested(Box<Serializer>, bool), // Nested (bool = many)
     List(Box<Element>),  // List(inner)
     Uuid,                // UUID -> str(value)
+    IpAddr,              // IP/IPv4/IPv6/IPInterface/... -> str(value)
     /// DateTime/Date/Time: a held serialization callable, else ``value.strftime(fmt)``.
     Temporal {
         func: Option<Py<PyAny>>,
@@ -508,7 +509,7 @@ impl Element {
                 }
                 Ok(out.into_any())
             }
-            Element::Uuid => {
+            Element::Uuid | Element::IpAddr => {
                 if value.is_none() {
                     return Ok(py.None().into_bound(py));
                 }
@@ -726,6 +727,7 @@ fn parse_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<Element> {
             Ok(Element::List(Box::new(inner)))
         }
         6 => Ok(Element::Uuid),
+        16 => Ok(Element::IpAddr),
         7 => {
             // (7, func_or_None, format_str)
             let func_obj = t.get_item(1)?;
@@ -936,6 +938,9 @@ enum LoadElement {
     /// NaiveDateTime/AwareDateTime: defer to the field's own ``_deserialize``
     /// (parse + timezone-awareness check); any ``ValidationError`` -> fallback.
     DatetimeAwareness { deserialize: Py<PyAny> },
+    /// IP/IPv4/IPv6/IPInterface/...: defer to the field's own ``_deserialize``
+    /// (``ensure_text_type`` + the held ``ipaddress`` ctor); any error -> fallback.
+    IpAddr { deserialize: Py<PyAny> },
     /// Dict (no key/value fields): copy a dict input via ``dict(value)``; a
     /// non-dict input defers (Python decides Mapping-or-``invalid``).
     Dict,
@@ -1792,6 +1797,10 @@ impl LoadElement {
                 .bind(py)
                 .call1((value, py.None(), py.None()))
                 .map_err(|e| to_fallback(py, e)),
+            LoadElement::IpAddr { deserialize } => deserialize
+                .bind(py)
+                .call1((value, py.None(), py.None()))
+                .map_err(|e| to_fallback(py, e)),
             LoadElement::Dict => {
                 if value.is_instance_of::<PyDict>() {
                     ctx.dict_fn.bind(py).call1((value,))
@@ -2139,6 +2148,10 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
             // (18, bound _deserialize)
             deserialize: t.get_item(1)?.unbind(),
         }),
+        19 => Ok(LoadElement::IpAddr {
+            // (19, bound _deserialize)
+            deserialize: t.get_item(1)?.unbind(),
+        }),
         16 => {
             // (16, nested_payload, data_key, many)
             let serializer = parse_load_serializer(py, &t.get_item(1)?)?;
@@ -2181,7 +2194,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 15;
+const PROTOCOL_VERSION: u32 = 16;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {

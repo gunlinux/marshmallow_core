@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 15
+_EXPECTED_PROTOCOL = 16
 
 
 class _NoFallbackError(Exception):
@@ -94,6 +94,7 @@ _TIMEDELTA = 12
 _DICT_TYPED = 13
 _TUPLE = 14
 _PLUCK = 15
+_IPADDR = 16
 
 # Load element tags (a distinct tag space from the dump tags above).
 _L_PASSTHROUGH = 0
@@ -115,6 +116,7 @@ _L_TUPLE = 15
 _L_PLUCK = 16
 _L_TIMEDELTA = 17
 _L_DATETIME_AWARENESS = 18
+_L_IPADDR = 19
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -148,6 +150,21 @@ _SCALAR_KINDS: dict[type, int] = {
     ma_fields.Integer: _INTEGER,
     ma_fields.Float: _FLOAT,
 }
+
+# ``ipaddress``-backed fields. ``_serialize`` is ``str(value)`` for all of them
+# (identical to ``UUID``), and ``_deserialize`` is intrinsically Python
+# (``ensure_text_type`` + the held ``ipaddress`` constructor), so on load we hand
+# the field's own ``_deserialize`` to the core (the ``Decimal``/``TimeDelta``
+# pattern) and let any ``ValidationError`` become an ``AccelFallback``. Probed via
+# ``getattr`` so a marshmallow build missing any of them just omits it.
+_IP_TYPES: frozenset[type] = frozenset(
+    t
+    for t in (
+        getattr(ma_fields, _n, None)
+        for _n in ("IP", "IPv4", "IPv6", "IPInterface", "IPv4Interface", "IPv6Interface")
+    )
+    if t is not None
+)
 
 # Temporal field types whose ``_serialize`` is exactly ``_TemporalField._serialize``.
 _TEMPORAL_TYPES: frozenset[type] = frozenset(
@@ -255,6 +272,10 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
         return (_LIST, inner_element)
     if ftype is ma_fields.UUID:
         return (_UUID,)
+    if ftype in _IP_TYPES:
+        # ``IP*._serialize`` is ``str(value)`` (None passes through) — identical
+        # to ``UUID``; the core stringifies and defers (dump fallback) on nothing.
+        return (_IPADDR,)
     if ftype in _TEMPORAL_TYPES:
         # ``field.format`` is resolved to a concrete string once the field is
         # bound to its schema (which has happened by the first dump).
@@ -581,6 +602,11 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
         # ``UUID._validated``: pass through an existing UUID, else ``uuid.UUID(value)``
         # (with the 16-byte ``bytes=`` special case). Any error -> fall back.
         return (_L_UUID, uuid.UUID)
+    if ftype in _IP_TYPES:
+        # ``IP*._deserialize`` (``ensure_text_type`` + the held ``ipaddress``
+        # constructor) is intrinsically Python; hand the field's own method to the
+        # core, which turns any ``ValidationError`` into a fallback.
+        return (_L_IPADDR, field._deserialize)
     if ftype in _LOAD_TEMPORAL_TYPES:
         # ``_TemporalField._deserialize`` passes through an existing instance, else
         # applies ``DESERIALIZATION_FUNCS[format]``. A custom strptime format (no
