@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "marshmallow_core"
-version = "0.1.6"
+version = "0.1.7"
 description = "Rust acceleration core for marshmallow serialization, installed as a separate, opt-in package."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -1810,6 +1810,132 @@ def test_load_partial_nested_own_option_defers(monkeypatch):
     assert accelerated == pure == {"id": 1, "inner": {}}
 
 
+# ---- fused loads (jiter, Design A) ---------------------------------------
+# ``loads`` parses JSON straight off a jiter tree and deserializes without the
+# intermediate Python dict ``json.loads`` would build. These mirror the
+# ``_load_both`` pattern: run the fused path, then force the stock
+# ``json.loads`` + pure-Python load and assert the two agree.
+
+
+def _loads_both(schema_factory, json_str, *, many=False, monkeypatch, **kwargs):
+    """Return (fused, pure) ``loads`` of ``json_str``."""
+    fused = schema_factory().loads(json_str, many=many, **kwargs)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    pure = schema_factory().loads(json_str, many=many, **kwargs)
+    return fused, pure
+
+
+class LoadsFlat(Schema):
+    i = fields.Integer()
+    f = fields.Float()
+    s = fields.String()
+    b = fields.Boolean()
+    r = fields.Raw()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"i": 1, "f": 2.5, "s": "x", "b": true, "r": [1, 2, null]}',
+        '{"i": 1}',  # missing fields -> no default applied
+        '{"i": 1, "i": 2}',  # duplicate key -> last wins (== json.loads)
+        '{"i": 123456789012345678901234567890}',  # big int -> jiter parse fails, fallback
+        '{"f": 1.1234567890123456}',  # float round-trip
+        "{}",  # empty object
+    ],
+)
+def test_loads_flat_equivalence(payload, monkeypatch):
+    fused, pure = _loads_both(LoadsFlat, payload, monkeypatch=monkeypatch)
+    assert fused == pure
+
+
+def test_loads_many_equivalence(monkeypatch):
+    fused, pure = _loads_both(
+        LoadsFlat, '[{"i": 1}, {"i": 2}, {"i": 3}]', many=True, monkeypatch=monkeypatch
+    )
+    assert fused == pure
+
+
+def test_loads_partial_equivalence(monkeypatch):
+    fused, pure = _loads_both(LoadsFlat, '{"i": 1}', partial=True, monkeypatch=monkeypatch)
+    assert fused == pure
+
+
+class _LoadsInner(Schema):
+    x = fields.Integer()
+    y = fields.String()
+
+
+class LoadsNested(Schema):
+    items = fields.List(fields.Nested(_LoadsInner))  # list-of-records: the win case
+    tags = fields.List(fields.String())
+    total = fields.Integer()
+
+
+def test_loads_nested_list_equivalence(monkeypatch):
+    payload = (
+        '{"items": [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}],'
+        ' "tags": ["p", "q"], "total": 2}'
+    )
+    fused, pure = _loads_both(LoadsNested, payload, monkeypatch=monkeypatch)
+    assert fused == pure
+
+
+class LoadsInclude(Schema):
+    class Meta:
+        unknown = INCLUDE
+
+    i = fields.Integer()
+
+
+class LoadsExclude(Schema):
+    class Meta:
+        unknown = EXCLUDE
+
+    i = fields.Integer()
+
+
+@pytest.mark.parametrize("factory", [LoadsInclude, LoadsExclude])
+def test_loads_unknown_equivalence(factory, monkeypatch):
+    fused, pure = _loads_both(
+        factory, '{"i": 1, "extra": "yo", "n": 3, "extra": "last"}', monkeypatch=monkeypatch
+    )
+    assert fused == pure
+
+
+def test_loads_bytes_input_equivalence(monkeypatch):
+    fused, pure = _loads_both(LoadsFlat, b'{"i": 7, "s": "hi"}', monkeypatch=monkeypatch)
+    assert fused == pure
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"i": null}',  # null into a non-allow_none field
+        '{"i": 1, "zzz": 9}',  # unknown key under the default RAISE
+        '{"f": NaN}',  # NaN rejected by Float (special)
+        '{"i": "abc"}',  # invalid int
+        '{"s": 123}',  # number into String -> "Not a valid string."
+    ],
+)
+def test_loads_errors_match_python(payload, monkeypatch):
+    with pytest.raises(ValidationError) as fused_exc:
+        LoadsFlat().loads(payload)
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as pure_exc:
+        LoadsFlat().loads(payload)
+    assert fused_exc.value.messages == pure_exc.value.messages
+
+
+def test_loads_malformed_json_defers(monkeypatch):
+    """Malformed JSON: jiter fails -> fallback -> stock ``render_module.loads``
+    raises the same ``JSONDecodeError`` (which marshmallow does not wrap)."""
+    import json as _json
+
+    with pytest.raises(_json.JSONDecodeError):
+        LoadsFlat().loads('{"i": 1,')
+
+
 # ---- protocol-version handshake ------------------------------------------
 
 
