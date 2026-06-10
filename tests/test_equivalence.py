@@ -1230,6 +1230,56 @@ def test_load_oneof_custom_choices_equivalence(monkeypatch):
     assert accelerated == pure
 
 
+class EqNoneContainsSchema(Schema):
+    eq = fields.Integer(validate=validate.Equal(42))
+    none = fields.String(validate=validate.NoneOf(["x", "y", "z"]))
+    only = fields.List(fields.String(), validate=validate.ContainsOnly(["a", "b", "c"]))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"eq": 42, "none": "ok", "only": ["a", "b"]},
+        {"only": []},  # empty passes ContainsOnly
+        {"only": ["a", "a", "c"]},  # duplicates allowed
+        {},
+    ],
+)
+def test_load_eq_none_contains_valid(data, monkeypatch):
+    accelerated, pure = _load_both(EqNoneContainsSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"eq": 41},  # not Equal
+        {"none": "y"},  # in NoneOf iterable
+        {"only": ["a", "q"]},  # element not in ContainsOnly choices
+    ],
+)
+def test_load_eq_none_contains_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        EqNoneContainsSchema().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        EqNoneContainsSchema().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_eq_none_contains_is_native():
+    from marshmallow_core import _compiler
+
+    assert _compiler._build_validator(validate.Equal(1)) == (_compiler._V_EQUAL, 1)
+    assert _compiler._build_validator(validate.NoneOf([1]))[0] == _compiler._V_NONEOF
+    assert (
+        _compiler._build_validator(validate.ContainsOnly([1]))[0]
+        == _compiler._V_CONTAINSONLY
+    )
+
+
 def test_load_post_load_hook_runs(monkeypatch):
     class S(Schema):
         i = fields.Integer()
