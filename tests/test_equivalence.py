@@ -758,12 +758,26 @@ def test_load_typed_dict_is_native():
     assert element is not None and element[0] == _compiler._L_DICT_TYPED
 
 
-def test_dump_typed_dict_defers():
-    """The dump core has no fallback, so typed Dict dump stays a callback."""
+def test_dump_typed_dict_is_native():
+    """With the dump fallback in place, typed Dict dump compiles native."""
     from marshmallow_core import _compiler
 
     field = fields.Dict(keys=fields.String(), values=fields.Integer())
-    assert _compiler._build_element(field, ()) is None
+    element = _compiler._build_element(field, ())
+    assert element is not None and element[0] == _compiler._DICT_TYPED
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {"counts": {"a": 1, "b": 2}, "vals_only": {"x": 1.5}, "keys_only": {"k": "v"}},
+        {"counts": {}},
+        {},
+    ],
+)
+def test_dump_typed_dict_equivalence(obj, monkeypatch):
+    accelerated, pure = _dump_both(LoadTypedDictSchema, obj, monkeypatch=monkeypatch)
+    assert accelerated == pure
 
 
 class LoadTupleSchema(Schema):
@@ -810,6 +824,26 @@ def test_load_tuple_is_native():
     field = fields.Tuple((fields.String(), fields.Integer()))
     element = _compiler._build_load_element(field, ())
     assert element is not None and element[0] == _compiler._L_TUPLE
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {"row": ("a", 1, 2.5)},
+        {"row": ["x", 7, 3.0]},  # list input dumps the same
+    ],
+)
+def test_dump_tuple_equivalence(obj, monkeypatch):
+    accelerated, pure = _dump_both(LoadTupleSchema, obj, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+def test_dump_tuple_is_native():
+    from marshmallow_core import _compiler
+
+    field = fields.Tuple((fields.String(), fields.Integer()))
+    element = _compiler._build_element(field, ())
+    assert element is not None and element[0] == _compiler._TUPLE
 
 
 class _ArtistSchema(Schema):
@@ -866,6 +900,26 @@ def test_load_pluck_is_native():
     assert element is not None and element[0] == _compiler._L_PLUCK
 
 
+@pytest.mark.parametrize(
+    ("factory", "obj"),
+    [
+        (LoadPluckSchema, {"artist": {"id": 42, "name": "x"}}),
+        (LoadPluckManySchema, {"artists": [{"id": 1}, {"id": 2}, {"id": 3}]}),
+        (LoadPluckManySchema, {"artists": []}),
+    ],
+)
+def test_dump_pluck_equivalence(factory, obj, monkeypatch):
+    accelerated, pure = _dump_both(factory, obj, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+def test_dump_pluck_is_native():
+    from marshmallow_core import _compiler
+
+    element = _compiler._build_element(fields.Pluck(_ArtistSchema, "id"), ())
+    assert element is not None and element[0] == _compiler._PLUCK
+
+
 class TimeDeltaSchema(Schema):
     secs = fields.TimeDelta()  # precision="seconds"
     millis = fields.TimeDelta(precision="milliseconds")
@@ -915,6 +969,56 @@ def test_timedelta_is_native():
     field = fields.TimeDelta()
     assert _compiler._build_element(field, ())[0] == _compiler._TIMEDELTA
     assert _compiler._build_load_element(field, ())[0] == _compiler._L_TIMEDELTA
+
+
+class AwarenessSchema(Schema):
+    naive = fields.NaiveDateTime()
+    aware = fields.AwareDateTime()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"naive": "2020-01-02T03:04:05", "aware": "2020-01-02T03:04:05+00:00"},
+        {"naive": "2020-06-01T12:00:00"},
+        {},
+    ],
+)
+def test_load_awareness_equivalence(data, monkeypatch):
+    accelerated, pure = _load_both(AwarenessSchema, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"naive": "2020-01-02T03:04:05+00:00"},  # aware input -> naive field errors
+        {"aware": "2020-01-02T03:04:05"},  # naive input -> aware field errors
+        {"naive": "not-a-date"},
+    ],
+)
+def test_load_awareness_errors_match_python(data, monkeypatch):
+    with pytest.raises(ValidationError) as acc_exc:
+        AwarenessSchema().load(data)
+
+    monkeypatch.setattr(accel, "build_load_deserializer", lambda schema: None)
+    with pytest.raises(ValidationError) as py_exc:
+        AwarenessSchema().load(data)
+
+    assert acc_exc.value.messages == py_exc.value.messages
+
+
+def test_load_awareness_is_native():
+    from marshmallow_core import _compiler
+
+    assert (
+        _compiler._build_load_element(fields.NaiveDateTime(), ())[0]
+        == _compiler._L_DATETIME_AWARENESS
+    )
+    assert (
+        _compiler._build_load_element(fields.AwareDateTime(), ())[0]
+        == _compiler._L_DATETIME_AWARENESS
+    )
 
 
 @pytest.mark.parametrize("unknown", [RAISE, EXCLUDE, INCLUDE])

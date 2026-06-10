@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``_marshmallow_core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 10
+_EXPECTED_PROTOCOL = 14
 
 
 class _NoFallbackError(Exception):
@@ -91,6 +91,9 @@ _DECIMAL = 9
 _DICT = 10
 _CONSTANT = 11
 _TIMEDELTA = 12
+_DICT_TYPED = 13
+_TUPLE = 14
+_PLUCK = 15
 
 # Load element tags (a distinct tag space from the dump tags above).
 _L_PASSTHROUGH = 0
@@ -111,6 +114,7 @@ _L_DICT_TYPED = 14
 _L_TUPLE = 15
 _L_PLUCK = 16
 _L_TIMEDELTA = 17
+_L_DATETIME_AWARENESS = 18
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -211,6 +215,22 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
     kind = _SCALAR_KINDS.get(ftype)
     if kind is not None:
         return (kind, bool(getattr(field, "as_string", False)))
+    if ftype is ma_fields.Pluck:
+        # ``Pluck._serialize`` = ``Nested._serialize`` then ``ret[data_key]``
+        # (``utils.pluck`` per item when ``many``). Build the inner dump payload
+        # and extract the plucked key in the core.
+        inner_schema = field.schema
+        if (
+            inner_schema._hooks[PRE_DUMP]
+            or inner_schema._hooks[POST_DUMP]
+            or _overrides_native_dump(inner_schema)
+        ):
+            return None
+        payload = _build_payload(inner_schema, stack)
+        if payload is None:
+            return None
+        many = bool(inner_schema.many or field.many)
+        return (_PLUCK, payload, field._field_data_key, many)
     if ftype is ma_fields.Nested:
         # ``field.schema`` resolves the inner schema (applying only/exclude/many).
         inner_schema = field.schema
@@ -251,15 +271,28 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
         # hand the field's own ``_serialize`` to the core (provably identical).
         return (_DECIMAL, field._serialize)
     if ftype is ma_fields.Dict:
-        # Only the plain dict-copy case (``dict(value)``) is native; per-key/value
-        # field serialization falls back to the callback path.
-        if (
-            field.key_field is None
-            and field.value_field is None
-            and field.mapping_type is dict
+        if field.mapping_type is not dict:
+            return None
+        if field.key_field is None and field.value_field is None:
+            return (_DICT,)  # plain dict-copy (``dict(value)``)
+        # Typed Dict: serialize keys/values via their fields per entry. The dump
+        # elements are provably identical to ``_serialize``; the core defers
+        # (now that dump has a fallback) on a non-dict input.
+        key_el = (
+            _build_element(field.key_field, stack)
+            if field.key_field is not None
+            else None
+        )
+        val_el = (
+            _build_element(field.value_field, stack)
+            if field.value_field is not None
+            else None
+        )
+        if (field.key_field is not None and key_el is None) or (
+            field.value_field is not None and val_el is None
         ):
-            return (_DICT,)
-        return None
+            return None
+        return (_DICT_TYPED, key_el, val_el)
     if ftype is ma_fields.Constant:
         return (_CONSTANT, field.constant)
     if ftype is ma_fields.TimeDelta:
@@ -267,6 +300,18 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
         # Python and precision-sensitive; hand the field's own method to the core
         # (provably identical, like ``Decimal``).
         return (_TIMEDELTA, field._serialize)
+    if ftype is ma_fields.Tuple:
+        # ``Tuple._serialize``: ``tuple(f._serialize(each) for f, each in
+        # zip(fields, value, strict=True))``. Serialize each position natively;
+        # the core defers (dump fallback) on a length mismatch so Python raises
+        # the exact ``zip(strict=True)`` error.
+        elements = []
+        for inner in field.tuple_fields:
+            inner_element = _build_element(inner, stack)
+            if inner_element is None:
+                return None
+            elements.append(inner_element)
+        return (_TUPLE, tuple(elements))
     return None
 
 
@@ -531,6 +576,12 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
             return None
         internal_type = getattr(dt, field.OBJ_TYPE)
         return (_L_TEMPORAL, internal_type, func)
+    if ftype is ma_fields.NaiveDateTime or ftype is ma_fields.AwareDateTime:
+        # These wrap ``DateTime._deserialize`` with a timezone-awareness check
+        # (and adjust/raise). That logic is intrinsically Python; hand the field's
+        # own ``_deserialize`` to the core, which turns any ``ValidationError``
+        # into a fallback (the ``Decimal``/``TimeDelta`` pattern).
+        return (_L_DATETIME_AWARENESS, field._deserialize)
     if ftype is ma_fields.Decimal:
         # ``Decimal._deserialize`` (``_validated``) is intrinsically Python; hand
         # it to the core, which turns any ``ValidationError`` into a fallback.
