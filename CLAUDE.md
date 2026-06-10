@@ -120,7 +120,7 @@ identical to `Field._serialize`.
   match it. Bump both together when payload shapes/tags change.
 - **What stays pure-Python:** custom `dict_class`/`get_attribute`,
   self-referential schemas, custom strptime temporal formats,
-  `NaiveDateTime`/`AwareDateTime` on load, callable defaults, unrecognized field
+  callable defaults, unrecognized field
   validators (anything but `Range`/`Length`/`OneOf`), field-level
   `pre_load`/`post_load`, a `Dict` with key/value fields, a `Nested` whose inner
   schema overrides `load`/`_do_load`/`_deserialize` (load) or `dump`/`_serialize`
@@ -131,9 +131,14 @@ identical to `Field._serialize`.
   collection/dotted `partial`, dotted attribute writes (`set_value`),
   `Range`/`Length`/`OneOf` validators, `Decimal`/`Dict`/`Constant` fields,
   schema-level load hooks (`pre_load`/`post_load`/`validates`/`validates_schema`
-  run in Python around the core's per-field step), and `dumps` (fused to JSON in
-  Rust). `loads` is accelerated via the patched load path (a fused JSON *parser*
-  was prototyped but did not beat C `json.loads`, so it ships unfused).
+  run in Python around the core's per-field step), `dumps` (fused to JSON in
+  Rust), and `loads` (**fused**: `_patched_loads` parses JSON with the pure-Rust
+  `jiter` tree and deserializes straight off it via `LoadDeserializer.run_json`,
+  skipping the intermediate Python dict `json.loads` would build — 1.2–1.8× over
+  the prior `json.loads` + accelerated load. It defers to stock `loads` for
+  callback fields, load hooks, a non-`json` render module, extra kwargs, or
+  big-int payloads, since jiter is built without `num-bigint` to keep its pyo3
+  optional dep out of our build).
 
 ## Testing conventions
 
