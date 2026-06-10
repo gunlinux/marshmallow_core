@@ -1,0 +1,106 @@
+# Fair backlog — Phase 6 speedup plan
+
+Successor to [NEXTBACKLOG.md](NEXTBACKLOG.md) Phase 5 (now complete). Derived from
+the post-Phase-5 numbers in [performance/RESULTS.md](performance/RESULTS.md).
+Ordered by measured ROI.
+
+We are now in **diminishing-returns territory**: the big per-element loops (load
+and dump) and the JSON string escaper are done. The remaining work is incremental
+formatting/coverage micro-opts plus standing ceilings. **Profile before building.**
+
+**The new signal:** `dumps` is consistently **~2x `dump`** even though the fused
+writer skips the intermediate dict — list `dumps` 12.25µs vs `dump` 6.20µs; api
+22.04 vs 15.80; flat 0.97 vs 0.56. Building the JSON *string* costs more than
+building the dict, which means the per-scalar **formatting** in the writer
+(`int.__str__` / `float.__repr__` called per value, ~200 Python calls for the
+50-record list) is the dominant remaining `dumps` cost. That is where Phase 6
+starts.
+
+---
+
+## Tier 1 — native scalar formatting in the JSON writer (`dumps`)
+
+`write_json_value` formats each number by calling back into Python
+(`value.str()` for ints, `value.repr()` for floats). For a record list that is
+hundreds of Python calls. Format in Rust instead.
+
+- [ ] **Profile `run_json`** (api/list) to confirm the per-scalar formatting cost
+      before writing code — record the split (formatting vs structure vs escaping).
+- [ ] **Native `int` formatting** (safe): if the value fits `i64`/`u64`, format
+      with `itoa` directly; arbitrary-precision ints fall back to `value.str()`.
+      Integer text is identical across Python and Rust, so this is byte-safe.
+- [ ] **Native `float` formatting** (*spike, risky*): Python/`json` use
+      `float.__repr__` (shortest round-trip). `ryu` is shortest round-trip too but
+      its *formatting* differs (`1e20` vs Python `1e+20`, exponent threshold,
+      `-0.0`, `inf`/`nan` already special-cased). Land only if a normalization
+      layer is **byte-identical** to `repr` across a fuzz corpus; otherwise keep
+      `value.repr()` (no regression — the win is the int path).
+- [ ] Equivalence: the existing `dumps` tests already assert byte-identity; add a
+      numeric fuzz case (large ints, negatives, floats incl. `1e16`, `0.1`, `-0.0`).
+
+## Tier 2 — native datetime `isoformat` dump (with fallback)
+
+DateTime dump calls the field's serialization func (`utils.isoformat` →
+`value.isoformat()`) once per value — a Python call per datetime (the api `created`
+field is one per record). The dump core now has an `AccelFallback`, so this can be
+attempted safely.
+
+- [ ] Build the ISO string in Rust from `PyDateTime` components for the common
+      case (naive or fixed-offset, default format), and **defer** (fallback) on
+      anything fiddly (custom format, unusual tz, microsecond-trimming edge cases)
+      so the output stays byte-identical to `isoformat()`.
+- [ ] Equivalence (valid + each deferred edge): naive, aware, microseconds=0,
+      microseconds!=0, non-UTC offset.
+
+## Tier 3 — more native validators
+
+Only `Range`/`Length`/`OneOf` are native; the rest force the field onto the
+callback path. These are cheap set/equality checks; on failure they defer so the
+exact (possibly custom) message is reproduced.
+
+- [ ] `Equal` (`value == comparable`), `NoneOf` (`value not in iterable`),
+      `ContainsOnly` (`set(value) <= set(choices)`). All decision-only, like the
+      existing validators.
+- [ ] `Regexp` — only if the pattern is trivial enough for guaranteed parity;
+      otherwise skip (cf. the Email/URL spike in NEXTBACKLOG).
+- [ ] Equivalence: pass + fail inputs for each.
+
+## Tier 4 — profile-guided micro-opts
+
+- [ ] Profile api `load` (12.4µs) and `dump` (15.8µs); record the next hot spot
+      here before guessing.
+- [ ] Preallocate output `PyDict`/`PyList` capacity where the size is known
+      (record count, field count) — the item deferred from Phase 5 Tier 2. Only if
+      the profile shows allocation/rehash cost.
+
+## Spikes — probably not, but bounded by measurement
+
+- [ ] **SIMD JSON parser for `loads`.** `loads` (10x) trails `load` (25x) because
+      it is `json.loads` (C) + the accelerated load; the C parse is the floor. The
+      Phase 2 `serde_json` parser lost to C `json.loads`. A *SIMD* parser
+      (`simd-json`) *might* win, but it is a heavy dependency and must be
+      byte/precision-identical (big ints, float round-trip, key order, dup keys,
+      error messages). Spike behind a benchmark; do not ship a regression.
+
+## Structural ceilings — still not worth chasing
+
+Re-confirmed from Phases 4–5 (see [BACKLOG.md](BACKLOG.md) / [NEXTBACKLOG.md](NEXTBACKLOG.md)):
+
+- **Hook-bearing loads cap at ~2x** — marshmallow's Python hook dispatch around
+  the core's per-field step; not movable into Rust.
+- **`loads` is bounded by CPython's C `json.loads`** (see the SIMD spike above).
+- **Email/URL native regex** — false-positive validation risk, no byte-identical
+  parity, heavy dep. Not landed (NEXTBACKLOG).
+- **Per-class payload cache** — shares instance-bound references; correctness
+  hazard. Not landed (NEXTBACKLOG).
+- **By-design pure-Python:** custom `dict_class` / `get_attribute`, self-referential
+  schemas, custom strptime formats, callable defaults, `Function`/`Method` fields.
+
+## Recommended order
+
+1. **Profile `run_json`**, then **Tier 1 native int formatting** — the clearest
+   remaining win (`dumps` is ~2x `dump`), and byte-safe.
+2. **Tier 2 datetime isoformat** if the profile shows the datetime call is hot.
+3. **Tier 3 validators** — small, safe, helps validator-heavy schemas.
+4. Treat the float formatter and SIMD parser as *spikes*: land only on proven,
+   byte-identical gains, exactly as Phase 5 handled the regex validator and cache.
