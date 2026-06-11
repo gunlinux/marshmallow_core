@@ -2230,6 +2230,37 @@ def test_loads_unknown_equivalence(factory, monkeypatch):
     assert fused == pure
 
 
+def test_loads_wide_schema_equivalence(monkeypatch):
+    """A wide schema is the case the single-pass loader fixed (was O(fields^2));
+    confirm correctness still holds across many fields and a list of records."""
+    wide = type("Wide50", (Schema,), {f"f{n}": fields.Integer() for n in range(50)})
+    record = {f"f{n}": n for n in range(50)}
+    body = "{" + ", ".join(f'"f{n}": {n}' for n in range(50)) + "}"
+    payload = f"[{body}, {body}]"
+    fused, pure = _loads_both(wide, payload, many=True, monkeypatch=monkeypatch)
+    assert fused == pure
+    assert fused == [record, record]
+
+
+def test_loads_include_unknown_collides_with_out_key(monkeypatch):
+    """An INCLUDE'd unknown key whose name equals a field's output key must win
+    over the field's value — stock applies unknown keys after the fields, which
+    the single-pass loader reproduces by flushing them in a final pass."""
+
+    class S(Schema):
+        class Meta:
+            unknown = INCLUDE
+
+        # reads "src", writes "dest"; an unknown input key "dest" then collides.
+        x = fields.Integer(data_key="src", attribute="dest")
+
+    fused, pure = _loads_both(
+        S, '{"src": 1, "dest": "unknown-wins"}', monkeypatch=monkeypatch
+    )
+    assert fused == pure
+    assert fused == {"dest": "unknown-wins"}
+
+
 def test_loads_bytes_input_equivalence(monkeypatch):
     fused, pure = _loads_both(
         LoadsFlat, b'{"i": 7, "s": "hi"}', monkeypatch=monkeypatch

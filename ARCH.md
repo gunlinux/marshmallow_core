@@ -24,9 +24,14 @@ All of section **A** is addressed; section **B** (speed) is untouched.
 | A7 per-instance cache | **documented** | README: reuse schema instances (per-class cache stays rejected, by design) |
 | A8 free-threading unaudited | **documented** | README: 3.13t declared unsupported |
 
-Not done: **B1** (fused `loads` quadratic in width) and **B2** (doomed
-`run_json` for callback schemas) — the measured perf wins — plus B3/B4. B1's
-loop inversion is a non-trivial Rust change and was left for a dedicated branch.
+Section **B** (speed), branch `perf/b1-fused-loads-single-pass`:
+
+| Issue | Status | Result |
+|-------|--------|--------|
+| B1 fused `loads` quadratic | **fixed** | single-pass `run_one_json` (data_key→slot map); 100-field load 575→99µs, now flat ~0.44× of `json.loads`+load at every width |
+| B2 doomed `run_json` for callbacks | open | next |
+| B3 dict-path unknown alloc | open | (bundle with B2) |
+| B4 `get_one` re-probe | open | profile-gated |
 
 ---
 

@@ -35,6 +35,8 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 
 use jiter::{JsonArray, JsonObject, JsonValue};
 
+use std::collections::HashMap;
+
 create_exception!(
     _core,
     AccelFallback,
@@ -1172,7 +1174,15 @@ struct LoadSerializer {
     specs: Vec<LoadFieldSpec>,
     many: bool,
     unknown: u8,           // UNKNOWN_RAISE | UNKNOWN_EXCLUDE
-    known_keys: Py<PyAny>, // frozenset of data keys (only consulted when RAISE)
+    known_keys: Py<PyAny>, // frozenset of data keys (consulted on the PyDict path)
+    /// ``data_key`` -> index into ``specs``, built once. The JSON-tree path uses
+    /// it to bucket each record's keys in a single pass instead of scanning the
+    /// object per field (which was O(fields x keys); see ``run_one_json``).
+    data_key_index: HashMap<String, usize>,
+    /// Whether every ``data_key`` is distinct. If two specs share one, the
+    /// single-pass slot fill can't reproduce stock marshmallow (both fields read
+    /// the same input key), so the JSON path defers. Virtually always ``true``.
+    distinct_data_keys: bool,
 }
 
 #[pyclass(module = "marshmallow_core._core")]
@@ -1269,18 +1279,6 @@ fn json_to_py<'py>(py: Python<'py>, jv: &JsonValue<'_>) -> PyResult<Bound<'py, P
             Ok(out.into_any())
         }
     }
-}
-
-/// Last value for ``key`` in a jiter object (jiter does not dedup keys; stdlib
-/// ``json.loads`` keeps the last, so we scan to the last match).
-fn lookup_last<'a, 'j>(obj: &'a JsonObject<'j>, key: &str) -> Option<&'a JsonValue<'j>> {
-    let mut found = None;
-    for (k, v) in obj.iter() {
-        if k.as_ref() == key {
-            found = Some(v);
-        }
-    }
-    found
 }
 
 impl LoadSerializer {
@@ -1503,18 +1501,48 @@ impl LoadSerializer {
     /// handling) but reads fields from the jiter ``JsonObject`` instead of a
     /// ``PyDict``, and converts only the values it keeps. Callback fields are not
     /// modelled here — they defer the whole load to Python.
-    fn run_one_json<'py>(
+    ///
+    /// One pass buckets the object's keys (via the precomputed
+    /// ``data_key_index``) into per-spec slots and collects any unknown keys;
+    /// then the specs are applied in order. That is O(fields + keys), where the
+    /// previous per-spec ``lookup_last`` scan was O(fields x keys) — the cost that
+    /// made wide-schema fused ``loads`` slower than ``json.loads`` + load.
+    fn run_one_json<'py, 'j>(
         &self,
         ctx: &Ctx,
         py: Python<'py>,
-        obj: &JsonObject<'_>,
+        obj: &'j JsonObject<'j>,
         partial: &Partial<'py>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        // Two specs sharing a data_key can't be reproduced by the slot fill
+        // (both read the same input key); defer the whole load. Extremely rare.
+        if !self.distinct_data_keys {
+            return Err(fallback());
+        }
         let missing = ctx.missing.bind(py);
         let out = PyDict::new(py);
-        for spec in &self.specs {
+
+        // Pass 1: bucket each input key once. Known keys land in their spec slot
+        // (last-wins on duplicates via overwrite); unknown keys are rejected
+        // (RAISE) or held for INCLUDE — applied *after* the fields below so the
+        // overwrite order matches stock marshmallow.
+        let mut slots: Vec<Option<&'j JsonValue<'j>>> = vec![None; self.specs.len()];
+        let mut unknown_include: Vec<(&'j str, &'j JsonValue<'j>)> = Vec::new();
+        for (key, value) in obj.iter() {
+            match self.data_key_index.get(key.as_ref()) {
+                Some(&idx) => slots[idx] = Some(value),
+                None => match self.unknown {
+                    UNKNOWN_RAISE => return Err(fallback()),
+                    UNKNOWN_INCLUDE => unknown_include.push((key.as_ref(), value)),
+                    _ => {} // EXCLUDE: drop the unknown key
+                },
+            }
+        }
+
+        // Pass 2: apply the specs in declaration order.
+        for (i, spec) in self.specs.iter().enumerate() {
             let LoadFieldSpec::Native {
-                data_key,
+                data_key: _,
                 out_key,
                 out_key_parts,
                 attr_name,
@@ -1528,8 +1556,7 @@ impl LoadSerializer {
                 // Callback field: defer the entire load to Python.
                 return Err(fallback());
             };
-            let dk = data_key.bind(py).to_str()?;
-            let Some(value) = lookup_last(obj, dk) else {
+            let Some(value) = slots[i] else {
                 if partial.allows_missing(attr_name.bind(py))? {
                     continue;
                 }
@@ -1573,22 +1600,11 @@ impl LoadSerializer {
             }
             set_load_value(py, &out, out_key.bind(py), out_key_parts, &result)?;
         }
-        if self.unknown == UNKNOWN_RAISE {
-            let known = self.known_keys.bind(py);
-            for (key, _) in obj.iter() {
-                if !known.contains(PyString::new(py, key.as_ref()))? {
-                    return Err(fallback());
-                }
-            }
-        } else if self.unknown == UNKNOWN_INCLUDE {
-            let known = self.known_keys.bind(py);
-            for (key, value) in obj.iter() {
-                let pk = PyString::new(py, key.as_ref());
-                if !known.contains(&pk)? {
-                    // last-wins on duplicate unknown keys via ``set_item``.
-                    out.set_item(&pk, json_to_py(py, value)?)?;
-                }
-            }
+
+        // Pass 3 (INCLUDE only): copy unknown keys through, after the fields so a
+        // collision on an output key resolves the unknown value last, as stock does.
+        for (key, value) in unknown_include {
+            out.set_item(PyString::new(py, key), json_to_py(py, value)?)?;
         }
         Ok(out)
     }
@@ -2095,11 +2111,27 @@ fn parse_load_serializer(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult
     for item in specs_list.iter() {
         specs.push(parse_load_field_spec(py, &item)?);
     }
+    // Index ``data_key`` -> spec position once, for the single-pass JSON loader.
+    let mut data_key_index = HashMap::with_capacity(specs.len());
+    let mut distinct_data_keys = true;
+    for (i, spec) in specs.iter().enumerate() {
+        let data_key = match spec {
+            LoadFieldSpec::Native { data_key, .. } | LoadFieldSpec::Callback { data_key, .. } => {
+                data_key
+            }
+        };
+        let key = data_key.bind(py).to_str()?.to_owned();
+        if data_key_index.insert(key, i).is_some() {
+            distinct_data_keys = false; // two specs share a data_key
+        }
+    }
     Ok(LoadSerializer {
         specs,
         many,
         unknown,
         known_keys,
+        data_key_index,
+        distinct_data_keys,
     })
 }
 
@@ -2394,22 +2426,21 @@ mod tests {
         assert_eq!(esc("aé b"), "\"a\\u00e9 b\"");
     }
 
-    fn int_of(jv: Option<&JsonValue<'_>>) -> i64 {
-        match jv {
-            Some(JsonValue::Int(n)) => *n,
-            _ => panic!("expected an Int JsonValue"),
-        }
-    }
-
     #[test]
-    fn lookup_last_keeps_the_last_duplicate() {
-        // jiter does not dedup keys; stdlib json.loads keeps the last value.
+    fn json_parse_keeps_last_duplicate_key() {
+        // jiter does not dedup keys; stdlib json.loads keeps the last value, and
+        // ``run_one_json``'s slot fill reproduces that by overwriting. Verify the
+        // ordering assumption the loader relies on at the tree level.
         let data = br#"{"a": 1, "b": 2, "a": 3}"#;
         let JsonValue::Object(obj) = JsonValue::parse(data, false).unwrap() else {
             panic!("expected an object");
         };
-        assert_eq!(int_of(lookup_last(&obj, "a")), 3);
-        assert_eq!(int_of(lookup_last(&obj, "b")), 2);
-        assert!(lookup_last(&obj, "missing").is_none());
+        let mut last_a = None;
+        for (k, v) in obj.iter() {
+            if k.as_ref() == "a" {
+                last_a = Some(v);
+            }
+        }
+        assert!(matches!(last_a, Some(JsonValue::Int(3))));
     }
 }
