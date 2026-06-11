@@ -2268,6 +2268,35 @@ def test_loads_bytes_input_equivalence(monkeypatch):
     assert fused == pure
 
 
+def test_loads_fusable_flag_tracks_callback_fields(monkeypatch):
+    """A callback field anywhere makes the schema non-fusable (transitively
+    through Nested); ``_patched_loads`` reads this to skip a doomed jiter parse
+    and go straight to stock ``loads`` (ARCH.md B2). The plan caches the flag."""
+
+    class AllNative(Schema):
+        a = fields.Integer()
+        b = fields.String()
+
+    class WithCallback(Schema):
+        a = fields.Integer()
+        c = fields.Function(deserialize=lambda v: v)  # forces the callback path
+
+    class NestedCallback(Schema):
+        inner = fields.Nested(WithCallback)
+
+    assert accel.build_load_deserializer(AllNative()).fusable is True
+    assert accel.build_load_deserializer(WithCallback()).fusable is False
+    assert accel.build_load_deserializer(NestedCallback()).fusable is False
+
+    # The cached plan carries the flag (4th element), and the non-fusable schema
+    # still loads correctly via the stock path.
+    schema = WithCallback()
+    schema.loads('{"a": 1, "c": 5}')
+    assert vars(schema)["_mc_load_plan"][3] is False
+    fused, pure = _loads_both(WithCallback, '{"a": 1, "c": 5}', monkeypatch=monkeypatch)
+    assert fused == pure
+
+
 @pytest.mark.parametrize(
     "payload",
     [

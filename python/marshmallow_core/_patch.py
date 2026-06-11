@@ -207,6 +207,29 @@ def _patched_serialize(self: Schema, obj: typing.Any, *, many: bool = False):
     return _orig_serialize(self, obj, many=many)
 
 
+def _load_plan(self: Schema) -> typing.Any:
+    """Build (once, cached on the instance) or fetch this schema's load plan.
+
+    Returns ``None`` when the schema isn't compilable (always pure Python), else
+    a tuple ``(deserializer, has_load_hooks, default_core_partial, json_fusable)``
+    — the deserializer plus the three per-call constants we'd otherwise recompute
+    every load. ``json_fusable`` is whether the whole spec tree is callback-free,
+    so ``loads`` can skip the jiter parse for a schema that would only defer
+    (ARCH.md B2). Shared by :func:`_patched_do_load` and :func:`_patched_loads`
+    so the cached tuple shape can't drift between them.
+    """
+    cache = vars(self)
+    plan = cache.get("_mc_load_plan", _UNSET)
+    if plan is _UNSET:
+        ld = _compiler.build_load_deserializer(self)
+        plan = cache["_mc_load_plan"] = (
+            None
+            if ld is None
+            else (ld, _has_load_hooks(self), _core_partial(self.partial), ld.fusable)
+        )
+    return plan
+
+
 def _patched_do_load(
     self: Schema,
     data: Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]],
@@ -228,21 +251,9 @@ def _patched_do_load(
     # schemas use the hook-aware path (core does the per-field step, Python runs
     # the hooks around it); hook-free schemas call the core directly.
     if unknown == self.unknown and _partial_is_supported(partial):
-        cache = vars(self)
-        # Cached once per instance: the compiled deserializer plus the two
-        # constants we'd otherwise recompute every load — whether the schema has
-        # load hooks, and the core form of its default ``partial``. ``None`` means
-        # "not compilable" (always pure Python); ``_UNSET`` means "not built yet".
-        plan = cache.get("_mc_load_plan", _UNSET)
-        if plan is _UNSET:
-            ld = _compiler.build_load_deserializer(self)
-            plan = cache["_mc_load_plan"] = (
-                None
-                if ld is None
-                else (ld, _has_load_hooks(self), _core_partial(self.partial))
-            )
+        plan = _load_plan(self)
         if plan is not None:
-            ld, has_hooks, default_core_partial = plan
+            ld, has_hooks, default_core_partial, _fusable = plan
             try:
                 if has_hooks:
                     # On a marshmallow whose ``_do_load`` internals we haven't
@@ -418,21 +429,16 @@ def _patched_loads(
         and eff_unknown == self.unknown
         and _partial_is_supported(eff_partial)
     ):
-        cache = vars(self)
         # Reuse the same compiled plan the ``_do_load`` path builds/caches.
-        plan = cache.get("_mc_load_plan", _UNSET)
-        if plan is _UNSET:
-            ld = _compiler.build_load_deserializer(self)
-            plan = cache["_mc_load_plan"] = (
-                None
-                if ld is None
-                else (ld, _has_load_hooks(self), _core_partial(self.partial))
-            )
+        plan = _load_plan(self)
         if plan is not None:
-            ld, has_hooks, default_core_partial = plan
+            ld, has_hooks, default_core_partial, fusable = plan
             # Hook-bearing schemas can't fuse the JSON parse (the hooks run in
-            # Python around the per-field step), so let them take stock ``loads``.
-            if not has_hooks:
+            # Python around the per-field step). A schema with a callback field
+            # anywhere can't finish ``run_json`` either — it would parse the whole
+            # JSON only to defer on the first record — so skip straight to stock
+            # ``loads`` instead of wasting the jiter parse (ARCH.md B2).
+            if not has_hooks and fusable:
                 many_v = bool(self.many) if many is None else bool(many)
                 core_partial = (
                     default_core_partial if partial is None else _core_partial(partial)

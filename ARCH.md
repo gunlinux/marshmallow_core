@@ -29,8 +29,8 @@ Section **B** (speed), branch `perf/b1-fused-loads-single-pass`:
 | Issue | Status | Result |
 |-------|--------|--------|
 | B1 fused `loads` quadratic | **fixed** | single-pass `run_one_json` (data_key→slot map); 100-field load 575→99µs, now flat ~0.44× of `json.loads`+load at every width |
-| B2 doomed `run_json` for callbacks | open | next |
-| B3 dict-path unknown alloc | open | (bundle with B2) |
+| B2 doomed `run_json` for callbacks | **fixed** | `LoadDeserializer.fusable` (callback-free tree, computed once); `_patched_loads` skips the jiter parse — callback-schema `loads` overhead +13%→+0% |
+| B3 dict-path unknown alloc | open | (optional; bundle if revisited) |
 | B4 `get_one` re-probe | open | profile-gated |
 
 ---

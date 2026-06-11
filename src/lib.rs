@@ -1189,6 +1189,11 @@ struct LoadSerializer {
 pub struct LoadDeserializer {
     ctx: Ctx,
     root: LoadSerializer,
+    /// Whether the whole spec tree is callback-free, so ``run_json`` can finish
+    /// off the jiter tree. A callback anywhere makes ``run_one_json`` defer on
+    /// first sight; the Python caller reads this to skip the (wasted) jiter parse
+    /// and go straight to stock ``loads`` (see ``_patched_loads``).
+    fusable: bool,
 }
 
 #[pymethods]
@@ -1198,7 +1203,19 @@ impl LoadDeserializer {
     fn new(py: Python<'_>, payload: &Bound<'_, PyAny>, missing: Py<PyAny>) -> PyResult<Self> {
         let ctx = Ctx::new(py, missing)?;
         let root = parse_load_serializer(py, payload)?;
-        Ok(LoadDeserializer { ctx, root })
+        let fusable = serializer_is_fusable(&root);
+        Ok(LoadDeserializer {
+            ctx,
+            root,
+            fusable,
+        })
+    }
+
+    /// Whether ``run_json`` can complete for this schema (no callback fields
+    /// anywhere in the tree). Read once by the Python caller and cached.
+    #[getter]
+    fn fusable(&self) -> bool {
+        self.fusable
     }
 
     /// Deserialize ``data``; raises ``AccelFallback`` to defer to Python.
@@ -2099,6 +2116,33 @@ impl LoadElement {
 /// mis-iterate a ``Mapping`` (which ``is_collection`` excludes) or a generator.
 fn is_list_like(val: &Bound<'_, PyAny>) -> bool {
     val.is_instance_of::<PyList>() || val.is_instance_of::<PyTuple>()
+}
+
+/// Whether a serializer (and everything reachable through nested schemas) has no
+/// callback field, so ``run_json`` can finish off the jiter tree. Used once at
+/// construction to set ``LoadDeserializer::fusable``.
+fn serializer_is_fusable(s: &LoadSerializer) -> bool {
+    s.specs.iter().all(|spec| match spec {
+        LoadFieldSpec::Callback { .. } => false,
+        LoadFieldSpec::Native { element, .. } => element_is_fusable(element),
+    })
+}
+
+/// Whether a load element contains only fusable sub-serializers (a nested schema
+/// with a callback field makes the enclosing element non-fusable).
+fn element_is_fusable(e: &LoadElement) -> bool {
+    match e {
+        LoadElement::Nested(serializer) => serializer_is_fusable(serializer),
+        LoadElement::Pluck { serializer, .. } => serializer_is_fusable(serializer),
+        LoadElement::List(inner, _) => element_is_fusable(inner),
+        LoadElement::Tuple(elements) => elements.iter().all(element_is_fusable),
+        LoadElement::DictTyped { key_el, val_el, .. } => {
+            key_el.as_deref().is_none_or(element_is_fusable)
+                && val_el.as_deref().is_none_or(element_is_fusable)
+        }
+        // Scalars and held-method elements contain no nested serializer.
+        _ => true,
+    }
 }
 
 fn parse_load_serializer(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<LoadSerializer> {
