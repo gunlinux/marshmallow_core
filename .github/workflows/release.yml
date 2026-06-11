@@ -70,6 +70,14 @@ jobs:
     permissions:
       id-token: write # trusted publishing; no API token needed
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify tag is on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "${{ github.sha }}" origin/main || \
+            { echo "::error::Tag ${{ github.ref_name }} is not on the main branch — publish aborted."; exit 1; }
       - uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
