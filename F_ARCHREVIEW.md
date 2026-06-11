@@ -36,17 +36,64 @@ all.
 
 ## Summary of findings
 
-| # | Finding | Severity | Where |
-|---|---------|----------|-------|
-| R1 | One-shot iterables + dump fallback: silent data loss, swallowed errors | **critical** | `_patch.py:190,383` / `lib.rs:324` |
-| R2 | Rust-held cycles invisible to GC: every dumping schema leaks forever | **critical** | `lib.rs` (`DumpSerializer`/`LoadDeserializer`) |
-| R3 | Unbounded recursion in the fused JSON writer: SIGSEGV vs stock `RecursionError` | **high** | `lib.rs:244` |
-| R4 | Stale cached `partial`: validation silently skipped after mutation | **high** | `_patch.py:225-230,267-271` |
-| R5 | Root-schema `_deserialize` override silently bypassed | **high** | `_compiler.py:727-731` |
-| R6 | Lone-surrogate `loads` input: `UnicodeEncodeError` escapes instead of stock result | medium | `lib.rs:1252-1254` |
-| R7 | `uninstall()` clobbers patches stacked on top of ours | medium | `_patch.py:474-486` |
-| R8 | `__version__` drift: `__init__.py` says 0.1.8, the wheel is 0.1.11 | low | `__init__.py:28` |
-| R9 | Internal duplication/hygiene (see list) | low | various |
+| # | Finding | Severity | Where | Status |
+|---|---------|----------|-------|--------|
+| R1 | One-shot iterables + dump fallback: silent data loss, swallowed errors | **critical** | `_patch.py:190,383` / `lib.rs:324` | **DONE** |
+| R2 | Rust-held cycles invisible to GC: every dumping schema leaks forever | **critical** | `lib.rs` (`DumpSerializer`/`LoadDeserializer`) | **DONE** |
+| R3 | Unbounded recursion in the fused JSON writer: SIGSEGV vs stock `RecursionError` | **high** | `lib.rs:244` | **DONE** |
+| R4 | Stale cached `partial`: validation silently skipped after mutation | **high** | `_patch.py:225-230,267-271` | **DONE** |
+| R5 | Root-schema `_deserialize` override silently bypassed | **high** | `_compiler.py:727-731` | **DONE** |
+| R6 | Lone-surrogate `loads` input: `UnicodeEncodeError` escapes instead of stock result | medium | `lib.rs:1252-1254` | **DONE** |
+| R7 | `uninstall()` clobbers patches stacked on top of ours | medium | `_patch.py:474-486` | **DONE** |
+| R8 | `__version__` drift: `__init__.py` says 0.1.8, the wheel is 0.1.11 | low | `__init__.py:28` | **DONE** |
+| R9 | Internal duplication/hygiene (see list) | low | various | CANCELED — cosmetic; no correctness impact |
+
+---
+
+## Post-implementation results (2026-06-11)
+
+All R1–R8 items implemented and tested. R9 canceled (hygiene items, no correctness risk).
+
+### R1 — one-shot iterables
+`_patched_serialize` and `_patched_dumps` now call `obj = list(obj)` when `many=True`
+and `obj` is not already a `list`/`tuple`. Test: `test_r1_*` in `test_contract.py`.
+
+### R2 — GC traverse/clear
+`DumpSerializer` and `LoadDeserializer` pyclasses restructured to hold
+`Option<Box<DsInner>>`/`Option<Box<LdInner>>`. Implemented `__traverse__` and `__clear__`
+with recursive traverse helpers for all `Py<>` refs in `Element`, `FieldSpec`,
+`Serializer`, `LoadElement`, `LoadFieldSpec`, `LoadSerializer`, `Validator`.
+GC collection verified via `weakref` tests in `test_contract.py`.
+
+### R3 — depth budget
+`write_json_value` now takes a `depth: usize` parameter. Raises `AccelFallback` when
+`depth > JSON_DEPTH_LIMIT (512)`. Two call sites from `Element::write_json` pass `depth=0`.
+
+### R4 — stale partial cache
+Removed `default_core_partial` from `_load_plan` tuple (was index 2; `fusable` now index 2).
+All call sites now use `_core_partial(partial)` live. Fixed `_patched_do_load` to also
+correctly fall through to `_orig_do_load` (not `ld.run()`) when `has_hooks=True` and
+`_ACCEL_LOAD_VERIFIED=False`.
+
+### R5 — root _deserialize override
+Added `_deserialize` identity check in `_build_load_payload` when `is_root=True`.
+Schemas overriding `_deserialize` at root now compile to `None` (pure Python).
+
+### R6 — lone surrogates
+Changed `s.to_str()?` to `s.to_str().map_err(|_| fallback())?` in `LoadDeserializer::run_json`.
+
+### R7 — uninstall stacking
+`uninstall()` now checks identity before restoring each attribute. Emits `RuntimeWarning`
+and leaves the attribute alone if a foreign patch was stacked on top.
+
+### R8 — __version__
+`__init__.py` now derives `__version__` from `importlib.metadata.version("marshmallow_core")`
+with a broad `except Exception` guard.
+
+### R9 — hygiene — CANCELED
+Items: body deduplication in `build_dump_serializer`/`build_dump_json_serializer`,
+`known_keys` deduplication, `Ctx` singleton, stray doc line in `parse_validator_list`,
+`install()` guard when core unavailable. All cosmetic; no correctness risk. Skipped.
 
 ---
 
