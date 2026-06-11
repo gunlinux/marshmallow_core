@@ -305,6 +305,50 @@ def test_nested_instance_only_equivalence(monkeypatch):
     assert accelerated == pure == {"title": "t", "inner": {"a": "x"}}
 
 
+def test_n1_generator_in_nested_many_with_dicttyped_sibling(monkeypatch):
+    """N1: a generator inside a many=True Nested field must not be silently
+    exhausted when a sibling DictTyped(UserDict) field triggers AccelFallback.
+    """
+    from collections import UserDict
+
+    class Inner(Schema):
+        x = fields.Integer()
+
+    class S(Schema):
+        a = fields.Nested(Inner, many=True)
+        b = fields.Dict(keys=fields.String(), values=fields.Integer())
+
+    gen_obj = {"a": ({"x": i} for i in range(3)), "b": UserDict({"k": 1})}
+    # pure-Python path is the reference
+    monkeypatch.setattr(accel, "build_dump_serializer", lambda schema: None)
+    expected = S().dump(gen_obj)
+    monkeypatch.undo()
+
+    gen_obj2 = {"a": ({"x": i} for i in range(3)), "b": UserDict({"k": 1})}
+    accelerated = S().dump(gen_obj2)
+    assert accelerated == expected
+
+
+def test_n1_generator_in_list_field_with_dicttyped_sibling(monkeypatch):
+    """N1: a generator inside a List field must not be silently exhausted
+    when a sibling DictTyped field triggers AccelFallback.
+    """
+    from collections import UserDict
+
+    class S(Schema):
+        a = fields.List(fields.Integer())
+        b = fields.Dict(keys=fields.String(), values=fields.Integer())
+
+    gen_obj = {"a": (i for i in range(3)), "b": UserDict({"k": 1})}
+    monkeypatch.setattr(accel, "build_dump_serializer", lambda schema: None)
+    expected = S().dump(gen_obj)
+    monkeypatch.undo()
+
+    gen_obj2 = {"a": (i for i in range(3)), "b": UserDict({"k": 1})}
+    accelerated = S().dump(gen_obj2)
+    assert accelerated == expected
+
+
 # ---- fused dumps (dump -> JSON string in Rust) ----------------------------
 
 

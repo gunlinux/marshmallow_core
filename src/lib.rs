@@ -685,11 +685,21 @@ impl Element {
                 if value.is_none() {
                     return Ok(py.None().into_bound(py));
                 }
+                // N1: defer before consuming a non-replayable iterator; re-iterable
+                // containers (set, range, dict views) stay fast.
+                if *many && is_one_shot_iterator(value) {
+                    return Err(fallback());
+                }
                 serializer.run(ctx, value, *many)
             }
             Element::List(inner) => {
                 if value.is_none() {
                     return Ok(py.None().into_bound(py));
+                }
+                // N1: same guard — generators in a List field must not be consumed
+                // before a potential later AccelFallback.
+                if is_one_shot_iterator(value) {
+                    return Err(fallback());
                 }
                 let out = PyList::empty(py);
                 for each in value.try_iter()? {
@@ -787,6 +797,10 @@ impl Element {
                 if value.is_none() {
                     return Ok(py.None().into_bound(py));
                 }
+                // N1: defer before consuming a non-replayable iterator.
+                if *many && is_one_shot_iterator(value) {
+                    return Err(fallback());
+                }
                 let dk = data_key.bind(py);
                 let ret = serializer.run(ctx, value, *many)?;
                 if *many {
@@ -815,6 +829,12 @@ impl Element {
                     buf.push_str("null");
                     Ok(())
                 } else {
+                    // N1: same guard as apply — defer before consuming a
+                    // non-replayable iterator so a later fallback doesn't replay
+                    // an exhausted generator against the original object.
+                    if *many && is_one_shot_iterator(value) {
+                        return Err(fallback());
+                    }
                     serializer.write_json(buf, ctx, value, *many)
                 }
             }
@@ -822,6 +842,10 @@ impl Element {
                 if value.is_none() {
                     buf.push_str("null");
                     return Ok(());
+                }
+                // N1: same guard as apply.
+                if is_one_shot_iterator(value) {
+                    return Err(fallback());
                 }
                 buf.push('[');
                 let mut first = true;
@@ -2372,9 +2396,19 @@ impl LoadElement {
                 // miss, or a ``TypeError`` from an unhashable value, defers so
                 // Python raises the exact ``invalid`` error (matching the
                 // ``try/except TypeError`` in ``Boolean._deserialize``).
-                if truthy.bind(py).contains(value).map_err(|_| fallback())? {
+                // N2: use ``to_fallback`` (not bare fallback) so KI/SystemExit
+                // from ``__hash__``/``__eq__`` propagates instead of being eaten.
+                if truthy
+                    .bind(py)
+                    .contains(value)
+                    .map_err(|e| to_fallback(py, e))?
+                {
                     Ok(PyBool::new(py, true).to_owned().into_any())
-                } else if falsy.bind(py).contains(value).map_err(|_| fallback())? {
+                } else if falsy
+                    .bind(py)
+                    .contains(value)
+                    .map_err(|e| to_fallback(py, e))?
+                {
                     Ok(PyBool::new(py, false).to_owned().into_any())
                 } else {
                     Err(fallback())
@@ -2509,6 +2543,23 @@ impl LoadElement {
 /// mis-iterate a ``Mapping`` (which ``is_collection`` excludes) or a generator.
 fn is_list_like(val: &Bound<'_, PyAny>) -> bool {
     val.is_instance_of::<PyList>() || val.is_instance_of::<PyTuple>()
+}
+
+/// N1: returns ``true`` if ``value`` is a non-replayable one-shot iterator
+/// (has ``__next__``). Re-iterable containers (list, tuple, set, range,
+/// dict views) do NOT have ``__next__`` on the object itself, so they stay fast.
+///
+/// Lists and tuples short-circuit to ``false`` before the ``hasattr`` call —
+/// they are the overwhelmingly common dump input, so the hot path pays only
+/// two type-pointer comparisons and never reaches Python.
+#[inline]
+fn is_one_shot_iterator(value: &Bound<'_, PyAny>) -> bool {
+    if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
+        return false;
+    }
+    value
+        .hasattr(intern!(value.py(), "__next__"))
+        .unwrap_or(false)
 }
 
 /// Whether a serializer (and everything reachable through nested schemas) has no

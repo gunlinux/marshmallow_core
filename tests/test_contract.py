@@ -63,6 +63,62 @@ def test_r1_generator_no_fallback_passthrough():
     assert result == [{"i": n} for n in range(5)]
 
 
+# ─── N1: inner generator + dump fallback must not silently drop records ───────
+
+class _InnerS(Schema):
+    x = fields.Integer()
+
+
+class _N1NestedSchema(Schema):
+    """Generator in Nested(many=True); DictTyped sibling triggers fallback."""
+    a = fields.Nested(_InnerS, many=True)
+    b = fields.Dict(keys=fields.String(), values=fields.Integer())
+
+
+class _N1ListSchema(Schema):
+    """Generator in List; DictTyped sibling triggers fallback."""
+    a = fields.List(fields.Integer())
+    b = fields.Dict(keys=fields.String(), values=fields.Integer())
+
+
+def test_n1_generator_in_nested_many_not_exhausted():
+    """N1: generator inside Nested(many=True) must not be silently exhausted
+    when a sibling DictTyped field forces AccelFallback.
+    """
+    from collections import UserDict
+
+    gen_obj = {"a": ({"x": i} for i in range(3)), "b": UserDict({"k": 1})}
+    result = _N1NestedSchema().dump(gen_obj)
+    assert result == {"a": [{"x": 0}, {"x": 1}, {"x": 2}], "b": {"k": 1}}, (
+        "N1: generator in nested-many was silently exhausted by AccelFallback"
+    )
+
+
+def test_n1_generator_in_list_not_exhausted():
+    """N1: generator inside a List field must not be silently exhausted
+    when a sibling DictTyped field forces AccelFallback.
+    """
+    from collections import UserDict
+
+    gen_obj = {"a": (i for i in range(3)), "b": UserDict({"k": 1})}
+    result = _N1ListSchema().dump(gen_obj)
+    assert result == {"a": [0, 1, 2], "b": {"k": 1}}, (
+        "N1: generator in List field was silently exhausted by AccelFallback"
+    )
+
+
+def test_n1_dumps_generator_in_nested_many_not_exhausted():
+    """N1: same check for the fused JSON (dumps) path."""
+    import json
+    from collections import UserDict
+
+    gen_obj = {"a": ({"x": i} for i in range(3)), "b": UserDict({"k": 1})}
+    result = json.loads(_N1NestedSchema().dumps(gen_obj))
+    assert result == {"a": [{"x": 0}, {"x": 1}, {"x": 2}], "b": {"k": 1}}, (
+        "N1: generator in nested-many was silently exhausted on the fused dumps path"
+    )
+
+
 # ─── R2: GC — schemas must be collectable after one op ────────────────────────
 
 class _FlatS(Schema):
