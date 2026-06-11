@@ -257,13 +257,15 @@ def _patched_do_load(
             try:
                 if has_hooks:
                     # On a marshmallow whose ``_do_load`` internals we haven't
-                    # verified, don't trust the transcription: defer to the
-                    # unchanged pure-Python load below (ARCH.md A2).
-                    if not _ACCEL_LOAD_VERIFIED:
-                        raise _compiler.AccelFallback
-                    return _accelerated_load(
-                        self, ld, data, many, partial, unknown, postprocess
-                    )
+                    # verified, don't trust the transcription: fall through to
+                    # the unchanged pure-Python load below without raising an
+                    # exception (F_SPEEDUP F2: raising AccelFallback here costs
+                    # ~0.5µs of exception overhead on every hook-bearing load,
+                    # making it 16% slower than stock on an unverified build).
+                    if _ACCEL_LOAD_VERIFIED:
+                        return _accelerated_load(
+                            self, ld, data, many, partial, unknown, postprocess
+                        )
                 core_partial = (
                     default_core_partial
                     if partial_is_default

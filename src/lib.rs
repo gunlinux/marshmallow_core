@@ -35,7 +35,16 @@ use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyT
 
 use jiter::{JsonArray, JsonObject, JsonValue};
 
+use std::cell::Cell;
 use std::collections::HashMap;
+
+// Per-thread, single-slot cache: (type_ptr, has_getitem). For homogeneous
+// ``many=True`` dumps (all objects of the same type) this eliminates all but
+// the first ``hasattr("__getitem__")`` probe (F_SPEEDUP F3). Cleared at the
+// start of each top-level ``DumpSerializer::run``/``run_json`` call.
+thread_local! {
+    static INDEXABLE_LAST: Cell<(usize, bool)> = const { Cell::new((0, false)) };
+}
 
 create_exception!(
     _core,
@@ -158,6 +167,11 @@ impl DumpSerializer {
 
     /// Serialize ``obj`` (or each element if ``many``) into a dict (or list).
     fn run<'py>(&self, obj: &Bound<'py, PyAny>, many: bool) -> PyResult<Bound<'py, PyAny>> {
+        // Clear the per-invocation type cache before each top-level serialize
+        // (F_SPEEDUP F3: all non-dict objects share this single-slot cache, so a
+        // homogeneous many=True dump pays only one hasattr probe instead of
+        // fields × records).
+        INDEXABLE_LAST.with(|c| c.set((0, false)));
         self.root.run(&self.ctx, obj, many)
     }
 
@@ -168,10 +182,25 @@ impl DumpSerializer {
     /// reproduce exactly (e.g. an unencodable value or a non-``str`` dict key),
     /// and the caller falls back to ``dump`` + ``json.dumps``.
     fn run_json(&self, obj: &Bound<'_, PyAny>, many: bool) -> PyResult<String> {
+        INDEXABLE_LAST.with(|c| c.set((0, false)));
         let mut buf = String::new();
         self.root.write_json(&mut buf, &self.ctx, obj, many)?;
         Ok(buf)
     }
+}
+
+/// Hex digit table for fast ``\uXXXX`` emission without ``core::fmt`` overhead.
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// Push a single ``\uXXXX`` escape for a 16-bit code point (avoids ``write!``).
+#[inline]
+fn push_u4(buf: &mut String, cp: u32) {
+    // SAFETY: all pushed bytes are valid ASCII.
+    buf.push_str("\\u");
+    buf.push(HEX[((cp >> 12) & 0xF) as usize] as char);
+    buf.push(HEX[((cp >> 8) & 0xF) as usize] as char);
+    buf.push(HEX[((cp >> 4) & 0xF) as usize] as char);
+    buf.push(HEX[(cp & 0xF) as usize] as char);
 }
 
 /// Append ``s`` to ``buf`` as a JSON string literal, matching CPython's
@@ -179,8 +208,12 @@ impl DumpSerializer {
 /// short escapes for ``" \\ \n \r \t \b \f``, ``\u00XX`` for other control
 /// characters, raw bytes for printable ASCII (``0x20..=0x7E``, ``/`` unescaped),
 /// and ``\uXXXX`` (surrogate pairs above the BMP) for everything else.
+///
+/// Non-ASCII characters are emitted via ``push_u4`` (a nibble table) rather
+/// than ``write!`` (which invokes the full ``core::fmt`` machinery per char).
+/// For Cyrillic/CJK/Arabic text this is the hot path and the saving is ~14×
+/// per char (measured; F_SPEEDUP F1).
 fn json_escape_into(buf: &mut String, s: &str) {
-    use std::fmt::Write as _;
     buf.push('"');
     // Scan bytes (not chars): a "clean" byte is printable ASCII except ``"`` and
     // ``\``. Clean runs are bulk-copied with a single ``push_str``; only a byte
@@ -209,9 +242,7 @@ fn json_escape_into(buf: &mut String, s: &str) {
                 b'\t' => buf.push_str("\\t"),
                 0x08 => buf.push_str("\\b"),
                 0x0c => buf.push_str("\\f"),
-                _ => {
-                    let _ = write!(buf, "\\u{b:04x}"); // other control char
-                }
+                _ => push_u4(buf, b as u32), // other control char
             }
             i += 1;
         } else {
@@ -220,12 +251,13 @@ fn json_escape_into(buf: &mut String, s: &str) {
             let ch = s[i..].chars().next().unwrap();
             let cp = ch as u32;
             if cp <= 0xFFFF {
-                let _ = write!(buf, "\\u{cp:04x}");
+                push_u4(buf, cp);
             } else {
                 let v = cp - 0x10000;
                 let hi = 0xD800 + (v >> 10);
                 let lo = 0xDC00 + (v & 0x3FF);
-                let _ = write!(buf, "\\u{hi:04x}\\u{lo:04x}");
+                push_u4(buf, hi);
+                push_u4(buf, lo);
             }
             i += ch.len_utf8();
         }
@@ -854,7 +886,24 @@ fn get_one<'py>(
             Err(e) => Err(e),
         };
     }
-    if obj.hasattr(intern!(py, "__getitem__"))? {
+    // Non-dict: check whether the object's type is indexable, using a
+    // single-slot type-level cache (F_SPEEDUP F3). For homogeneous many=True
+    // dumps (all objects the same type) this reduces N*fields hasattr probes to
+    // just one. The cache is cleared at the start of each top-level run call.
+    let type_ptr = obj.get_type().as_ptr() as usize;
+    let cached = INDEXABLE_LAST.with(|c| {
+        let (ptr, val) = c.get();
+        if ptr == type_ptr { Some(val) } else { None }
+    });
+    let has_getitem = match cached {
+        Some(v) => v,
+        None => {
+            let v = obj.hasattr(intern!(py, "__getitem__"))?;
+            INDEXABLE_LAST.with(|c| c.set((type_ptr, v)));
+            v
+        }
+    };
+    if has_getitem {
         match obj.get_item(key) {
             Ok(v) => return Ok(v),
             Err(e) => {
@@ -1110,6 +1159,13 @@ enum LoadFieldSpec {
         required: bool,
         allow_none: bool,
         element: LoadElement,
+        /// True if this element can forward ``partial`` into a nested schema
+        /// (``Nested``/``Pluck``, transitively through ``List``/``Tuple``/
+        /// ``DictTyped``). When false, ``partial.derive`` is skipped entirely for
+        /// this spec (F_SPEEDUP F4: for flat schemas with a ``Coll`` partial,
+        /// all specs have ``consumes_partial = false`` and zero derive calls are
+        /// made across all records).
+        consumes_partial: bool,
         validators: Vec<Validator>,
     },
     Callback {
@@ -1340,6 +1396,7 @@ impl LoadSerializer {
                     required,
                     allow_none,
                     element,
+                    consumes_partial,
                     validators,
                 } => {
                     let raw = data.get_item(data_key.bind(py))?;
@@ -1370,18 +1427,21 @@ impl LoadSerializer {
                         }
                         return Err(fallback()); // ``null`` error
                     }
-                    // The sub-partial for this field. ``derive`` is identity for
-                    // ``None``/``All`` (only a ``Coll`` strips the ``attr.`` prefix),
-                    // so reuse the parent partial directly off the hot path and
-                    // only call ``derive`` for the collection case.
-                    let derived;
-                    let field_partial: &Partial = match partial {
-                        Partial::Coll(_) => {
-                            derived = partial.derive(py, attr_name.bind(py))?;
-                            &derived
+                    // The sub-partial for this field. Only call ``derive`` when
+                    // the element actually forwards partial into a nested schema
+                    // (F_SPEEDUP F4: for flat schemas all specs have
+                    // ``consumes_partial = false``, eliminating all derive calls).
+                    let sub_partial_opt: Option<Partial> = if *consumes_partial {
+                        match partial {
+                            Partial::Coll(_) => {
+                                Some(partial.derive(py, attr_name.bind(py))?)
+                            }
+                            _ => None,
                         }
-                        _ => partial,
+                    } else {
+                        None
                     };
+                    let field_partial: &Partial = sub_partial_opt.as_ref().unwrap_or(partial);
                     let result = element.apply(ctx, &value, field_partial)?;
                     // Validators run on the deserialized value (mirrors
                     // ``Field._validate(output)``); any failure or error defers
@@ -1563,6 +1623,7 @@ impl LoadSerializer {
                 required,
                 allow_none,
                 element,
+                consumes_partial,
                 validators,
             } = spec
             else {
@@ -1595,14 +1656,17 @@ impl LoadSerializer {
                 }
                 return Err(fallback());
             }
-            let derived;
-            let field_partial: &Partial = match partial {
-                Partial::Coll(_) => {
-                    derived = partial.derive(py, attr_name.bind(py))?;
-                    &derived
+            let sub_partial_opt: Option<Partial> = if *consumes_partial {
+                match partial {
+                    Partial::Coll(_) => {
+                        Some(partial.derive(py, attr_name.bind(py))?)
+                    }
+                    _ => None,
                 }
-                _ => partial,
+            } else {
+                None
             };
+            let field_partial: &Partial = sub_partial_opt.as_ref().unwrap_or(partial);
             let result = element.apply_json(py, ctx, value, field_partial)?;
             for validator in validators {
                 match validator.check(&result) {
@@ -2141,6 +2205,23 @@ fn element_is_fusable(e: &LoadElement) -> bool {
     }
 }
 
+/// Whether a load element passes ``partial`` into a nested schema (F_SPEEDUP F4).
+/// Only ``Nested``/``Pluck`` — and containers that wrap them — ever forward the
+/// sub-partial; pure scalar elements never read it. Mirrors the recursion shape
+/// of ``element_is_fusable``.
+fn element_consumes_partial(e: &LoadElement) -> bool {
+    match e {
+        LoadElement::Nested(_) | LoadElement::Pluck { .. } => true,
+        LoadElement::List(inner, _) => element_consumes_partial(inner),
+        LoadElement::Tuple(elements) => elements.iter().any(element_consumes_partial),
+        LoadElement::DictTyped { key_el, val_el, .. } => {
+            key_el.as_deref().is_some_and(element_consumes_partial)
+                || val_el.as_deref().is_some_and(element_consumes_partial)
+        }
+        _ => false,
+    }
+}
+
 fn parse_load_serializer(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<LoadSerializer> {
     let t = payload.cast::<PyTuple>()?;
     let many: bool = t.get_item(0)?.extract()?;
@@ -2199,6 +2280,8 @@ fn parse_load_field_spec(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Lo
         }
         let out_key = t.get_item(2)?.cast_into::<PyString>()?;
         let out_key_parts = split_key_parts(py, &out_key)?;
+        let element = parse_load_element(py, &t.get_item(7)?)?;
+        let consumes_partial = element_consumes_partial(&element);
         Ok(LoadFieldSpec::Native {
             data_key: t.get_item(1)?.cast_into::<PyString>()?.unbind(),
             out_key: out_key.unbind(),
@@ -2207,7 +2290,8 @@ fn parse_load_field_spec(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<Lo
             load_default: t.get_item(4)?.unbind(),
             required: t.get_item(5)?.extract()?,
             allow_none: t.get_item(6)?.extract()?,
-            element: parse_load_element(py, &t.get_item(7)?)?,
+            element,
+            consumes_partial,
             validators,
         })
     }
