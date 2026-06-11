@@ -7,8 +7,10 @@ this table when the core changes.
 
 - **Environment:** Apple Silicon (arm64, macOS), CPython 3.12, marshmallow 4.3.0,
   release build (`maturin build --release`), `--number 6000`.
-- **Recorded:** after ARCH.md B1/B2 (single-pass fused `loads`; skip the jiter
-  parse for callback schemas). Earlier-phase numbers are in the git history.
+- **Recorded:** after the B1/B2 loader rework (single-pass fused `loads`; skip
+  the jiter parse for callback schemas). Earlier-phase numbers, and the
+  ARCH.md/F_SPEEDUP.md reviews the B*/F* item IDs refer to, are in git history;
+  the current review is `F_REAL_REVIEW.md`.
 - These are indicative ratios, not guarantees; absolute numbers vary by machine.
 
 | case      | op    | stock (µs) | core (µs) | speedup |
@@ -44,7 +46,7 @@ unknown probe): flat `loads` 1.05→0.57µs (5.2→9.6x), list `loads` 22.5→13
 (10.8→18.0x), api `loads` 31.7→21.2µs (10.7→15.8x). Dump/dumps are unchanged
 (B1/B2 touch only load); `hooks loads` stays ~2x (it runs stock `loads`, not the
 fused path — see below). A wide-schema (50–100 field) case isn't in the standard
-set; per ARCH.md B1 the fused path is now flat at ~0.44x of `json.loads`+load
+set; per the B1 measurements the fused path is now flat at ~0.44x of `json.loads`+load
 across 5–100 fields, where it was 2.45x *slower* at 100 before.
 
 ## Reading the table
@@ -55,7 +57,7 @@ across 5–100 fields, where it was 2.45x *slower* at 100 before.
   and **dumps** (Phase 6 native int formatting) have closed much of the gap.
 - **`dumps` is still ~2x `dump`** on float-heavy payloads — the remaining cost is
   `float.__repr__` per value, which can't be matched byte-for-byte in Rust
-  (see `FAIRBACKLOG.md` Tier 1 / "not landed").
+  (see the won't-do list in `F_REAL_REVIEW.md`).
 - **hooks** is the floor (~2x): marshmallow's Python hook dispatch around the
   core's per-field step, not movable into Rust. Hook-bearing schemas also can't
   fuse `loads` (the hooks run in Python around the per-field step), so `hooks
