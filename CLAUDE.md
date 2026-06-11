@@ -37,28 +37,37 @@ upstream branch is the reference implementation to diff against.
 
 ## Commands
 
-Requires `cargo` (rustup) and [`maturin`](https://www.maturin.rs/) (run via `uvx`).
+Requires `cargo` (rustup), [`maturin`](https://www.maturin.rs/) (run via `uvx`),
+and `uv`. The Makefile is the front door:
 
 ```bash
-# Build the Rust core + install the package into the current venv (iterating):
-uvx maturin develop --release
+make dev        # uv sync --dev (pytest, ruff, pyright)
+make develop    # uvx maturin develop --release — build the core into the venv
+make check      # lint + types + test, both languages (run before committing)
+make fix        # ruff --fix/format + cargo fmt/clippy --fix
+make py-test    # rebuilds the core, then uv run pytest
+```
 
-# Build a wheel without installing (verifies Rust compiles + maturin metadata):
-uvx maturin build --release            # -> target/wheels/marshmallow_core-*.whl
+```bash
+# Iterating on tests directly (after make develop):
+uv run pytest -q
+uv run pytest tests/test_equivalence.py::test_load_equivalence -q   # one test
 
-# Run the suite. IMPORTANT: test against STOCK marshmallow, not a checkout of
-# the fork (the fork has its own baked-in accel and would double-patch). Use a
-# throwaway venv with marshmallow from PyPI:
-WHEEL=$(ls -t target/wheels/*.whl | head -1)
-uv venv /tmp/mc && uv pip install --python /tmp/mc/bin/python marshmallow pytest "$WHEEL"
-/tmp/mc/bin/python -m pytest -q                       # whole suite
-/tmp/mc/bin/python -m pytest tests/test_equivalence.py::test_load_equivalence -q   # one test
-MARSHMALLOW_NO_ACCEL=1 /tmp/mc/bin/python -m pytest -q -k "not core_active and not protocol"  # pure-Python path
+# Full-fidelity run: builds the wheel and tests it in a throwaway venv against
+# STOCK marshmallow from PyPI (never a checkout of the fork — it has its own
+# baked-in accel and would double-patch). Extra args go to pytest:
+./run_tests.sh -q
+MARSHMALLOW_NO_ACCEL=1 ./run_tests.sh -q -k "not core_active and not protocol"  # pure-Python path
+
+# Benchmark stock vs core (dump/load/dumps/loads per case, speedup table):
+uv run python -m performance.benchmark               # all cases
+uv run python -m performance.benchmark --only flat,list --number 20000
 ```
 
 `MARSHMALLOW_NO_ACCEL=1` disables the core even after `install()` (the
 pure-Python path is always correct). CI (`.github/workflows/ci.yml`) runs the
-suite on py3.10–3.13 both with the core active and disabled.
+suite on py3.10–3.13 both with the core active and disabled. Past benchmark
+numbers live in `performance/RESULTS.md`.
 
 ## Architecture
 
@@ -74,15 +83,21 @@ The wrappers try the compiled core and otherwise call the saved originals:
   `vars(schema)["_mc_dump_serializer"]` / `["_mc_load_deserializer"]` — `_UNSET`
   (not built), `None` (not compilable → always pure Python), or a core object.
 - `_do_load` only attempts the core when the call uses the schema's own
-  `unknown`, `partial` is `True`-or-falsy, and the schema has **no load hooks**
-  (`_has_load_hooks` checks `pre_load`/`post_load`/`validates`/`validates_schema`).
-  On `AccelFallback` from the core it falls through to the original `_do_load`.
+  `unknown` and `partial` is a bool or a name collection. Hook-free schemas call
+  the core directly; schemas with load hooks
+  (`pre_load`/`post_load`/`validates`/`validates_schema`) go through
+  `_accelerated_load` — a verbatim transcription of `Schema._do_load` with the
+  per-field `self._deserialize(...)` call replaced by the core, so Python runs
+  the hooks *around* the Rust per-field step (same split as the upstream
+  branch). On `AccelFallback` either path falls through to the original
+  `_do_load`.
 
-**Key divergence from the upstream branch:** there, a *root* schema with load
-hooks still uses the core for the per-field step with Python running the hooks
-*around* it. That split lives *inside* `_do_load` and cannot be reproduced by
-wrapping the method from outside, so here **hook-bearing schemas use the
-pure-Python load path entirely**. Correct, just not accelerated. Dump is fully
+Because `_accelerated_load` transcribes `_do_load`'s body, it pins to
+marshmallow's private hook invokers (both the 3.x and 4.x shapes, branching on
+`_MA4`). `install()` runs `_accel_load_supported()` — a structural check that
+those invokers still exist with the expected keyword parameters — and on a
+mismatch (an untested future marshmallow) routes hook-bearing schemas to the
+pure-Python load instead: correct, just unaccelerated. Dump is fully
 accelerated regardless of dump hooks (they run via `dump`, not `_serialize`).
 
 ### `_compiler.py` — Schema → payload (the "compiler")
@@ -154,12 +169,25 @@ for every input it accepts, and must defer on any shape it does not.
 `tests/test_equivalence.py` is the source of truth: an autouse fixture calls
 `install()`, and each `_dump_both`/`_load_both` helper runs once accelerated,
 then `monkeypatch`es `_compiler.build_*` to `None` to force the pure path, and
-asserts the two are equal. `tests/test_smoke.py` is a quick install/uninstall +
-equivalence sanity check. New native fields need a case in `test_equivalence.py`.
+asserts the two are equal. New native fields need a case there.
+
+The other three files cover what equivalence can't:
+
+- `tests/test_protocol.py` — tag-sync contract: reflects every `_*`/`_L_*`/`_V_*`
+  tag constant from `_compiler.py` and round-trips a minimal payload per tag
+  through the extension's constructors, so a tag added or renumbered on the
+  Python side without a matching Rust arm fails here instead of surfacing as a
+  missed equivalence case. **A new tag needs an entry in its `_MIN_*` table**
+  (a completeness guard trips otherwise).
+- `tests/test_contract.py` — invariant *preconditions* (F_ARCHREVIEW R1–R7):
+  one-shot iterables are replayable, errors don't leak as wrong exception
+  types, cached compiled state doesn't diverge from live schema state,
+  `uninstall()` doesn't clobber foreign patches.
+- `tests/test_smoke.py` — quick install/uninstall + equivalence sanity check.
 
 ## Development
 
  - commit only after passing tests
- - for every big part create a new branch 
- - for every small task(feature) make a commit
- - do not commit thing that i'nt make functionality
+ - for every big part create a new branch
+ - for every small task (feature) make a commit
+ - do not commit changes that don't add functionality
