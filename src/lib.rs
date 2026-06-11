@@ -155,10 +155,7 @@ struct Serializer {
 // DumpSerializer → bound-method/field → schema). These helpers make the
 // cycle visible so the collector can break it.
 
-fn traverse_ctx(
-    ctx: &Ctx,
-    visit: &pyo3::PyVisit<'_>,
-) -> Result<(), pyo3::PyTraverseError> {
+fn traverse_ctx(ctx: &Ctx, visit: &pyo3::PyVisit<'_>) -> Result<(), pyo3::PyTraverseError> {
     visit.call(&ctx.missing)?;
     visit.call(&ctx.int_fn)?;
     visit.call(&ctx.float_fn)?;
@@ -166,10 +163,7 @@ fn traverse_ctx(
     Ok(())
 }
 
-fn traverse_element(
-    el: &Element,
-    visit: &pyo3::PyVisit<'_>,
-) -> Result<(), pyo3::PyTraverseError> {
+fn traverse_element(el: &Element, visit: &pyo3::PyVisit<'_>) -> Result<(), pyo3::PyTraverseError> {
     match el {
         Element::Temporal { func, format } => {
             if let Some(f) = func {
@@ -1062,7 +1056,11 @@ fn get_one<'py>(
     let type_ptr = obj.get_type().as_ptr() as usize;
     let cached = INDEXABLE_LAST.with(|c| {
         let (ptr, val) = c.get();
-        if ptr == type_ptr { Some(val) } else { None }
+        if ptr == type_ptr {
+            Some(val)
+        } else {
+            None
+        }
     });
     let has_getitem = match cached {
         Some(v) => v,
@@ -1213,6 +1211,15 @@ enum LoadElement {
     Boolean {
         truthy: Py<PyAny>,
         falsy: Py<PyAny>,
+    },
+    /// Nested schema with only ``@post_load`` hooks: deserialize the inner fields
+    /// natively in Rust (building a plain dict), then call the Python
+    /// ``post_load_fn`` callable once per record to produce the final value.
+    /// Eliminates the Python ``field.deserialize → inner.load → _patched_do_load``
+    /// call overhead for nested schemas whose only hook is ``@post_load``.
+    NestedPostLoad {
+        serializer: Box<LoadSerializer>,
+        post_load_fn: Py<PyAny>,
     },
 }
 
@@ -1459,7 +1466,10 @@ fn traverse_load_element(
         LoadElement::Uuid { uuid_class } => {
             visit.call(uuid_class)?;
         }
-        LoadElement::Temporal { internal_type, func } => {
+        LoadElement::Temporal {
+            internal_type,
+            func,
+        } => {
             visit.call(internal_type)?;
             visit.call(func)?;
         }
@@ -1509,6 +1519,13 @@ fn traverse_load_element(
         } => {
             traverse_load_serializer_inner(serializer, visit)?;
             visit.call(data_key)?;
+        }
+        LoadElement::NestedPostLoad {
+            serializer,
+            post_load_fn,
+        } => {
+            traverse_load_serializer_inner(serializer, visit)?;
+            visit.call(post_load_fn)?;
         }
         _ => {} // Passthrough, Str, Int, IntStrict, Float, Dict
     }
@@ -1790,9 +1807,7 @@ impl LoadSerializer {
                     // ``consumes_partial = false``, eliminating all derive calls).
                     let sub_partial_opt: Option<Partial> = if *consumes_partial {
                         match partial {
-                            Partial::Coll(_) => {
-                                Some(partial.derive(py, attr_name.bind(py))?)
-                            }
+                            Partial::Coll(_) => Some(partial.derive(py, attr_name.bind(py))?),
                             _ => None,
                         }
                     } else {
@@ -2015,9 +2030,7 @@ impl LoadSerializer {
             }
             let sub_partial_opt: Option<Partial> = if *consumes_partial {
                 match partial {
-                    Partial::Coll(_) => {
-                        Some(partial.derive(py, attr_name.bind(py))?)
-                    }
+                    Partial::Coll(_) => Some(partial.derive(py, attr_name.bind(py))?),
                     _ => None,
                 }
             } else {
@@ -2414,6 +2427,23 @@ impl LoadElement {
                     Err(fallback())
                 }
             }
+            LoadElement::NestedPostLoad {
+                serializer,
+                post_load_fn,
+            } => {
+                // Deserialize the inner fields natively, then call the Python
+                // post_load processor. Any error from either step defers to the
+                // pure-Python path via AccelFallback; KI/SystemExit propagates.
+                let dict = if serializer.many {
+                    serializer.run(ctx, value, true, partial)?
+                } else {
+                    serializer.run_one(ctx, value, partial)?.into_any()
+                };
+                post_load_fn
+                    .bind(py)
+                    .call1((dict,))
+                    .map_err(|e| to_fallback(py, e))
+            }
         }
     }
 }
@@ -2529,6 +2559,30 @@ impl LoadElement {
                 }
                 _ => Err(fallback()),
             },
+            LoadElement::NestedPostLoad {
+                serializer,
+                post_load_fn,
+            } => {
+                // Same as the dict path: deserialize inner fields off the JSON
+                // tree natively, then call the Python post_load processor.
+                let dict = if serializer.many {
+                    match jv {
+                        JsonValue::Array(a) => serializer.run_many_json(ctx, py, a, partial)?,
+                        _ => return Err(fallback()),
+                    }
+                } else {
+                    match jv {
+                        JsonValue::Object(o) => {
+                            serializer.run_one_json(ctx, py, o, partial)?.into_any()
+                        }
+                        _ => return Err(fallback()),
+                    }
+                };
+                post_load_fn
+                    .bind(py)
+                    .call1((dict,))
+                    .map_err(|e| to_fallback(py, e))
+            }
             // Scalars and the remaining wrappers (Enum/Pluck/Decimal/...): the
             // input is a leaf, so materialise it and reuse the exact pure path.
             _ => {
@@ -2578,6 +2632,7 @@ fn element_is_fusable(e: &LoadElement) -> bool {
     match e {
         LoadElement::Nested(serializer) => serializer_is_fusable(serializer),
         LoadElement::Pluck { serializer, .. } => serializer_is_fusable(serializer),
+        LoadElement::NestedPostLoad { serializer, .. } => serializer_is_fusable(serializer),
         LoadElement::List(inner, _) => element_is_fusable(inner),
         LoadElement::Tuple(elements) => elements.iter().all(element_is_fusable),
         LoadElement::DictTyped { key_el, val_el, .. } => {
@@ -2595,7 +2650,9 @@ fn element_is_fusable(e: &LoadElement) -> bool {
 /// of ``element_is_fusable``.
 fn element_consumes_partial(e: &LoadElement) -> bool {
     match e {
-        LoadElement::Nested(_) | LoadElement::Pluck { .. } => true,
+        LoadElement::Nested(_) | LoadElement::Pluck { .. } | LoadElement::NestedPostLoad { .. } => {
+            true
+        }
         LoadElement::List(inner, _) => element_consumes_partial(inner),
         LoadElement::Tuple(elements) => elements.iter().any(element_consumes_partial),
         LoadElement::DictTyped { key_el, val_el, .. } => {
@@ -2864,6 +2921,15 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
                 val_validators: parse_validator_list(py, &t.get_item(4)?)?,
             })
         }
+        20 => {
+            // (20, payload, post_load_fn)
+            let serializer = parse_load_serializer(py, &t.get_item(1)?)?;
+            let post_load_fn = t.get_item(2)?.unbind();
+            Ok(LoadElement::NestedPostLoad {
+                serializer: Box::new(serializer),
+                post_load_fn,
+            })
+        }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown load element tag {other}"
         ))),
@@ -2874,7 +2940,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 18;
+const PROTOCOL_VERSION: u32 = 19;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -7,13 +7,11 @@ schema state, and uninstall must not clobber foreign patches.
 """
 
 import gc
-import warnings
 import weakref
 
 import pytest
 
 import marshmallow_core
-import marshmallow_core._compiler as accel
 from marshmallow import Schema, ValidationError, fields
 
 
@@ -25,6 +23,7 @@ def _install():
 
 
 # ─── R1: one-shot iterables ───────────────────────────────────────────────────
+
 
 class _TupleSchema(Schema):
     t = fields.Tuple((fields.Integer(), fields.Integer()))
@@ -55,6 +54,7 @@ def test_r1_dumps_generator_with_mid_stream_fallback():
 
 def test_r1_generator_no_fallback_passthrough():
     """With no fallback triggered, generator inputs should work as lists do."""
+
     class _S(Schema):
         i = fields.Integer()
 
@@ -65,18 +65,21 @@ def test_r1_generator_no_fallback_passthrough():
 
 # ─── N1: inner generator + dump fallback must not silently drop records ───────
 
+
 class _InnerS(Schema):
     x = fields.Integer()
 
 
 class _N1NestedSchema(Schema):
     """Generator in Nested(many=True); DictTyped sibling triggers fallback."""
+
     a = fields.Nested(_InnerS, many=True)
     b = fields.Dict(keys=fields.String(), values=fields.Integer())
 
 
 class _N1ListSchema(Schema):
     """Generator in List; DictTyped sibling triggers fallback."""
+
     a = fields.List(fields.Integer())
     b = fields.Dict(keys=fields.String(), values=fields.Integer())
 
@@ -120,6 +123,7 @@ def test_n1_dumps_generator_in_nested_many_not_exhausted():
 
 
 # ─── R2: GC — schemas must be collectable after one op ────────────────────────
+
 
 class _FlatS(Schema):
     i = fields.Integer()
@@ -169,6 +173,7 @@ def test_r2_decimal_schema_collected():
 
 # ─── R3: depth budget in the fused JSON writer ────────────────────────────────
 
+
 def test_r3_deep_nesting_dumps_fallback():
     """dumps() of a deeply nested Raw value must not SIGSEGV.
 
@@ -179,6 +184,7 @@ def test_r3_deep_nesting_dumps_fallback():
     (a) The call completes without crashing the process (no SIGSEGV).
     (b) The output matches what stock dumps would produce.
     """
+
     class _Raw(Schema):
         v = fields.Raw()
 
@@ -206,6 +212,7 @@ def test_r3_deep_nesting_dumps_fallback():
 
 # ─── R4: stale cached partial ─────────────────────────────────────────────────
 
+
 class _PartialS(Schema):
     a = fields.Integer(required=True)
     b = fields.Integer(required=True)
@@ -226,10 +233,12 @@ def test_r4_partial_mutation_detected():
 
 # ─── N3: invalidate() clears the per-instance cache ─────────────────────────
 
+
 def test_n3_invalidate_clears_cache():
     """invalidate(schema) must drop all three cache keys so the next call
     recompiles against the schema's current state.
     """
+
     class _S(Schema):
         i = fields.Integer()
 
@@ -254,6 +263,7 @@ def test_n3_invalidate_clears_cache():
 
 def test_n3_invalidate_noop_on_unwarmed_schema():
     """invalidate() on a schema that has never been used must not raise."""
+
     class _S(Schema):
         i = fields.Integer()
 
@@ -261,6 +271,7 @@ def test_n3_invalidate_noop_on_unwarmed_schema():
 
 
 # ─── R5: root _deserialize override ──────────────────────────────────────────
+
 
 def test_r5_root_deserialize_override_respected():
     """A root schema with a _deserialize override must not have it silently bypassed."""
@@ -281,6 +292,7 @@ def test_r5_root_deserialize_override_respected():
 
 # ─── R6: lone surrogates in loads ────────────────────────────────────────────
 
+
 def test_r6_loads_lone_surrogate_passthrough():
     """loads() of a str containing lone surrogates must match stock behaviour.
 
@@ -289,6 +301,7 @@ def test_r6_loads_lone_surrogate_passthrough():
     stock ``json.loads``. Stock ``json.loads`` (which operates on the Python str
     directly) succeeds on this input.
     """
+
     class _Str(Schema):
         a = fields.String()
 
@@ -300,6 +313,7 @@ def test_r6_loads_lone_surrogate_passthrough():
 
 
 # ─── R7: uninstall stacking ───────────────────────────────────────────────────
+
 
 def test_r7_uninstall_leaves_foreign_patch_in_place():
     """uninstall() must not clobber a wrapper installed after our install()."""

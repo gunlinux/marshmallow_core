@@ -505,6 +505,7 @@ def uninstall() -> None:
     global _orig_serialize, _orig_do_load, _orig_dumps, _orig_loads
     if not is_installed():
         return
+
     # R7: check identity before restoring; if something else patched Schema after
     # our install(), restoring blindly would clobber its wrapper. Leave that
     # attribute alone and warn instead.

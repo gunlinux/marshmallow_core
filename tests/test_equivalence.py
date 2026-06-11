@@ -66,6 +66,12 @@ class Obj:
     def __init__(self, **kw):
         self.__dict__.update(kw)
 
+    def __eq__(self, other):
+        return isinstance(other, Obj) and self.__dict__ == other.__dict__
+
+    def __repr__(self):
+        return f"Obj({self.__dict__!r})"
+
 
 def _dump_both(schema_factory, obj, *, many=False, monkeypatch):
     """Return (accelerated, pure_python) dumps of ``obj``."""
@@ -1543,6 +1549,97 @@ def test_load_post_load_only_uses_core(monkeypatch):
     assert accelerated == pure == {"i": 5, "doubled": 10}
 
 
+# ---- NestedPostLoad (_L_NESTED_POST_LOAD) ------------------------------------
+
+
+class _PostLoadInner(Schema):
+    """Schema with only a @post_load hook — the NestedPostLoad target."""
+
+    x = fields.Integer()
+    y = fields.String()
+
+    @post_load
+    def make_obj(self, data, **kwargs):
+        return Obj(**data)
+
+
+class _PostLoadOuter(Schema):
+    name = fields.String()
+    inner = fields.Nested(_PostLoadInner())
+
+
+class _PostLoadOuterMany(Schema):
+    name = fields.String()
+    items = fields.List(fields.Nested(_PostLoadInner()))
+
+
+def test_nested_post_load_is_native():
+    """A nested @post_load-only schema compiles to a NestedPostLoad element."""
+    schema = _PostLoadOuter()
+    schema.load({"name": "t", "inner": {"x": 1, "y": "a"}})
+    if accel.is_available():
+        plan = vars(schema).get("_mc_load_plan")
+        assert plan is not None, "schema should be accelerated"
+
+
+def test_nested_post_load_equivalence(monkeypatch):
+    data = {"name": "Alice", "inner": {"x": 7, "y": "hi"}}
+    accelerated, pure = _load_both(_PostLoadOuter, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+    assert isinstance(accelerated["inner"], Obj)
+    assert accelerated["inner"].x == 7
+
+
+def test_nested_post_load_none_allowed(monkeypatch):
+    class S(Schema):
+        inner = fields.Nested(_PostLoadInner(), allow_none=True)
+
+    accelerated, pure = _load_both(S, {"inner": None}, monkeypatch=monkeypatch)
+    assert accelerated == pure == {"inner": None}
+
+
+def test_nested_post_load_many(monkeypatch):
+    """Nested field with many=True and @post_load on inner schema."""
+
+    class Inner(Schema):
+        v = fields.Integer()
+
+        @post_load
+        def wrap(self, data, **kwargs):
+            return Obj(**data)
+
+    class Outer(Schema):
+        items = fields.Nested(Inner(), many=True)
+
+    data = {"items": [{"v": 1}, {"v": 2}, {"v": 3}]}
+    accelerated, pure = _load_both(Outer, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+    assert all(isinstance(i, Obj) for i in accelerated["items"])
+
+
+def test_nested_post_load_via_list_field(monkeypatch):
+    """List(Nested(@post_load-schema)) — the List wraps the NestedPostLoad."""
+    data = {"name": "x", "items": [{"x": 1, "y": "a"}, {"x": 2, "y": "b"}]}
+    accelerated, pure = _load_both(_PostLoadOuterMany, data, monkeypatch=monkeypatch)
+    assert accelerated == pure
+    assert all(isinstance(i, Obj) for i in accelerated["items"])
+
+
+def test_nested_post_load_root_schema_equivalence(monkeypatch):
+    """Root @post_load schema unchanged — accelerated via _accelerated_load."""
+    accelerated, pure = _load_both(
+        _PostLoadInner, {"x": 3, "y": "z"}, monkeypatch=monkeypatch
+    )
+    assert accelerated == pure
+    assert isinstance(accelerated, Obj)
+
+
+def test_nested_post_load_error_falls_back(monkeypatch):
+    """An invalid inner value still raises a ValidationError (not AccelFallback)."""
+    with pytest.raises(ValidationError):
+        _PostLoadOuter().load({"name": "x", "inner": {"x": "not-an-int", "y": "a"}})
+
+
 def test_load_callback_base_exception_not_swallowed():
     """A ``BaseException`` (not ``Exception``) from a callback field must
     propagate unchanged, not be swallowed as ``AccelFallback`` and the field
@@ -2206,6 +2303,14 @@ def test_loads_nested_list_equivalence(monkeypatch):
     )
     fused, pure = _loads_both(LoadsNested, payload, monkeypatch=monkeypatch)
     assert fused == pure
+
+
+def test_loads_nested_post_load_equivalence(monkeypatch):
+    """Fused JSON loads path through a NestedPostLoad element."""
+    payload = '{"name": "Bob", "inner": {"x": 5, "y": "hi"}}'
+    fused, pure = _loads_both(_PostLoadOuter, payload, monkeypatch=monkeypatch)
+    assert fused == pure
+    assert isinstance(fused["inner"], Obj)
 
 
 class LoadsContainers(Schema):

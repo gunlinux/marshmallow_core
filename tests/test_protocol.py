@@ -109,6 +109,7 @@ _MIN_LOAD_ELEMENT = {
     accel._L_TIMEDELTA: (accel._L_TIMEDELTA, _noop),
     accel._L_DATETIME_AWARENESS: (accel._L_DATETIME_AWARENESS, _noop),
     accel._L_IPADDR: (accel._L_IPADDR, _noop),
+    accel._L_NESTED_POST_LOAD: (accel._L_NESTED_POST_LOAD, _LOAD_SUBPAYLOAD, _noop),
 }
 
 # Minimal valid validator spec per validator tag (value -> spec).

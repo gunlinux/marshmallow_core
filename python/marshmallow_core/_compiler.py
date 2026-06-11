@@ -29,6 +29,7 @@ on *dump* the fallback is limited (see ``src/lib.rs``).
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import os
 import typing
 import uuid
@@ -61,7 +62,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``marshmallow_core._core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 18
+_EXPECTED_PROTOCOL = 19
 
 
 class _NoFallbackError(Exception):
@@ -113,6 +114,7 @@ _L_PLUCK = 16
 _L_TIMEDELTA = 17
 _L_DATETIME_AWARENESS = 18
 _L_IPADDR = 19
+_L_NESTED_POST_LOAD = 20
 
 # Native load validator tags (a distinct tag space; see ``_build_validator``).
 _V_RANGE = 0
@@ -191,6 +193,54 @@ _LOAD_TEMPORAL_TYPES: frozenset[type] = frozenset(
         ma_fields.Time,
     }
 )
+
+
+def _detect_ma4() -> bool:
+    """True if the installed marshmallow is 4.x (probes the same signature as _patch._MA4)."""
+    from marshmallow.schema import Schema as _Schema
+
+    method = getattr(_Schema, "_invoke_schema_validators", None)
+    if method is None:
+        return False
+    try:
+        return "pass_collection" in frozenset(inspect.signature(method).parameters)
+    except (TypeError, ValueError):
+        return False
+
+
+#: Whether the installed marshmallow is 4.x. Used to decide whether
+#: ``_invoke_load_processors`` accepts an ``unknown`` keyword argument.
+_MA4_LOAD: typing.Final = _detect_ma4()
+
+
+def _make_nested_post_load_fn(inner_schema: typing.Any, many: bool) -> typing.Any:
+    """Return a ``(data,) -> result`` callable that runs *inner_schema*'s
+    ``@post_load`` processors after the Rust per-field step.
+
+    Built once at compile time and stored in the ``_L_NESTED_POST_LOAD``
+    element; the Rust core calls it once per nested record (after building the
+    plain dict) to produce the final post-processed value.
+
+    Returns ``None`` if the schema has no ``POST_LOAD`` hooks (shouldn't happen
+    given the caller's guard, but defensive).
+    """
+    if not inner_schema._hooks.get(POST_LOAD):
+        return None
+    _unknown_kwarg = {"unknown": inner_schema.unknown} if _MA4_LOAD else {}
+    _schema = inner_schema
+    _many = many
+
+    def _post_process(data: typing.Any) -> typing.Any:
+        return _schema._invoke_load_processors(
+            POST_LOAD,
+            data,
+            many=_many,
+            original_data=data,
+            partial=False,
+            **_unknown_kwarg,
+        )
+
+    return _post_process
 
 
 def is_available() -> bool:
@@ -591,9 +641,32 @@ def _build_load_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | N
         payload = _build_load_payload(
             inner_schema, many=many, unknown=unknown, stack=stack
         )
-        if payload is None:
-            return None
-        return (_L_NESTED, payload)
+        if payload is not None:
+            return (_L_NESTED, payload)
+        # NestedPostLoad: inner schema has *only* POST_LOAD hooks and no load
+        # overrides — compile the fields natively and store the post-processor.
+        # The Rust element runs the inner fields in Rust, then calls the Python
+        # post_load callable once per record to produce the final value.
+        if (
+            inner_schema._hooks.get(POST_LOAD)
+            and not any(
+                inner_schema._hooks.get(h)
+                for h in (PRE_LOAD, VALIDATES, VALIDATES_SCHEMA)
+            )
+            and not _overrides_native_load(inner_schema)
+        ):
+            post_payload = _build_load_payload(
+                inner_schema,
+                many=many,
+                unknown=unknown,
+                stack=stack,
+                _for_nested_post_load=True,
+            )
+            if post_payload is not None:
+                post_fn = _make_nested_post_load_fn(inner_schema, many)
+                if post_fn is not None:
+                    return (_L_NESTED_POST_LOAD, post_payload, post_fn)
+        return None
     if ftype is ma_fields.List:
         inner = field.inner
         if _has_field_processors(inner):
@@ -711,6 +784,7 @@ def _build_load_payload(
     unknown: str | None = None,
     stack: tuple[type, ...] = (),
     is_root: bool = False,
+    _for_nested_post_load: bool = False,
 ) -> tuple | None:
     """Build ``(many, unknown_code, known_keys, specs)`` for one schema level.
 
@@ -732,9 +806,13 @@ def _build_load_payload(
 
         if type(schema)._deserialize is not _Schema._deserialize:
             return None
-    if not is_root and (
-        any(schema._hooks[hook] for hook in _LOAD_HOOKS)
-        or _overrides_native_load(schema)
+    if (
+        not is_root
+        and not _for_nested_post_load
+        and (
+            any(schema._hooks[hook] for hook in _LOAD_HOOKS)
+            or _overrides_native_load(schema)
+        )
     ):
         return None  # nested load != _deserialize once hooks/an override are involved
     if not is_root and schema.partial:
