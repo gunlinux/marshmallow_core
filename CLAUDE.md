@@ -191,3 +191,6 @@ The other three files cover what equivalence can't:
  - for every big part create a new branch
  - for every small task (feature) make a commit
  - do not commit changes that don't add functionality
+ - never commit unnecessary files to the repository — temp markdown notes,
+   debug/scratch scripts, one-off benchmark dumps, etc. Delete them when done
+   or keep them untracked (add to `.gitignore` if they recur)
