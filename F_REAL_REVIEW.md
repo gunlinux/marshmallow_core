@@ -94,7 +94,7 @@ Reading of the floors:
 
 ## Findings
 
-### N1 (critical) — nested one-shot iterables + dump fallback = silent data loss [measured]
+### N1 (critical) **[DONE]** — nested one-shot iterables + dump fallback = silent data loss [measured]
 
 R1 materializes a one-shot iterable only at the **top level** of
 `_patched_serialize`/`_patched_dumps` (`many and not isinstance(obj,
@@ -142,7 +142,7 @@ equivalence case (generator in nested-many + each fallback trigger as the
 sibling) and a `test_contract.py` precondition test (this is R1's missing
 half).
 
-### N2 (low) — `Boolean` load swallows `KeyboardInterrupt`/`SystemExit`
+### N2 (low) **[DONE]** — `Boolean` load swallows `KeyboardInterrupt`/`SystemExit`
 
 `LoadElement::Boolean` maps *any* error from the `truthy`/`falsy` containment
 check to `AccelFallback` (`.map_err(|_| fallback())`), unlike every other
@@ -151,7 +151,7 @@ KeyboardInterrupt/SystemExit propagate. A value whose `__hash__`/`__eq__`
 raises KI during `value in truthy` gets the interrupt silently eaten and the
 load retried. Pathological input, two-line fix: use `to_fallback` there.
 
-### N3 (medium) — the per-instance compile cache has no invalidation; document the boundary
+### N3 (medium) **[DONE]** — the per-instance compile cache has no invalidation; document the boundary
 
 `_mc_dump_serializer` / `_mc_dump_json` / `_mc_load_plan` are built once per
 instance and never invalidated. R4 fixed the one *runtime argument* that was
@@ -169,7 +169,7 @@ schema instance is treated as immutable after its first dump/load; mutate it
 `marshmallow_core.invalidate(schema)` (three `vars(schema).pop` calls) for
 the rare legitimate reconfigure-in-place user.
 
-### N4 (medium) — the `_accelerated_load` guard catches renames, not semantics
+### N4 (medium) **[DONE]** — the `_accelerated_load` guard catches renames, not semantics
 
 `_accel_load_supported()` verifies the three private invokers exist with the
 expected kwargs. A future marshmallow that keeps the signatures but changes
@@ -181,7 +181,7 @@ against marshmallow's `--pre`/git-main so the suite fails *before* a release
 ships, and pin the lowest supported 3.x in the matrix so both line endpoints
 are always exercised.
 
-### N5 (medium, perf) — unknown-key handling on the dict path is O(keys) Python-API calls
+### N5 (medium, perf) **[SKIPPED — profiled]** — unknown-key handling on the dict path is O(keys) Python-API calls
 
 (Carried from old ARCH B3, still open.) `run_one` under `RAISE` re-walks
 `data.keys()` calling `frozenset.__contains__` per key; under `INCLUDE` it
@@ -191,6 +191,10 @@ the same index (one `HashMap` probe per key on the Rust side for exact-str
 keys) instead of the per-key Python set lookups. Only matters for wide
 payloads under RAISE/INCLUDE; profile before building (the `api` case is the
 one to watch: dump 15.7µs / load 12.7µs core-side).
+
+**Profiled 2026-06-11**: api load now 12.34µs core-side, 307.92µs stock =
+25x. The api case is already at the N5-motivated floor; no regression visible.
+Building the `data_key_index` port is not justified by current numbers.
 
 ### N6 (low) — `INCLUDE` key-order parity is approximate
 
@@ -232,10 +236,9 @@ no partial work is observable. Add that family alongside the N1 fix.
 
 ## Priority order
 
-1. **N1** — fix + equivalence + contract tests (critical; silent data loss).
-2. **N2** — two-line `to_fallback` consistency fix; fold into the N1 PR.
-3. **N3** — document the immutable-after-first-use boundary (README +
-   CLAUDE.md), optional `invalidate()` helper.
-4. **N4** — CI: marshmallow `--pre` job + lowest-3.x pin.
-5. **N5** — profile, then (only if the api case shows it) port the
-   `data_key_index` bucket fill to the dict path.
+1. **N1** ✅ — fix + equivalence + contract tests (critical; silent data loss).
+2. **N2** ✅ — two-line `to_fallback` consistency fix; folded into the N1 commit.
+3. **N3** ✅ — documented the immutable-after-first-use boundary (README +
+   CLAUDE.md); exposed `marshmallow_core.invalidate(schema)`.
+4. **N4** ✅ — CI: marshmallow `--pre` job + lowest-3.x pin.
+5. **N5** ⏭ — profiled; api load at 25x is already excellent. Not building.
