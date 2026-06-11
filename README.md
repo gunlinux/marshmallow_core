@@ -37,7 +37,13 @@ marshmallow_core.uninstall()    # restore the stock pure-Python methods
   natively stays a callback, so output is behaviour-identical. The compiled plan
   is cached **per instance**, so reuse schema instances rather than constructing a
   new `Schema()` per call — otherwise every call recompiles (stock marshmallow
-  rewards instance reuse too).
+  rewards instance reuse too). A schema instance is treated as **immutable
+  after its first accelerated call**: mutating fields or their validators in
+  place afterwards is not reflected in the cached plan (the pure-Python path
+  always reads live state, so the two paths would diverge silently). If you must
+  reconfigure an instance in place, call `marshmallow_core.invalidate(schema)` to
+  drop the cache and force a recompile on the next call, or simply build a fresh
+  `Schema()` instance.
 - Both cores handle the happy path and raise an internal `AccelFallback` on any
   error/edge case, so marshmallow re-runs the unchanged pure-Python path and
   every error message and value matches exactly. (Dump has no side effects — it

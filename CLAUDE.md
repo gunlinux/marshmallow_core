@@ -164,6 +164,19 @@ for every input it accepts, and must defer on any shape it does not.
   non-`json` render module, extra kwargs, or big-int payloads, since jiter is
   built without `num-bigint` to keep its pyo3 optional dep out of our build).
 
+### Per-instance cache contract (N3)
+
+The compiled dump/load plan is built once per schema *instance* on first use
+and cached on `vars(schema)`. **A schema instance is immutable after its first
+accelerated call.** Mutating `schema.fields["x"].validators` (or any other
+field state) after the first `dump`/`load` is not reflected in the cached plan
+— the native path keeps using the compiled-at-first-use snapshot while the
+pure-Python path reads live state. This is a contract boundary, not a bug;
+recompiling per call would erase the speedup and detecting arbitrary field
+mutation is not tractable. The fix is to build a fresh `Schema()` instance or
+call `marshmallow_core.invalidate(schema)` (drops all three cache keys and
+forces a recompile on the next call) before reconfiguring an existing instance.
+
 ## Testing conventions
 
 `tests/test_equivalence.py` is the source of truth: an autouse fixture calls

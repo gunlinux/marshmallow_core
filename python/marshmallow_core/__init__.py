@@ -22,9 +22,9 @@ a no-op even when installed.
 from __future__ import annotations
 
 from marshmallow_core._compiler import is_available
-from marshmallow_core._patch import install, is_installed, uninstall
+from marshmallow_core._patch import install, invalidate, is_installed, uninstall
 
-__all__ = ["install", "is_available", "is_installed", "uninstall"]
+__all__ = ["install", "invalidate", "is_available", "is_installed", "uninstall"]
 
 try:
     from importlib.metadata import version as _pkg_version

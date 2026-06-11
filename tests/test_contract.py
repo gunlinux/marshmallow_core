@@ -224,6 +224,42 @@ def test_r4_partial_mutation_detected():
     assert "a" in exc_info.value.messages
 
 
+# ─── N3: invalidate() clears the per-instance cache ─────────────────────────
+
+def test_n3_invalidate_clears_cache():
+    """invalidate(schema) must drop all three cache keys so the next call
+    recompiles against the schema's current state.
+    """
+    class _S(Schema):
+        i = fields.Integer()
+
+    s = _S()
+    s.load({"i": 1})  # populates _mc_load_plan
+    s.dump({"i": 1})  # populates _mc_dump_serializer and _mc_dump_json
+    cache_before = set(vars(s))
+    assert "_mc_load_plan" in cache_before
+    assert "_mc_dump_serializer" in cache_before
+
+    marshmallow_core.invalidate(s)
+
+    cache_after = set(vars(s))
+    assert "_mc_load_plan" not in cache_after
+    assert "_mc_dump_serializer" not in cache_after
+    assert "_mc_dump_json" not in cache_after
+
+    # After invalidation the next call must recompile (cache repopulated).
+    s.load({"i": 2})
+    assert "_mc_load_plan" in vars(s)
+
+
+def test_n3_invalidate_noop_on_unwarmed_schema():
+    """invalidate() on a schema that has never been used must not raise."""
+    class _S(Schema):
+        i = fields.Integer()
+
+    marshmallow_core.invalidate(_S())  # must not raise
+
+
 # ─── R5: root _deserialize override ──────────────────────────────────────────
 
 def test_r5_root_deserialize_override_respected():

@@ -459,6 +459,26 @@ def _patched_loads(
     )
 
 
+def invalidate(schema: Schema) -> None:
+    """Clear the compiled dump/load plan cached on *schema*.
+
+    The core builds one plan per schema *instance* on the first ``dump``/
+    ``load`` call and caches it on the instance forever.  A schema is treated
+    as **immutable after its first accelerated call**: mutating fields or their
+    validators afterwards is not reflected in the cached plan (the pure-Python
+    path always reads live state, so the two paths would diverge).
+
+    If you must reconfigure a schema in place — e.g. appending a validator or
+    changing a field — call ``invalidate(schema)`` to drop all three caches and
+    force a recompile on the next call.  Building a fresh ``Schema()`` instance
+    is the simpler alternative.
+    """
+    cache = vars(schema)
+    cache.pop("_mc_dump_serializer", None)
+    cache.pop("_mc_dump_json", None)
+    cache.pop("_mc_load_plan", None)
+
+
 def install() -> None:
     """Patch the Rust core into ``marshmallow.Schema`` (idempotent)."""
     global _orig_serialize, _orig_do_load, _orig_dumps, _orig_loads
