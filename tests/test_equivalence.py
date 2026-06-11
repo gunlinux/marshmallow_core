@@ -2284,15 +2284,20 @@ def test_loads_fusable_flag_tracks_callback_fields(monkeypatch):
     class NestedCallback(Schema):
         inner = fields.Nested(WithCallback)
 
-    assert accel.build_load_deserializer(AllNative()).fusable is True
-    assert accel.build_load_deserializer(WithCallback()).fusable is False
-    assert accel.build_load_deserializer(NestedCallback()).fusable is False
+    # The ``fusable`` flag is a core-only construct: with the extension disabled
+    # (``MARSHMALLOW_NO_ACCEL``) ``build_load_deserializer`` returns ``None``.
+    # Guard those assertions on availability; the equivalence below holds either way.
+    if accel.is_available():
+        assert accel.build_load_deserializer(AllNative()).fusable is True
+        assert accel.build_load_deserializer(WithCallback()).fusable is False
+        assert accel.build_load_deserializer(NestedCallback()).fusable is False
 
-    # The cached plan carries the flag (4th element), and the non-fusable schema
-    # still loads correctly via the stock path.
-    schema = WithCallback()
-    schema.loads('{"a": 1, "c": 5}')
-    assert vars(schema)["_mc_load_plan"][3] is False
+        # The cached plan carries the flag as its 4th element.
+        schema = WithCallback()
+        schema.loads('{"a": 1, "c": 5}')
+        assert vars(schema)["_mc_load_plan"][3] is False
+
+    # The non-fusable schema still loads correctly via the stock path.
     fused, pure = _loads_both(WithCallback, '{"a": 1, "c": 5}', monkeypatch=monkeypatch)
     assert fused == pure
 
