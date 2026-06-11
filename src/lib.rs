@@ -1204,11 +1204,7 @@ impl LoadDeserializer {
         let ctx = Ctx::new(py, missing)?;
         let root = parse_load_serializer(py, payload)?;
         let fusable = serializer_is_fusable(&root);
-        Ok(LoadDeserializer {
-            ctx,
-            root,
-            fusable,
-        })
+        Ok(LoadDeserializer { ctx, root, fusable })
     }
 
     /// Whether ``run_json`` can complete for this schema (no callback fields
