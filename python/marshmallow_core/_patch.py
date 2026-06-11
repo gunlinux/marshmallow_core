@@ -188,6 +188,11 @@ def _has_dump_hooks(schema: Schema) -> bool:
 
 
 def _patched_serialize(self: Schema, obj: typing.Any, *, many: bool = False):
+    # R1: materialize one-shot iterables before the core might partially consume
+    # them; if an element triggers AccelFallback the pure-Python re-run needs to
+    # replay the same sequence from the start.
+    if many and not isinstance(obj, (list, tuple)):
+        obj = list(obj)
     cache = vars(self)
     ds = cache.get("_mc_dump_serializer", _UNSET)
     if ds is _UNSET:
@@ -211,21 +216,22 @@ def _load_plan(self: Schema) -> typing.Any:
     """Build (once, cached on the instance) or fetch this schema's load plan.
 
     Returns ``None`` when the schema isn't compilable (always pure Python), else
-    a tuple ``(deserializer, has_load_hooks, default_core_partial, json_fusable)``
-    — the deserializer plus the three per-call constants we'd otherwise recompute
-    every load. ``json_fusable`` is whether the whole spec tree is callback-free,
-    so ``loads`` can skip the jiter parse for a schema that would only defer
-    (ARCH.md B2). Shared by :func:`_patched_do_load` and :func:`_patched_loads`
-    so the cached tuple shape can't drift between them.
+    a tuple ``(deserializer, has_load_hooks, json_fusable)`` — the deserializer
+    plus the two per-call constants. ``json_fusable`` is whether the whole spec
+    tree is callback-free, so ``loads`` can skip the jiter parse for a schema
+    that would only defer (ARCH.md B2). Shared by :func:`_patched_do_load` and
+    :func:`_patched_loads` so the cached tuple shape can't drift between them.
+
+    ``partial`` is intentionally *not* cached here (R4): ``_core_partial`` is
+    two isinstance checks, and caching ``self.partial`` means mutations between
+    calls silently skip validation.
     """
     cache = vars(self)
     plan = cache.get("_mc_load_plan", _UNSET)
     if plan is _UNSET:
         ld = _compiler.build_load_deserializer(self)
         plan = cache["_mc_load_plan"] = (
-            None
-            if ld is None
-            else (ld, _has_load_hooks(self), _core_partial(self.partial), ld.fusable)
+            None if ld is None else (ld, _has_load_hooks(self), ld.fusable)
         )
     return plan
 
@@ -241,10 +247,7 @@ def _patched_do_load(
 ):
     many = bool(self.many) if many is None else bool(many)
     unknown = self.unknown if unknown is None else unknown
-    # Track whether the caller supplied ``partial`` so we can reuse the cached
-    # ``_core_partial(self.partial)`` on the common "use the schema default" call.
-    partial_is_default = partial is None
-    if partial_is_default:
+    if partial is None:
         partial = self.partial
     # The core is compiled for this schema's own ``unknown``; ``partial`` (boolean
     # or a name collection) is threaded as a runtime argument. Hook-bearing
@@ -253,27 +256,27 @@ def _patched_do_load(
     if unknown == self.unknown and _partial_is_supported(partial):
         plan = _load_plan(self)
         if plan is not None:
-            ld, has_hooks, default_core_partial, _fusable = plan
-            try:
-                if has_hooks:
-                    # On a marshmallow whose ``_do_load`` internals we haven't
-                    # verified, don't trust the transcription: fall through to
-                    # the unchanged pure-Python load below without raising an
-                    # exception (F_SPEEDUP F2: raising AccelFallback here costs
-                    # ~0.5µs of exception overhead on every hook-bearing load,
-                    # making it 16% slower than stock on an unverified build).
-                    if _ACCEL_LOAD_VERIFIED:
+            ld, has_hooks, _fusable = plan
+            if has_hooks:
+                # Hook-bearing schemas use the hook-aware accelerated path only
+                # when the running marshmallow's _do_load internals have been
+                # verified (F_SPEEDUP F2). On an unverified build, go straight to
+                # _orig_do_load without exception overhead (raising AccelFallback
+                # costs ~0.5µs per call, making it 16% slower than stock).
+                if _ACCEL_LOAD_VERIFIED:
+                    try:
                         return _accelerated_load(
                             self, ld, data, many, partial, unknown, postprocess
                         )
-                core_partial = (
-                    default_core_partial
-                    if partial_is_default
-                    else _core_partial(partial)
-                )
-                return ld.run(data, many, core_partial)
-            except _compiler.AccelFallback:
-                pass  # off the happy path -> unchanged pure-Python load below
+                    except _compiler.AccelFallback:
+                        pass  # per-field edge case → pure Python below
+            else:
+                # R4: recompute _core_partial live (two isinstance checks) rather
+                # than using a cached value; self.partial can change between calls.
+                try:
+                    return ld.run(data, many, _core_partial(partial))
+                except _compiler.AccelFallback:
+                    pass  # off the happy path → unchanged pure-Python load below
     return _orig_do_load(
         self,
         data,
@@ -385,6 +388,11 @@ def _accelerated_load(
 def _patched_dumps(
     self: Schema, obj: typing.Any, *args, many: bool | None = None, **kwargs
 ):
+    # R1: materialize one-shot iterables before the core or the fallback consumes
+    # them; both paths must replay the same sequence.
+    eff_many = bool(self.many) if many is None else bool(many)
+    if eff_many and not isinstance(obj, (list, tuple)):
+        obj = list(obj)
     # Only fuse the default ``json.dumps`` call: any extra positional/keyword
     # argument (indent=, sort_keys=, cls=, ...) or a non-stdlib render module
     # could change the output, so defer to ``dump`` + ``render_module.dumps``.
@@ -402,7 +410,7 @@ def _patched_dumps(
             js = cache["_mc_dump_json"] = _compiler.build_dump_json_serializer(self)
         if js is not None:
             try:
-                return js.run_json(obj, bool(self.many) if many is None else bool(many))
+                return js.run_json(obj, eff_many)
             except _compiler.AccelFallback:
                 pass  # value the JSON writer can't reproduce -> stock path below
     return _orig_dumps(self, obj, *args, many=many, **kwargs)
@@ -434,7 +442,7 @@ def _patched_loads(
         # Reuse the same compiled plan the ``_do_load`` path builds/caches.
         plan = _load_plan(self)
         if plan is not None:
-            ld, has_hooks, default_core_partial, fusable = plan
+            ld, has_hooks, fusable = plan
             # Hook-bearing schemas can't fuse the JSON parse (the hooks run in
             # Python around the per-field step). A schema with a callback field
             # anywhere can't finish ``run_json`` either — it would parse the whole
@@ -442,11 +450,8 @@ def _patched_loads(
             # ``loads`` instead of wasting the jiter parse (ARCH.md B2).
             if not has_hooks and fusable:
                 many_v = bool(self.many) if many is None else bool(many)
-                core_partial = (
-                    default_core_partial if partial is None else _core_partial(partial)
-                )
                 try:
-                    return ld.run_json(json_data, many_v, core_partial)
+                    return ld.run_json(json_data, many_v, _core_partial(eff_partial))
                 except _compiler.AccelFallback:
                     pass  # any edge case -> unchanged stock loads below
     return _orig_loads(
@@ -475,13 +480,29 @@ def install() -> None:
 
 def uninstall() -> None:
     """Restore stock marshmallow's pure-Python ``Schema`` methods (idempotent)."""
+    import warnings
+
     global _orig_serialize, _orig_do_load, _orig_dumps, _orig_loads
     if not is_installed():
         return
-    Schema._serialize = _orig_serialize  # type: ignore[method-assign]
-    Schema._do_load = _orig_do_load  # type: ignore[method-assign]
-    Schema.dumps = _orig_dumps  # type: ignore[method-assign]
-    Schema.loads = _orig_loads  # type: ignore[method-assign]
+    # R7: check identity before restoring; if something else patched Schema after
+    # our install(), restoring blindly would clobber its wrapper. Leave that
+    # attribute alone and warn instead.
+    def _restore(attr: str, our_fn: typing.Any, saved: typing.Any) -> None:
+        if getattr(Schema, attr) is our_fn:
+            setattr(Schema, attr, saved)  # type: ignore[method-assign]
+        else:
+            warnings.warn(
+                f"marshmallow_core: Schema.{attr} was modified after install(); "
+                "not restoring to avoid clobbering a foreign patch.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
+    _restore("_serialize", _patched_serialize, _orig_serialize)
+    _restore("_do_load", _patched_do_load, _orig_do_load)
+    _restore("dumps", _patched_dumps, _orig_dumps)
+    _restore("loads", _patched_loads, _orig_loads)
     _orig_serialize = None
     _orig_do_load = None
     _orig_dumps = None

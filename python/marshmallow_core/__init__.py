@@ -25,4 +25,10 @@ from marshmallow_core._compiler import is_available
 from marshmallow_core._patch import install, is_installed, uninstall
 
 __all__ = ["install", "is_available", "is_installed", "uninstall"]
-__version__ = "0.1.8"
+
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("marshmallow_core")
+except Exception:
+    __version__ = "unknown"

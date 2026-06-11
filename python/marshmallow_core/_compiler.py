@@ -724,6 +724,14 @@ def _build_load_payload(
     """
     if schema.dict_class is not dict:
         return None  # the Rust side always builds plain dicts
+    if is_root:
+        # At root, load/do_load overrides are fine (they wrap the patched method),
+        # but _deserialize sits *below* the _do_load replacement point and is
+        # silently bypassed by the accelerated path (R5).
+        from marshmallow.schema import Schema as _Schema
+
+        if type(schema)._deserialize is not _Schema._deserialize:
+            return None
     if not is_root and (
         any(schema._hooks[hook] for hook in _LOAD_HOOKS)
         or _overrides_native_load(schema)

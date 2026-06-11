@@ -2292,10 +2292,12 @@ def test_loads_fusable_flag_tracks_callback_fields(monkeypatch):
         assert accel.build_load_deserializer(WithCallback()).fusable is False
         assert accel.build_load_deserializer(NestedCallback()).fusable is False
 
-        # The cached plan carries the flag as its 4th element.
+        # The cached plan carries the flag as its 3rd element (index 2).
+        # (R4 removed the stale ``default_core_partial`` slot from the tuple,
+        # shifting ``fusable`` from index 3 to index 2.)
         schema = WithCallback()
         schema.loads('{"a": 1, "c": 5}')
-        assert vars(schema)["_mc_load_plan"][3] is False
+        assert vars(schema)["_mc_load_plan"][2] is False
 
     # The non-fusable schema still loads correctly via the stock path.
     fused, pure = _loads_both(WithCallback, '{"a": 1, "c": 5}', monkeypatch=monkeypatch)

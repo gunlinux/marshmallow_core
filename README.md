@@ -129,11 +129,11 @@ the repo root with the compiled extension importable (`uvx maturin develop
 
 ```bash
 # stock-vs-core table for dump / load / dumps / loads on four schema shapes
-python -m performance.benchmark                       # all cases
-python -m performance.benchmark --number 20000 --only flat,list
+uv run python -m performance.benchmark                       # all cases
+uv run python -m performance.benchmark --number 20000 --only flat,list
 
 # coverage probe: per-field native vs callback for each schema shape
-python -m performance.analyze_paths
+uv run python -m performance.analyze_paths
 ```
 
 `benchmark.py` reports per-call microseconds for stock and core plus the speedup

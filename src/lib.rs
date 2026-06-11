@@ -149,10 +149,128 @@ struct Serializer {
     specs: Vec<FieldSpec>,
 }
 
-#[pyclass(module = "marshmallow_core._core")]
-pub struct DumpSerializer {
+// R2: GC traverse helpers for the dump side. CPython's cyclic GC can't see
+// through Rust-owned ``Py<T>`` refs, so without ``__traverse__``/``__clear__``
+// any schema that ever dumps leaks itself permanently (schema → instance dict →
+// DumpSerializer → bound-method/field → schema). These helpers make the
+// cycle visible so the collector can break it.
+
+fn traverse_ctx(
+    ctx: &Ctx,
+    visit: &pyo3::PyVisit<'_>,
+) -> Result<(), pyo3::PyTraverseError> {
+    visit.call(&ctx.missing)?;
+    visit.call(&ctx.int_fn)?;
+    visit.call(&ctx.float_fn)?;
+    visit.call(&ctx.dict_fn)?;
+    Ok(())
+}
+
+fn traverse_element(
+    el: &Element,
+    visit: &pyo3::PyVisit<'_>,
+) -> Result<(), pyo3::PyTraverseError> {
+    match el {
+        Element::Temporal { func, format } => {
+            if let Some(f) = func {
+                visit.call(f)?;
+            }
+            visit.call(format)?;
+        }
+        Element::Enum { inner, .. } => traverse_element(inner, visit)?,
+        Element::Decimal { serialize } => {
+            visit.call(serialize)?;
+        }
+        Element::Constant { constant } => {
+            visit.call(constant)?;
+        }
+        Element::TimeDelta { serialize } => {
+            visit.call(serialize)?;
+        }
+        Element::Nested(s, _) => traverse_dump_serializer(s, visit)?,
+        Element::Pluck {
+            serializer,
+            data_key,
+            ..
+        } => {
+            traverse_dump_serializer(serializer, visit)?;
+            visit.call(data_key)?;
+        }
+        Element::List(inner) => traverse_element(inner, visit)?,
+        Element::DictTyped { key_el, val_el } => {
+            if let Some(k) = key_el {
+                traverse_element(k, visit)?;
+            }
+            if let Some(v) = val_el {
+                traverse_element(v, visit)?;
+            }
+        }
+        Element::Tuple(els) => {
+            for e in els {
+                traverse_element(e, visit)?;
+            }
+        }
+        _ => {} // Passthrough, Str, Int, Float, Uuid, IpAddr, Dict
+    }
+    Ok(())
+}
+
+fn traverse_field_spec(
+    spec: &FieldSpec,
+    visit: &pyo3::PyVisit<'_>,
+) -> Result<(), pyo3::PyTraverseError> {
+    match spec {
+        FieldSpec::Native {
+            key,
+            key_parts,
+            output_key,
+            dump_default,
+            element,
+        } => {
+            visit.call(key)?;
+            if let Some(parts) = key_parts {
+                for p in parts {
+                    visit.call(p)?;
+                }
+            }
+            visit.call(output_key)?;
+            visit.call(dump_default)?;
+            traverse_element(element, visit)?;
+        }
+        FieldSpec::Callback {
+            name,
+            output_key,
+            field,
+        } => {
+            visit.call(name)?;
+            visit.call(output_key)?;
+            visit.call(field)?;
+        }
+    }
+    Ok(())
+}
+
+fn traverse_dump_serializer(
+    s: &Serializer,
+    visit: &pyo3::PyVisit<'_>,
+) -> Result<(), pyo3::PyTraverseError> {
+    visit.call(&s.accessor)?;
+    for spec in &s.specs {
+        traverse_field_spec(spec, visit)?;
+    }
+    Ok(())
+}
+
+// Inner content struct; wrapped in ``Option<Box<>>`` so ``__clear__`` can drop
+// all Python refs atomically by setting ``inner = None``.
+struct DsInner {
     ctx: Ctx,
     root: Serializer,
+}
+
+#[pyclass(module = "marshmallow_core._core")]
+pub struct DumpSerializer {
+    inner: Option<Box<DsInner>>,
 }
 
 #[pymethods]
@@ -162,17 +280,20 @@ impl DumpSerializer {
     fn new(py: Python<'_>, payload: &Bound<'_, PyAny>, missing: Py<PyAny>) -> PyResult<Self> {
         let ctx = Ctx::new(py, missing)?;
         let root = parse_serializer(py, payload)?;
-        Ok(DumpSerializer { ctx, root })
+        Ok(DumpSerializer {
+            inner: Some(Box::new(DsInner { ctx, root })),
+        })
     }
 
     /// Serialize ``obj`` (or each element if ``many``) into a dict (or list).
     fn run<'py>(&self, obj: &Bound<'py, PyAny>, many: bool) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.as_ref().expect("DumpSerializer cleared by GC");
         // Clear the per-invocation type cache before each top-level serialize
         // (F_SPEEDUP F3: all non-dict objects share this single-slot cache, so a
         // homogeneous many=True dump pays only one hasattr probe instead of
         // fields × records).
         INDEXABLE_LAST.with(|c| c.set((0, false)));
-        self.root.run(&self.ctx, obj, many)
+        inner.root.run(&inner.ctx, obj, many)
     }
 
     /// Serialize ``obj`` straight to a JSON string, fusing ``dump`` +
@@ -182,10 +303,25 @@ impl DumpSerializer {
     /// reproduce exactly (e.g. an unencodable value or a non-``str`` dict key),
     /// and the caller falls back to ``dump`` + ``json.dumps``.
     fn run_json(&self, obj: &Bound<'_, PyAny>, many: bool) -> PyResult<String> {
+        let inner = self.inner.as_ref().expect("DumpSerializer cleared by GC");
         INDEXABLE_LAST.with(|c| c.set((0, false)));
         let mut buf = String::new();
-        self.root.write_json(&mut buf, &self.ctx, obj, many)?;
+        inner.root.write_json(&mut buf, &inner.ctx, obj, many)?;
         Ok(buf)
+    }
+
+    // R2: GC protocol — make cycles through DumpSerializer visible to CPython's
+    // collector so schemas don't leak permanently.
+    fn __traverse__(&self, visit: pyo3::PyVisit<'_>) -> Result<(), pyo3::PyTraverseError> {
+        if let Some(inner) = &self.inner {
+            traverse_ctx(&inner.ctx, &visit)?;
+            traverse_dump_serializer(&inner.root, &visit)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&mut self) {
+        self.inner = None; // drops all Py<> refs, breaking the cycle
     }
 }
 
@@ -273,7 +409,16 @@ fn json_escape_into(buf: &mut String, s: &str) {
 /// ``json.dumps`` (default options) would, or raise ``AccelFallback`` for a type
 /// it cannot reproduce byte-for-byte (so the caller defers to ``json.dumps``,
 /// which then either encodes it or raises the identical ``TypeError``).
-fn write_json_value(buf: &mut String, value: &Bound<'_, PyAny>) -> PyResult<()> {
+///
+/// ``depth`` guards against unbounded runtime recursion (R3): past
+/// ``JSON_DEPTH_LIMIT`` levels we raise ``AccelFallback`` and the caller's
+/// stock ``json.dumps`` raises the catchable ``RecursionError``.
+const JSON_DEPTH_LIMIT: usize = 512;
+
+fn write_json_value(buf: &mut String, value: &Bound<'_, PyAny>, depth: usize) -> PyResult<()> {
+    if depth > JSON_DEPTH_LIMIT {
+        return Err(fallback());
+    }
     if value.is_none() {
         buf.push_str("null");
         return Ok(());
@@ -319,7 +464,7 @@ fn write_json_value(buf: &mut String, value: &Bound<'_, PyAny>) -> PyResult<()> 
                 buf.push_str(", ");
             }
             first = false;
-            write_json_value(buf, &item?)?;
+            write_json_value(buf, &item?, depth + 1)?;
         }
         buf.push(']');
         return Ok(());
@@ -337,7 +482,7 @@ fn write_json_value(buf: &mut String, value: &Bound<'_, PyAny>) -> PyResult<()> 
             first = false;
             json_escape_into(buf, key.to_str()?);
             buf.push_str(": ");
-            write_json_value(buf, &v)?;
+            write_json_value(buf, &v, depth + 1)?;
         }
         buf.push('}');
         return Ok(());
@@ -458,7 +603,7 @@ impl Serializer {
                     first = false;
                     json_escape_into(buf, output_key.bind(py).to_str()?);
                     buf.push_str(": ");
-                    write_json_value(buf, &val)?;
+                    write_json_value(buf, &val, 0)?;
                 }
                 FieldSpec::Native {
                     key,
@@ -692,7 +837,7 @@ impl Element {
             }
             _ => {
                 let serialized = self.apply(ctx, value)?;
-                write_json_value(buf, &serialized)
+                write_json_value(buf, &serialized, 0)
             }
         }
     }
@@ -1241,15 +1386,181 @@ struct LoadSerializer {
     distinct_data_keys: bool,
 }
 
-#[pyclass(module = "marshmallow_core._core")]
-pub struct LoadDeserializer {
+// R2: GC traverse helpers for the load side.
+
+fn traverse_validator(
+    v: &Validator,
+    visit: &pyo3::PyVisit<'_>,
+) -> Result<(), pyo3::PyTraverseError> {
+    match v {
+        Validator::Range { min, max, .. } => {
+            if let Some(m) = min {
+                visit.call(m)?;
+            }
+            if let Some(m) = max {
+                visit.call(m)?;
+            }
+        }
+        Validator::OneOf { choices } => {
+            visit.call(choices)?;
+        }
+        Validator::Equal { comparable } => {
+            visit.call(comparable)?;
+        }
+        Validator::NoneOf { iterable } => {
+            visit.call(iterable)?;
+        }
+        Validator::ContainsOnly { choices } => {
+            visit.call(choices)?;
+        }
+        Validator::Python { validator } => {
+            visit.call(validator)?;
+        }
+        Validator::Length { .. } => {}
+    }
+    Ok(())
+}
+
+fn traverse_load_element(
+    el: &LoadElement,
+    visit: &pyo3::PyVisit<'_>,
+) -> Result<(), pyo3::PyTraverseError> {
+    match el {
+        LoadElement::Enum {
+            enum_class, inner, ..
+        } => {
+            visit.call(enum_class)?;
+            traverse_load_element(inner, visit)?;
+        }
+        LoadElement::Uuid { uuid_class } => {
+            visit.call(uuid_class)?;
+        }
+        LoadElement::Temporal { internal_type, func } => {
+            visit.call(internal_type)?;
+            visit.call(func)?;
+        }
+        LoadElement::Decimal { deserialize }
+        | LoadElement::TimeDelta { deserialize }
+        | LoadElement::DatetimeAwareness { deserialize }
+        | LoadElement::IpAddr { deserialize } => {
+            visit.call(deserialize)?;
+        }
+        LoadElement::Constant { constant } => {
+            visit.call(constant)?;
+        }
+        LoadElement::Boolean { truthy, falsy } => {
+            visit.call(truthy)?;
+            visit.call(falsy)?;
+        }
+        LoadElement::Nested(s) => traverse_load_serializer_inner(s, visit)?,
+        LoadElement::List(inner, _) => traverse_load_element(inner, visit)?,
+        LoadElement::Tuple(els) => {
+            for e in els {
+                traverse_load_element(e, visit)?;
+            }
+        }
+        LoadElement::DictTyped {
+            key_el,
+            val_el,
+            key_validators,
+            val_validators,
+        } => {
+            if let Some(k) = key_el {
+                traverse_load_element(k, visit)?;
+            }
+            if let Some(v) = val_el {
+                traverse_load_element(v, visit)?;
+            }
+            for v in key_validators {
+                traverse_validator(v, visit)?;
+            }
+            for v in val_validators {
+                traverse_validator(v, visit)?;
+            }
+        }
+        LoadElement::Pluck {
+            serializer,
+            data_key,
+            ..
+        } => {
+            traverse_load_serializer_inner(serializer, visit)?;
+            visit.call(data_key)?;
+        }
+        _ => {} // Passthrough, Str, Int, IntStrict, Float, Dict
+    }
+    Ok(())
+}
+
+fn traverse_load_field_spec(
+    spec: &LoadFieldSpec,
+    visit: &pyo3::PyVisit<'_>,
+) -> Result<(), pyo3::PyTraverseError> {
+    match spec {
+        LoadFieldSpec::Native {
+            data_key,
+            out_key,
+            out_key_parts,
+            attr_name,
+            load_default,
+            element,
+            validators,
+            ..
+        } => {
+            visit.call(data_key)?;
+            visit.call(out_key)?;
+            if let Some(parts) = out_key_parts {
+                for p in parts {
+                    visit.call(p)?;
+                }
+            }
+            visit.call(attr_name)?;
+            visit.call(load_default)?;
+            traverse_load_element(element, visit)?;
+            for v in validators {
+                traverse_validator(v, visit)?;
+            }
+        }
+        LoadFieldSpec::Callback {
+            data_key,
+            attr_name,
+            out_key,
+            out_key_parts,
+            field,
+        } => {
+            visit.call(data_key)?;
+            visit.call(attr_name)?;
+            visit.call(out_key)?;
+            if let Some(parts) = out_key_parts {
+                for p in parts {
+                    visit.call(p)?;
+                }
+            }
+            visit.call(field)?;
+        }
+    }
+    Ok(())
+}
+
+fn traverse_load_serializer_inner(
+    s: &LoadSerializer,
+    visit: &pyo3::PyVisit<'_>,
+) -> Result<(), pyo3::PyTraverseError> {
+    visit.call(&s.known_keys)?;
+    for spec in &s.specs {
+        traverse_load_field_spec(spec, visit)?;
+    }
+    Ok(())
+}
+
+struct LdInner {
     ctx: Ctx,
     root: LoadSerializer,
-    /// Whether the whole spec tree is callback-free, so ``run_json`` can finish
-    /// off the jiter tree. A callback anywhere makes ``run_one_json`` defer on
-    /// first sight; the Python caller reads this to skip the (wasted) jiter parse
-    /// and go straight to stock ``loads`` (see ``_patched_loads``).
     fusable: bool,
+}
+
+#[pyclass(module = "marshmallow_core._core")]
+pub struct LoadDeserializer {
+    inner: Option<Box<LdInner>>,
 }
 
 #[pymethods]
@@ -1260,14 +1571,19 @@ impl LoadDeserializer {
         let ctx = Ctx::new(py, missing)?;
         let root = parse_load_serializer(py, payload)?;
         let fusable = serializer_is_fusable(&root);
-        Ok(LoadDeserializer { ctx, root, fusable })
+        Ok(LoadDeserializer {
+            inner: Some(Box::new(LdInner { ctx, root, fusable })),
+        })
     }
 
     /// Whether ``run_json`` can complete for this schema (no callback fields
     /// anywhere in the tree). Read once by the Python caller and cached.
     #[getter]
     fn fusable(&self) -> bool {
-        self.fusable
+        self.inner
+            .as_ref()
+            .expect("LoadDeserializer cleared by GC")
+            .fusable
     }
 
     /// Deserialize ``data``; raises ``AccelFallback`` to defer to Python.
@@ -1283,8 +1599,9 @@ impl LoadDeserializer {
         many: bool,
         partial: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.as_ref().expect("LoadDeserializer cleared by GC");
         let p = Partial::from_arg(partial)?;
-        self.root.run(&self.ctx, data, many, &p)
+        inner.root.run(&inner.ctx, data, many, &p)
     }
 
     /// SPIKE (Design A): fused ``loads`` — parse JSON ``data`` (a ``str`` or
@@ -1305,16 +1622,32 @@ impl LoadDeserializer {
         // ``allow_inf_nan = true`` matches stdlib ``json.loads`` (accepts
         // ``NaN``/``Infinity``); a Float field still rejects them via its own
         // guard, deferring to Python for the exact ``special`` error.
+        let inner = self.inner.as_ref().expect("LoadDeserializer cleared by GC");
         if let Ok(s) = data.cast::<PyString>() {
-            let txt = s.to_str()?;
+            // R6: ``to_str()`` fails on lone surrogates; map the error to fallback
+            // so stock ``json.loads`` handles it (which succeeds on these inputs).
+            let txt = s.to_str().map_err(|_| fallback())?;
             let jv = JsonValue::parse(txt.as_bytes(), true).map_err(|_| fallback())?;
-            self.root.run_json_tree(&self.ctx, py, &jv, many, &p)
+            inner.root.run_json_tree(&inner.ctx, py, &jv, many, &p)
         } else if let Ok(b) = data.cast::<PyBytes>() {
             let jv = JsonValue::parse(b.as_bytes(), true).map_err(|_| fallback())?;
-            self.root.run_json_tree(&self.ctx, py, &jv, many, &p)
+            inner.root.run_json_tree(&inner.ctx, py, &jv, many, &p)
         } else {
             Err(fallback())
         }
+    }
+
+    // R2: GC protocol — makes cycles through LoadDeserializer visible to CPython.
+    fn __traverse__(&self, visit: pyo3::PyVisit<'_>) -> Result<(), pyo3::PyTraverseError> {
+        if let Some(inner) = &self.inner {
+            traverse_ctx(&inner.ctx, &visit)?;
+            traverse_load_serializer_inner(&inner.root, &visit)?;
+        }
+        Ok(())
+    }
+
+    fn __clear__(&mut self) {
+        self.inner = None; // drops all Py<> refs, breaking the cycle
     }
 }
 
