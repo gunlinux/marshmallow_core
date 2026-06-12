@@ -40,10 +40,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
-          # /git/refs/tags returns the tag-object SHA for annotated tags,
-          # not the commit SHA.  /tags gives the peeled commit SHA directly.
+          # /tags gives peeled commit SHAs (annotated-tag safe).
+          # Pipe into jq so --arg works; gh api --jq takes only one string arg.
           TAG=$(gh api "repos/${{ github.repository }}/tags" \
-            --jq --arg sha "$SHA" \
+            | jq -r --arg sha "$SHA" \
             '[.[] | select(.commit.sha == $sha and (.name | startswith("v")))] |
              if length > 0 then .[0].name else "" end')
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
