@@ -13,6 +13,9 @@ import pytest
 
 import marshmallow_core
 from marshmallow import Schema, ValidationError, fields
+from importlib.metadata import version as _pkg_version
+
+_MA4 = int(_pkg_version("marshmallow").split(".")[0]) >= 4
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +32,11 @@ class _TupleSchema(Schema):
     t = fields.Tuple((fields.Integer(), fields.Integer()))
 
 
+@pytest.mark.skipif(
+    not _MA4,
+    reason="marshmallow 3.x Tuple._serialize uses zip without strict=True and "
+    "silently truncates on a length mismatch instead of raising ValueError",
+)
 def test_r1_dump_generator_with_mid_stream_fallback():
     """dump() over a generator must not silently drop records on a Tuple fallback.
 
@@ -45,6 +53,11 @@ def test_r1_dump_generator_with_mid_stream_fallback():
         _TupleSchema(many=True).dump(gen)
 
 
+@pytest.mark.skipif(
+    not _MA4,
+    reason="marshmallow 3.x Tuple._serialize uses zip without strict=True and "
+    "silently truncates on a length mismatch instead of raising ValueError",
+)
 def test_r1_dumps_generator_with_mid_stream_fallback():
     """dumps() over a generator must not silently drop records either."""
     gen = ({"t": v} for v in [(1, 2), (1, 2, 3), (5, 6)])

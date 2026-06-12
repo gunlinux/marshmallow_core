@@ -660,7 +660,9 @@ def test_load_nested_overridden_load_uses_callback(monkeypatch):
         region = fields.Nested(_OverridesLoadSchema)
 
     accelerated, pure = _load_both(
-        _NestedOverrideSchema, {"id": 1, "region": {"name": "Moscow"}}, monkeypatch=monkeypatch
+        _NestedOverrideSchema,
+        {"id": 1, "region": {"name": "Moscow"}},
+        monkeypatch=monkeypatch,
     )
     assert accelerated == pure
     assert accelerated["region"] == _Region("Moscow")
@@ -675,7 +677,9 @@ def test_dump_nested_overridden_dump_uses_callback(monkeypatch):
         region = fields.Nested(_OverridesDumpSchema)
 
     accelerated, pure = _dump_both(
-        _NestedOverrideSchema, {"id": 1, "region": {"name": "Moscow"}}, monkeypatch=monkeypatch
+        _NestedOverrideSchema,
+        {"id": 1, "region": {"name": "Moscow"}},
+        monkeypatch=monkeypatch,
     )
     assert accelerated == pure
     assert accelerated["region"]["dumped"] is True
@@ -1609,7 +1613,7 @@ def test_nested_post_load_many(monkeypatch):
             return Obj(**data)
 
     class Outer(Schema):
-        items = fields.Nested(Inner(), many=True)
+        items = fields.Nested(Inner(many=True))
 
     data = {"items": [{"v": 1}, {"v": 2}, {"v": 3}]}
     accelerated, pure = _load_both(Outer, data, monkeypatch=monkeypatch)
