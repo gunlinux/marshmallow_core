@@ -40,10 +40,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
-          TAG=$(gh api "repos/${{ github.repository }}/git/refs/tags" \
+          # /git/refs/tags returns the tag-object SHA for annotated tags,
+          # not the commit SHA.  /tags gives the peeled commit SHA directly.
+          TAG=$(gh api "repos/${{ github.repository }}/tags" \
             --jq --arg sha "$SHA" \
-            '[.[] | select(.object.sha == $sha and (.ref | startswith("refs/tags/v")))] |
-             if length > 0 then .[0].ref | ltrimstr("refs/tags/") else "" end')
+            '[.[] | select(.commit.sha == $sha and (.name | startswith("v")))] |
+             if length > 0 then .[0].name else "" end')
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
           echo "Detected tag: ${TAG:-<none>} on ${SHA}"
