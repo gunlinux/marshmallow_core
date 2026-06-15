@@ -22,10 +22,10 @@ crate-type = ["cdylib"]
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.27", features = ["abi3-py310"] }
+pyo3 = { version = "0.28", features = ["abi3-py310"] }
 # SPIKE (Design A, fused loads): jiter's pure-Rust JSON tree. We use only
 # `JsonValue` (no pyo3/python feature), so there is no pyo3 version coupling.
-jiter = { version = "0.15", default-features = false }
+jiter = { version = "0.15", default-features = false, features = ["python"] }
 
 [profile.release]
 lto = "thin"

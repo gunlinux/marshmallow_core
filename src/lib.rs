@@ -33,7 +33,7 @@ use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
-use jiter::{JsonArray, JsonObject, JsonValue};
+use jiter::{JsonArray, JsonObject, JsonValue, cached_py_string};
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -1717,6 +1717,11 @@ impl LoadDeserializer {
 /// Convert a jiter ``JsonValue`` (sub)tree into exactly the Python object
 /// ``json.loads`` would have produced for it. Parity of the fused load rests on
 /// this being byte-identical to the stdlib parser's output per leaf.
+///
+/// String leaves use jiter's global LRU string cache (F_SPEEDUP F7): repeated
+/// values (enum-like fields, status strings, country codes) return the same
+/// Python object across calls, saving an allocation and making ``is``/``==``
+/// comparisons in Python code cheaper.
 fn json_to_py<'py>(py: Python<'py>, jv: &JsonValue<'_>) -> PyResult<Bound<'py, PyAny>> {
     match jv {
         JsonValue::Null => Ok(py.None().into_bound(py)),
@@ -1726,7 +1731,7 @@ fn json_to_py<'py>(py: Python<'py>, jv: &JsonValue<'_>) -> PyResult<Bound<'py, P
         // than i64 fails to parse and we fall back to ``json.loads`` (which
         // handles arbitrary precision) — rare, and correct.
         JsonValue::Float(f) => Ok((*f).into_pyobject(py)?.into_any()),
-        JsonValue::Str(s) => Ok(PyString::new(py, s.as_ref()).into_any()),
+        JsonValue::Str(s) => Ok(cached_py_string(py, s.as_ref()).into_any()),
         JsonValue::Array(a) => {
             let out = PyList::empty(py);
             for item in a.iter() {
@@ -2499,10 +2504,9 @@ impl LoadElement {
             LoadElement::Passthrough => return json_to_py(py, jv),
 
             LoadElement::Str => match jv {
-                // JSON strings arrive already as valid UTF-8 &str; wrap directly.
-                // Non-string JSON types (int, bool, ...) fall through: ``apply``
-                // will call ``ensure_text_type`` which raises ``invalid``.
-                JsonValue::Str(s) => return Ok(PyString::new(py, s.as_ref()).into_any()),
+                // JSON strings arrive already as valid UTF-8 &str; use the global
+                // string cache (F7) so repeated values share the same Python object.
+                JsonValue::Str(s) => return Ok(cached_py_string(py, s.as_ref()).into_any()),
                 _ => {
                     let v = json_to_py(py, jv)?;
                     return self.apply(ctx, &v, partial);
