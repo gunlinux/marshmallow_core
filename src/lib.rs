@@ -2475,9 +2475,12 @@ impl LoadElement {
     ///
     /// ``Nested`` and ``List`` recurse through the tree so a list-of-records
     /// never materialises an intermediate Python ``dict``/``list`` (the whole
-    /// point). Every other element converts the leaf with [`json_to_py`] — which
-    /// reproduces ``json.loads``'s output exactly — and runs the unchanged
-    /// [`LoadElement::apply`], so scalar parity holds by construction.
+    /// point). Hot scalar elements (``Str``, ``Int``, ``Float``, ``Passthrough``,
+    /// ``IntStrict``, ``Boolean``) are handled inline without going through
+    /// ``json_to_py`` + ``apply`` (F_SPEEDUP F6: eliminates the double dispatch
+    /// for the common case). Every other element materialises the leaf via
+    /// ``json_to_py`` and delegates to the unchanged ``apply`` path, so scalar
+    /// parity holds by construction.
     fn apply_json<'py>(
         &self,
         py: Python<'py>,
@@ -2486,6 +2489,83 @@ impl LoadElement {
         partial: &Partial<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
         match self {
+            // --- F6: scalar fast paths -------------------------------------------
+            // These convert JsonValue → Python object directly, skipping the
+            // json_to_py materialisation + apply double-dispatch that the catch-all
+            // would use. Each arm matches only the JSON type it can handle natively;
+            // any mismatch falls through to the materialise+apply path which handles
+            // coercion and error generation identically to the dict-source load path.
+
+            LoadElement::Passthrough => return json_to_py(py, jv),
+
+            LoadElement::Str => match jv {
+                // JSON strings arrive already as valid UTF-8 &str; wrap directly.
+                // Non-string JSON types (int, bool, ...) fall through: ``apply``
+                // will call ``ensure_text_type`` which raises ``invalid``.
+                JsonValue::Str(s) => return Ok(PyString::new(py, s.as_ref()).into_any()),
+                _ => {
+                    let v = json_to_py(py, jv)?;
+                    return self.apply(ctx, &v, partial);
+                }
+            },
+
+            LoadElement::Int => match jv {
+                // Boolean in JSON means ``true``/``false``; ``apply`` rejects them
+                // as ``invalid``, defer so Python emits the right message.
+                JsonValue::Bool(_) => return Err(fallback()),
+                JsonValue::Int(i) => return Ok((*i).into_pyobject(py)?.into_any()),
+                // Float or string coercion: materialise and let ``apply`` handle.
+                _ => {
+                    let v = json_to_py(py, jv)?;
+                    return self.apply(ctx, &v, partial);
+                }
+            },
+
+            LoadElement::IntStrict => match jv {
+                JsonValue::Bool(_) => return Err(fallback()),
+                // Strict: exact int only; any other JSON type defers.
+                JsonValue::Int(i) => return Ok((*i).into_pyobject(py)?.into_any()),
+                _ => return Err(fallback()),
+            },
+
+            LoadElement::Float { allow_nan } => match jv {
+                JsonValue::Bool(_) => return Err(fallback()),
+                JsonValue::Float(f) => {
+                    if !allow_nan && (f.is_nan() || f.is_infinite()) {
+                        return Err(fallback()); // ``special`` error
+                    }
+                    return Ok((*f).into_pyobject(py)?.into_any());
+                }
+                JsonValue::Int(i) => {
+                    // JSON integers are valid float inputs (same as ``float(42)``).
+                    let f = *i as f64;
+                    if !allow_nan && (f.is_nan() || f.is_infinite()) {
+                        return Err(fallback());
+                    }
+                    return Ok(f.into_pyobject(py)?.into_any());
+                }
+                _ => {
+                    let v = json_to_py(py, jv)?;
+                    return self.apply(ctx, &v, partial);
+                }
+            },
+
+            LoadElement::Boolean { .. } => {
+                // JSON booleans can be resolved directly without a Python set lookup.
+                match jv {
+                    JsonValue::Bool(b) => {
+                        return Ok(PyBool::new(py, *b).to_owned().into_any());
+                    }
+                    // Non-bool JSON: materialise and fall through to apply which
+                    // checks the truthy/falsy sets and defers on a miss.
+                    _ => {
+                        let v = json_to_py(py, jv)?;
+                        return self.apply(ctx, &v, partial);
+                    }
+                }
+            }
+
+            // --- end F6 fast paths -----------------------------------------------
             LoadElement::Nested(serializer) => {
                 if serializer.many {
                     match jv {
