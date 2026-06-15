@@ -15,6 +15,9 @@ dev:  ## Install dev dependencies
 .PHONY: develop
 develop:  ## Build the Rust core and install into the venv (iterating)
 	uvx maturin develop --release
+	@# ld-1328.2 (macOS 15) produces 4-byte-aligned LINKEDIT string pools that
+	@# dyld rejects. Patch in-place when the file exists; no-op on other systems.
+	@python3 scripts/fix_linkedit.py -v python/marshmallow_core/_core.abi3.so 2>/dev/null || true
 
 # ---- combined gates -------------------------------------------------------
 

@@ -133,12 +133,17 @@ enum FieldSpec {
         key: Py<PyString>,
         key_parts: Option<Vec<Py<PyString>>>,
         output_key: Py<PyString>,
+        /// Pre-escaped JSON key prefix: ``"\"name\": "`` built once at compile
+        /// time so ``write_json_one`` avoids re-escaping per record (F_SPEEDUP F5).
+        json_key: Box<str>,
         dump_default: Py<PyAny>,
         element: Element,
     },
     Callback {
         name: Py<PyString>,
         output_key: Py<PyString>,
+        /// Pre-escaped JSON key prefix for the callback case (same optimization).
+        json_key: Box<str>,
         field: Py<PyAny>,
     },
 }
@@ -220,6 +225,7 @@ fn traverse_field_spec(
             output_key,
             dump_default,
             element,
+            ..
         } => {
             visit.call(key)?;
             if let Some(parts) = key_parts {
@@ -235,6 +241,7 @@ fn traverse_field_spec(
             name,
             output_key,
             field,
+            ..
         } => {
             visit.call(name)?;
             visit.call(output_key)?;
@@ -514,6 +521,7 @@ impl Serializer {
                     name,
                     output_key,
                     field,
+                    ..
                 } => {
                     let val = field
                         .bind(py)
@@ -529,6 +537,7 @@ impl Serializer {
                     output_key,
                     dump_default,
                     element,
+                    ..
                 } => {
                     let mut value = get_value(py, obj, key, key_parts, missing)?;
                     if value.is(missing) {
@@ -582,8 +591,9 @@ impl Serializer {
             match spec {
                 FieldSpec::Callback {
                     name,
-                    output_key,
+                    json_key,
                     field,
+                    ..
                 } => {
                     let val = field
                         .bind(py)
@@ -595,16 +605,16 @@ impl Serializer {
                         buf.push_str(", ");
                     }
                     first = false;
-                    json_escape_into(buf, output_key.bind(py).to_str()?);
-                    buf.push_str(": ");
+                    buf.push_str(json_key); // F5: pre-escaped key prefix
                     write_json_value(buf, &val, 0)?;
                 }
                 FieldSpec::Native {
                     key,
                     key_parts,
-                    output_key,
+                    json_key,
                     dump_default,
                     element,
+                    ..
                 } => {
                     let mut value = get_value(py, obj, key, key_parts, missing)?;
                     if value.is(missing) {
@@ -617,8 +627,7 @@ impl Serializer {
                         buf.push_str(", ");
                     }
                     first = false;
-                    json_escape_into(buf, output_key.bind(py).to_str()?);
-                    buf.push_str(": ");
+                    buf.push_str(json_key); // F5: pre-escaped key prefix
                     element.write_json(buf, ctx, &value)?;
                 }
             }
@@ -874,15 +883,27 @@ fn parse_serializer(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<Seri
     Ok(Serializer { accessor, specs })
 }
 
+/// Build the pre-escaped JSON key prefix ``"\"name\": "`` for a field whose
+/// output key is ``key_str``. Used by both ``FieldSpec`` variants for F_SPEEDUP F5.
+fn make_json_key(key_str: &str) -> Box<str> {
+    let mut s = String::new();
+    json_escape_into(&mut s, key_str);
+    s.push_str(": ");
+    s.into_boxed_str()
+}
+
 fn parse_field_spec(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<FieldSpec> {
     let t = item.cast::<PyTuple>()?;
     let is_callback: bool = t.get_item(0)?.extract()?;
-    let output_key = t.get_item(1)?.cast_into::<PyString>()?.unbind();
+    let output_key = t.get_item(1)?.cast_into::<PyString>()?;
+    let json_key = make_json_key(output_key.to_str()?);
+    let output_key = output_key.unbind();
     if is_callback {
         // (True, output_key, attr_name, field)
         Ok(FieldSpec::Callback {
             name: t.get_item(2)?.cast_into::<PyString>()?.unbind(),
             output_key,
+            json_key,
             field: t.get_item(3)?.unbind(),
         })
     } else {
@@ -905,6 +926,7 @@ fn parse_field_spec(py: Python<'_>, item: &Bound<'_, PyAny>) -> PyResult<FieldSp
             key: key.unbind(),
             key_parts,
             output_key,
+            json_key,
             dump_default,
             element,
         })
