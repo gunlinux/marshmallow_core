@@ -93,11 +93,13 @@ impl LoadSerializer {
             if !is_list_like(data) {
                 return Err(fallback());
             }
-            let out = PyList::empty(py);
+            // ``is_list_like`` guarantees a list/tuple, so ``len`` is an exact
+            // capacity hint; build the result list in one allocation.
+            let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(data.len()?);
             for item in data.try_iter()? {
-                out.append(self.run_one(ctx, &item?, partial)?)?;
+                items.push(self.run_one(ctx, &item?, partial)?.into_any());
             }
-            Ok(out.into_any())
+            Ok(PyList::new(py, items)?.into_any())
         } else {
             Ok(self.run_one(ctx, data, partial)?.into_any())
         }
@@ -286,14 +288,19 @@ impl LoadSerializer {
         arr: &JsonArray<'_>,
         partial: &Partial<'py>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let out = PyList::empty(py);
+        // Pre-size: the record count is known up front, so collect into a `Vec`
+        // of exact length and build the list in one allocation rather than
+        // growing it by append.
+        let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(arr.len());
         for item in arr.iter() {
             match item {
-                JsonValue::Object(o) => out.append(self.run_one_json(ctx, py, o, partial)?)?,
+                JsonValue::Object(o) => {
+                    items.push(self.run_one_json(ctx, py, o, partial)?.into_any())
+                }
                 _ => return Err(fallback()),
             }
         }
-        Ok(out.into_any())
+        Ok(PyList::new(py, items)?.into_any())
     }
 
     /// Deserialize one JSON object off the tree. Mirrors ``run_one`` exactly

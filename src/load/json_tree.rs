@@ -29,11 +29,14 @@ pub(crate) fn json_to_py<'py>(py: Python<'py>, jv: &JsonValue<'_>) -> PyResult<B
         JsonValue::Float(f) => Ok((*f).into_pyobject(py)?.into_any()),
         JsonValue::Str(s) => Ok(cached_py_string(py, s.as_ref()).into_any()),
         JsonValue::Array(a) => {
-            let out = PyList::empty(py);
+            // Pre-size: the element count is known, so build a `Vec` of the exact
+            // length and construct the list once instead of growing it by append
+            // (which reallocates as it fills).
+            let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(a.len());
             for item in a.iter() {
-                out.append(json_to_py(py, item)?)?;
+                items.push(json_to_py(py, item)?);
             }
-            Ok(out.into_any())
+            Ok(PyList::new(py, items)?.into_any())
         }
         JsonValue::Object(o) => {
             // ``json.loads`` keeps the last value for a duplicated key; building

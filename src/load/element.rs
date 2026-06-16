@@ -224,19 +224,21 @@ impl LoadElement {
                 if !is_list_like(value) {
                     return Err(fallback()); // ``invalid`` (not a list)
                 }
-                let out = PyList::empty(py);
+                // ``is_list_like`` guarantees a list/tuple, so ``len`` is a cheap
+                // exact capacity hint; build the list in one allocation.
+                let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(value.len()?);
                 for each in value.try_iter()? {
                     let each = each?;
                     if each.is_none() {
                         if *inner_allow_none {
-                            out.append(py.None())?;
+                            items.push(py.None().into_bound(py));
                             continue;
                         }
                         return Err(fallback());
                     }
-                    out.append(inner.apply(ctx, &each, partial)?)?;
+                    items.push(inner.apply(ctx, &each, partial)?);
                 }
-                Ok(out.into_any())
+                Ok(PyList::new(py, items)?.into_any())
             }
             LoadElement::Enum {
                 enum_class,
@@ -535,18 +537,20 @@ impl LoadElement {
             }
             LoadElement::List(inner, inner_allow_none) => match jv {
                 JsonValue::Array(a) => {
-                    let out = PyList::empty(py);
+                    // Pre-size: the element count is known, so build the list in
+                    // one allocation instead of growing it by append.
+                    let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(a.len());
                     for item in a.iter() {
                         if matches!(item, JsonValue::Null) {
                             if *inner_allow_none {
-                                out.append(py.None())?;
+                                items.push(py.None().into_bound(py));
                                 continue;
                             }
                             return Err(fallback());
                         }
-                        out.append(inner.apply_json(py, ctx, item, partial)?)?;
+                        items.push(inner.apply_json(py, ctx, item, partial)?);
                     }
-                    Ok(out.into_any())
+                    Ok(PyList::new(py, items)?.into_any())
                 }
                 _ => Err(fallback()),
             },
