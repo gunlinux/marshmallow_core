@@ -208,15 +208,20 @@ The other three files cover what equivalence can't:
 
 ## Architecture review & planning surface
 
-`F_REAL_REVIEW.md` is the primary architecture/planning document. It carries:
+The standing architecture-review doc (`F_REAL_REVIEW.md`) has been removed; its
+durable content now lives where it belongs:
 
-- Benchmark baselines (use these to confirm no regression before landing perf changes).
-- Findings N1–N6 with their fix status (N1–N4 done; N5 profiled/skipped; N6 low, noted).
-- The standing won't-do list — deliberate non-features not to re-implement.
+- **Benchmark baselines** → `performance/RESULTS.md` (confirm no regression
+  against that table before landing perf changes).
+- **Won't-do list** → the inline section just below (kept here so it travels
+  with the project instructions).
+- Findings N1–N6 and the F_ARCHREVIEW R1–R7 review notes are historical; recover
+  them from git history if needed (`tests/test_contract.py` still encodes the
+  R1–R7 *preconditions* directly).
 
 ### Deliberate non-features (do not re-litigate)
 
-These were evaluated, measured, and rejected. Full rationale is in `F_REAL_REVIEW.md`.
+These were evaluated, measured, and rejected:
 
 - **Native float formatting in the JSON writer** — `ryu` differs from CPython `float.__repr__` (shortest-round-trip) on a measurable corpus. Stays `repr()`-via-Python.
 - **Native `Regexp` validator** — `regex` crate vs `re` semantics cannot be guaranteed equal. Already handled via `_V_PYTHON` with fallback.
