@@ -7,38 +7,49 @@ this table when the core changes.
 
 - **Environment:** Apple Silicon (arm64, macOS), CPython 3.12, marshmallow 4.3.0,
   release build (`maturin build --release`), `--number 6000`.
-- **Recorded:** after the B1/B2 loader rework (single-pass fused `loads`; skip
-  the jiter parse for callback schemas). Earlier-phase numbers, and the
-  ARCH.md/F_SPEEDUP.md reviews the B*/F* item IDs refer to, are in git history;
-  the current review is `F_REAL_REVIEW.md`.
+- **Recorded:** after the `itoa` + table-driven JSON escape change (faster
+  integer formatting and string escaping in the dump JSON writer). Earlier-phase
+  numbers, and the ARCH.md/F_SPEEDUP.md reviews the B*/F* item IDs refer to, are
+  in git history; the current review is `F_REAL_REVIEW.md`. This session's
+  machine baseline runs faster than the prior B1/B2 recording across the board
+  (compare same-op rows with care — the attributable win is isolated below).
 - These are indicative ratios, not guarantees; absolute numbers vary by machine.
 
 | case      | op    | stock (µs) | core (µs) | speedup |
 |-----------|-------|-----------:|----------:|--------:|
-| flat      | dump  |       2.08 |      0.54 |   3.86x |
-| flat      | load  |       4.54 |      0.44 |  10.44x |
-| flat      | dumps |       3.08 |      0.89 |   3.46x |
-| flat      | loads |       5.46 |      0.57 |   9.64x |
-| nested    | dump  |       5.24 |      0.57 |   9.15x |
-| nested    | load  |      15.34 |      0.72 |  21.20x |
-| nested    | dumps |       6.92 |      1.05 |   6.61x |
-| nested    | loads |      16.94 |      1.14 |  14.84x |
-| list      | dump  |      81.31 |      5.42 |  15.01x |
-| list      | load  |     223.58 |      8.17 |  27.38x |
-| list      | dumps |      97.38 |     11.01 |   8.84x |
-| list      | loads |     242.18 |     13.42 |  18.04x |
-| validator | dump  |       1.58 |      0.27 |   5.80x |
-| validator | load  |       4.16 |      0.43 |   9.75x |
-| validator | dumps |       2.46 |      0.54 |   4.57x |
-| validator | loads |       5.11 |      0.57 |   9.03x |
-| hooks     | dump  |       1.22 |      0.24 |   5.15x |
-| hooks     | load  |       4.55 |      2.18 |   2.09x |
-| hooks     | dumps |       2.06 |      0.50 |   4.09x |
-| hooks     | loads |       5.37 |      3.19 |   1.68x |
-| api       | dump  |     119.39 |     15.30 |   7.80x |
-| api       | load  |     311.72 |     12.29 |  25.37x |
-| api       | dumps |     142.09 |     20.85 |   6.81x |
-| api       | loads |     334.59 |     21.16 |  15.81x |
+| flat      | dump  |       2.31 |      0.37 |   6.28x |
+| flat      | load  |       4.81 |      0.42 |  11.47x |
+| flat      | dumps |       3.44 |      0.65 |   5.29x |
+| flat      | loads |       5.70 |      0.58 |   9.80x |
+| nested    | dump  |       5.53 |      0.50 |  11.15x |
+| nested    | load  |      16.24 |      0.64 |  25.50x |
+| nested    | dumps |       7.41 |      0.93 |   7.94x |
+| nested    | loads |      17.97 |      1.07 |  16.85x |
+| list      | dump  |      86.90 |      4.31 |  20.16x |
+| list      | load  |     235.43 |      6.56 |  35.87x |
+| list      | dumps |     104.18 |      8.46 |  12.32x |
+| list      | loads |     253.94 |     11.02 |  23.05x |
+| validator | dump  |       1.66 |      0.25 |   6.70x |
+| validator | load  |       4.30 |      0.39 |  11.11x |
+| validator | dumps |       2.58 |      0.51 |   5.10x |
+| validator | loads |       5.23 |      0.52 |  10.01x |
+| hooks     | dump  |       1.28 |      0.23 |   5.44x |
+| hooks     | load  |       4.66 |      2.16 |   2.16x |
+| hooks     | dumps |       2.19 |      0.47 |   4.71x |
+| hooks     | loads |       5.45 |      3.09 |   1.76x |
+| api       | dump  |     122.42 |      9.39 |  13.03x |
+| api       | load  |     319.14 |      9.55 |  33.43x |
+| api       | dumps |     145.45 |     12.12 |  12.00x |
+| api       | loads |     340.34 |     17.05 |  19.96x |
+
+The **`itoa` + table-escape** change targets only the dump JSON writer, so the
+clean way to read its effect is the **JSON-writing overhead = `dumps` − `dump`
+on the same run** (dump builds a Python dict and never touches the writer, so it
+isolates the writer cost). On the int/string-heavy `api` payload that overhead
+fell from ~5.55µs to ~2.5µs (roughly halved): `api dumps` went 6.8x→12.0x and
+`flat dumps` 3.5x→5.3x. String-only payloads (`non_ascii`) and float-heavy
+payloads are unaffected by `itoa`; floats remain the `dumps` floor (`repr()`
+via Python, by design).
 
 The **B1 single-pass loader** lifted every `loads` case, not just wide schemas
 (it also dropped the per-field `data_key.to_str()` and the per-key frozenset

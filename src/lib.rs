@@ -355,6 +355,45 @@ fn push_u4(buf: &mut String, cp: u32) {
     buf.push(HEX[(cp & 0xF) as usize] as char);
 }
 
+/// Per-byte classification for [`json_escape_into`] (serde_json's table-driven
+/// approach). ``0`` = clean (copy verbatim); any other code selects the escape
+/// handling. Bytes ``0x80..=0xFF`` are all ``NON`` (multi-byte UTF-8, decoded at
+/// the call site). This replaces the old four-comparison range test per byte
+/// with a single table load + compare-to-zero.
+const CL: u8 = 0; // clean
+const QU: u8 = 1; // \"
+const BS: u8 = 2; // \\
+const BB: u8 = 3; // \b   (0x08)
+const TT: u8 = 4; // \t   (0x09)
+const NN: u8 = 5; // \n   (0x0a)
+const FF: u8 = 6; // \f   (0x0c)
+const RR: u8 = 7; // \r   (0x0d)
+const UU: u8 = 8; // \u00XX (other control char, incl. 0x7f)
+const NON: u8 = 9; // non-ASCII byte (>= 0x80): decode and emit \uXXXX
+
+const ESCAPE_TABLE: [u8; 256] = {
+    let mut t = [CL; 256];
+    let mut b = 0u8;
+    while b < 0x20 {
+        t[b as usize] = UU; // control chars default to \u00XX ...
+        b += 1;
+    }
+    t[0x08] = BB;
+    t[0x09] = TT;
+    t[0x0a] = NN;
+    t[0x0c] = FF;
+    t[0x0d] = RR;
+    t[b'"' as usize] = QU;
+    t[b'\\' as usize] = BS;
+    t[0x7f] = UU; // DEL: outside 0x20..=0x7e, escaped as 
+    let mut i = 0x80usize;
+    while i < 256 {
+        t[i] = NON;
+        i += 1;
+    }
+    t
+};
+
 /// Append ``s`` to ``buf`` as a JSON string literal, matching CPython's
 /// ``json.encoder.py_encode_basestring_ascii`` (``ensure_ascii=True``):
 /// short escapes for ``" \\ \n \r \t \b \f``, ``\u00XX`` for other control
@@ -367,52 +406,53 @@ fn push_u4(buf: &mut String, cp: u32) {
 /// per char (measured; F_SPEEDUP F1).
 fn json_escape_into(buf: &mut String, s: &str) {
     buf.push('"');
-    // Scan bytes (not chars): a "clean" byte is printable ASCII except ``"`` and
-    // ``\``. Clean runs are bulk-copied with a single ``push_str``; only a byte
-    // needing an escape breaks the run. Byte comparisons avoid per-char decoding,
-    // so this is fast for both short and long strings. Output is byte-identical
-    // to the stdlib ``ensure_ascii=True`` encoding (the escape logic is unchanged;
-    // multi-byte UTF-8 is decoded only at the rare non-ASCII byte).
+    // Scan bytes (not chars) via ``ESCAPE_TABLE``: a "clean" byte (table entry
+    // ``CL``) extends the current run; any other byte flushes the run with a
+    // single ``push_str`` and emits its escape. Output is byte-identical to the
+    // stdlib ``ensure_ascii=True`` encoding; multi-byte UTF-8 is decoded only at
+    // the rare non-ASCII byte.
     let bytes = s.as_bytes();
     let mut last = 0;
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\' {
+        let code = ESCAPE_TABLE[b as usize];
+        if code == CL {
             i += 1;
             continue; // clean: extend the run
         }
         if last < i {
             buf.push_str(&s[last..i]); // flush the clean run
         }
-        if b < 0x80 {
-            match b {
-                b'"' => buf.push_str("\\\""),
-                b'\\' => buf.push_str("\\\\"),
-                b'\n' => buf.push_str("\\n"),
-                b'\r' => buf.push_str("\\r"),
-                b'\t' => buf.push_str("\\t"),
-                0x08 => buf.push_str("\\b"),
-                0x0c => buf.push_str("\\f"),
-                _ => push_u4(buf, b as u32), // other control char
+        match code {
+            QU => buf.push_str("\\\""),
+            BS => buf.push_str("\\\\"),
+            BB => buf.push_str("\\b"),
+            TT => buf.push_str("\\t"),
+            NN => buf.push_str("\\n"),
+            FF => buf.push_str("\\f"),
+            RR => buf.push_str("\\r"),
+            UU => push_u4(buf, b as u32), // other control char
+            _ => {
+                // NON: decode the one char and emit ``\uXXXX`` (surrogate pair
+                // above the BMP), matching ``ensure_ascii=True``.
+                let ch = s[i..].chars().next().unwrap();
+                let cp = ch as u32;
+                if cp <= 0xFFFF {
+                    push_u4(buf, cp);
+                } else {
+                    let v = cp - 0x10000;
+                    let hi = 0xD800 + (v >> 10);
+                    let lo = 0xDC00 + (v & 0x3FF);
+                    push_u4(buf, hi);
+                    push_u4(buf, lo);
+                }
+                i += ch.len_utf8();
+                last = i;
+                continue;
             }
-            i += 1;
-        } else {
-            // Non-ASCII: decode the one char and emit ``\uXXXX`` (surrogate pair
-            // above the BMP), matching ``ensure_ascii=True``.
-            let ch = s[i..].chars().next().unwrap();
-            let cp = ch as u32;
-            if cp <= 0xFFFF {
-                push_u4(buf, cp);
-            } else {
-                let v = cp - 0x10000;
-                let hi = 0xD800 + (v >> 10);
-                let lo = 0xDC00 + (v & 0x3FF);
-                push_u4(buf, hi);
-                push_u4(buf, lo);
-            }
-            i += ch.len_utf8();
         }
+        i += 1;
         last = i;
     }
     if last < bytes.len() {
@@ -445,13 +485,13 @@ fn write_json_value(buf: &mut String, value: &Bound<'_, PyAny>, depth: usize) ->
         return Ok(());
     }
     if value.is_exact_instance_of::<PyInt>() {
-        use std::fmt::Write as _;
         // Format in Rust when it fits a machine integer (byte-identical to
         // ``int.__repr__``); arbitrary-precision ints fall back to ``str()``.
+        // ``itoa`` writes into a stack buffer, faster than ``core::fmt``.
         if let Ok(n) = value.extract::<i64>() {
-            let _ = write!(buf, "{n}");
+            buf.push_str(itoa::Buffer::new().format(n));
         } else if let Ok(n) = value.extract::<i128>() {
-            let _ = write!(buf, "{n}");
+            buf.push_str(itoa::Buffer::new().format(n));
         } else {
             buf.push_str(value.str()?.to_str()?); // big int -> ``int.__repr__``
         }
