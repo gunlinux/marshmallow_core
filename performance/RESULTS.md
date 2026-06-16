@@ -7,8 +7,11 @@ this table when the core changes.
 
 - **Environment:** Apple Silicon (arm64, macOS), CPython 3.12, marshmallow 4.3.0,
   release build (`maturin build --release`), `--number 6000`.
-- **Recorded:** after the `itoa` + table-driven JSON escape change (faster
-  integer formatting and string escaping in the dump JSON writer). Earlier-phase
+- **Recorded:** after the PyList pre-sizing change (dump/load list builders now
+  construct the result list in one allocation from a capacity-hinted `Vec`
+  instead of `empty` + per-element `append`): on the `list` case this moved
+  `dump` ~4.31→3.97µs and `load` ~6.56→5.93µs (~5% each); `loads` ~11.0→10.7µs;
+  `dumps` unchanged (it writes a string buffer, not a list). Earlier-phase
   numbers, and the ARCH.md/F_SPEEDUP.md reviews the B*/F* item IDs refer to, are
   in git history; the current review is `F_REAL_REVIEW.md`. This session's
   machine baseline runs faster than the prior B1/B2 recording across the board
@@ -17,30 +20,30 @@ this table when the core changes.
 
 | case      | op    | stock (µs) | core (µs) | speedup |
 |-----------|-------|-----------:|----------:|--------:|
-| flat      | dump  |       2.31 |      0.37 |   6.28x |
-| flat      | load  |       4.81 |      0.42 |  11.47x |
-| flat      | dumps |       3.44 |      0.65 |   5.29x |
-| flat      | loads |       5.70 |      0.58 |   9.80x |
-| nested    | dump  |       5.53 |      0.50 |  11.15x |
-| nested    | load  |      16.24 |      0.64 |  25.50x |
-| nested    | dumps |       7.41 |      0.93 |   7.94x |
-| nested    | loads |      17.97 |      1.07 |  16.85x |
-| list      | dump  |      86.90 |      4.31 |  20.16x |
-| list      | load  |     235.43 |      6.56 |  35.87x |
-| list      | dumps |     104.18 |      8.46 |  12.32x |
-| list      | loads |     253.94 |     11.02 |  23.05x |
-| validator | dump  |       1.66 |      0.25 |   6.70x |
-| validator | load  |       4.30 |      0.39 |  11.11x |
-| validator | dumps |       2.58 |      0.51 |   5.10x |
-| validator | loads |       5.23 |      0.52 |  10.01x |
-| hooks     | dump  |       1.28 |      0.23 |   5.44x |
-| hooks     | load  |       4.66 |      2.16 |   2.16x |
-| hooks     | dumps |       2.19 |      0.47 |   4.71x |
-| hooks     | loads |       5.45 |      3.09 |   1.76x |
-| api       | dump  |     122.42 |      9.39 |  13.03x |
-| api       | load  |     319.14 |      9.55 |  33.43x |
-| api       | dumps |     145.45 |     12.12 |  12.00x |
-| api       | loads |     340.34 |     17.05 |  19.96x |
+| flat      | dump  |       2.23 |      0.36 |   6.14x |
+| flat      | load  |       4.76 |      0.41 |  11.75x |
+| flat      | dumps |       3.32 |      0.64 |   5.16x |
+| flat      | loads |       5.63 |      0.57 |   9.95x |
+| nested    | dump  |       5.50 |      0.53 |  10.40x |
+| nested    | load  |      16.09 |      0.65 |  24.75x |
+| nested    | dumps |       7.21 |      0.95 |   7.56x |
+| nested    | loads |      17.65 |      1.07 |  16.50x |
+| list      | dump  |      86.53 |      3.97 |  21.77x |
+| list      | load  |     234.87 |      5.93 |  39.58x |
+| list      | dumps |     103.49 |      8.63 |  11.99x |
+| list      | loads |     250.93 |     10.68 |  23.50x |
+| validator | dump  |       1.62 |      0.25 |   6.41x |
+| validator | load  |       4.32 |      0.39 |  11.14x |
+| validator | dumps |       2.59 |      0.51 |   5.09x |
+| validator | loads |       5.20 |      0.52 |   9.96x |
+| hooks     | dump  |       1.27 |      0.23 |   5.48x |
+| hooks     | load  |       4.70 |      2.18 |   2.16x |
+| hooks     | dumps |       2.12 |      0.48 |   4.40x |
+| hooks     | loads |       5.41 |      3.04 |   1.78x |
+| api       | dump  |     123.37 |      9.93 |  12.42x |
+| api       | load  |     317.65 |      9.94 |  31.96x |
+| api       | dumps |     147.00 |     12.33 |  11.92x |
+| api       | loads |     340.13 |     17.63 |  19.29x |
 
 The **`itoa` + table-escape** change targets only the dump JSON writer, so the
 clean way to read its effect is the **JSON-writing overhead = `dumps` − `dump`
