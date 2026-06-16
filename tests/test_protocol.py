@@ -51,6 +51,7 @@ _DUMP_TAGS = {
         "_TUPLE",
         "_PLUCK",
         "_IPADDR",
+        "_TEMPORAL_NATIVE",
     )
 }
 _LOAD_TAGS = {v: k for k, v in vars(accel).items() if k.startswith("_L_")}
@@ -85,6 +86,7 @@ _MIN_DUMP_ELEMENT = {
     accel._TUPLE: (accel._TUPLE, ((accel._PASSTHROUGH,),)),
     accel._PLUCK: (accel._PLUCK, _DUMP_SUBPAYLOAD, "k", False),
     accel._IPADDR: (accel._IPADDR,),
+    accel._TEMPORAL_NATIVE: (accel._TEMPORAL_NATIVE, 0),  # kind=0 (DateTime)
 }
 
 # Minimal valid load element tuple per load tag (value -> element).

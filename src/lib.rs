@@ -31,9 +31,12 @@ use pyo3::exceptions::{
 };
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{
+    PyBool, PyBytes, PyDate, PyDateAccess, PyDateTime, PyDelta, PyDeltaAccess, PyDict, PyFloat,
+    PyInt, PyList, PyString, PyTime, PyTimeAccess, PyTuple,
+};
 
-use jiter::{JsonArray, JsonObject, JsonValue, cached_py_string};
+use jiter::{cached_py_string, JsonArray, JsonObject, JsonValue};
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -72,6 +75,14 @@ impl Ctx {
             dict_fn: builtins.getattr("dict")?.unbind(),
         })
     }
+}
+
+/// Discriminant for ``Element::TemporalNative`` — which Python temporal type to expect.
+#[derive(Clone, Copy)]
+enum TemporalKind {
+    DateTime,
+    Date,
+    Time,
 }
 
 /// A value -> serialized-output transform (mirrors a field's ``_serialize``).
@@ -126,6 +137,10 @@ enum Element {
         data_key: Py<PyString>,
         many: bool,
     },
+    /// Native ISO format for ``datetime``/``date``/``time`` — uses C-level struct
+    /// accessors instead of calling the Python ``isoformat()`` method.  Requires a
+    /// non-abi3 build (struct accessors are not in the limited API).
+    TemporalNative(TemporalKind),
 }
 
 enum FieldSpec {
@@ -491,6 +506,103 @@ fn write_json_value(buf: &mut String, value: &Bound<'_, PyAny>, depth: usize) ->
     Err(fallback()) // unencodable type (Decimal, datetime, custom, ...) -> defer
 }
 
+/// Append ``±HH:MM[:SS[.ffffff]]`` for a UTC offset timedelta, matching
+/// CPython's ``datetime._format_offset`` exactly.
+fn write_utcoffset(buf: &mut String, offset: &Bound<'_, PyAny>) -> PyResult<()> {
+    let delta = offset.cast::<PyDelta>().map_err(|_| fallback())?;
+    let days = delta.get_days() as i64;
+    let secs = delta.get_seconds() as i64;
+    let us = delta.get_microseconds() as i64;
+    let total_us = days * 86_400_000_000_i64 + secs * 1_000_000_i64 + us;
+    let (sign, abs_us) = if total_us < 0 {
+        ('-', (-total_us) as u64)
+    } else {
+        ('+', total_us as u64)
+    };
+    let us_part = (abs_us % 1_000_000) as u32;
+    let abs_s = abs_us / 1_000_000;
+    let ss = (abs_s % 60) as u32;
+    let mm = ((abs_s / 60) % 60) as u32;
+    let hh = (abs_s / 3600) as u32;
+    use std::fmt::Write as _;
+    let _ = write!(buf, "{}{:02}:{:02}", sign, hh, mm);
+    if ss != 0 || us_part != 0 {
+        let _ = write!(buf, ":{:02}", ss);
+        if us_part != 0 {
+            let _ = write!(buf, ".{:06}", us_part);
+        }
+    }
+    Ok(())
+}
+
+/// Write the ISO parts shared by ``format_datetime_native`` and the
+/// ``dumps``-fused path into ``buf``.
+fn write_temporal_native(
+    buf: &mut String,
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    kind: TemporalKind,
+) -> PyResult<()> {
+    use std::fmt::Write as _;
+    match kind {
+        TemporalKind::DateTime => {
+            let dt = value.cast::<PyDateTime>().map_err(|_| fallback())?;
+            let _ = write!(
+                buf,
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                dt.get_year(),
+                dt.get_month() as u32,
+                dt.get_day() as u32,
+                dt.get_hour() as u32,
+                dt.get_minute() as u32,
+                dt.get_second() as u32,
+            );
+            let us = dt.get_microsecond();
+            if us != 0 {
+                let _ = write!(buf, ".{:06}", us);
+            }
+            let offset = value.call_method0(intern!(py, "utcoffset"))?;
+            if !offset.is_none() {
+                write_utcoffset(buf, &offset)?;
+            }
+        }
+        TemporalKind::Date => {
+            // datetime.datetime is a subclass of datetime.date; if value is a
+            // datetime, fall back so Python produces the full isoformat string.
+            if value.is_instance_of::<PyDateTime>() {
+                return Err(fallback());
+            }
+            let d = value.cast::<PyDate>().map_err(|_| fallback())?;
+            let _ = write!(
+                buf,
+                "{:04}-{:02}-{:02}",
+                d.get_year(),
+                d.get_month() as u32,
+                d.get_day() as u32,
+            );
+        }
+        TemporalKind::Time => {
+            let t = value.cast::<PyTime>().map_err(|_| fallback())?;
+            let _ = write!(
+                buf,
+                "{:02}:{:02}:{:02}",
+                t.get_hour() as u32,
+                t.get_minute() as u32,
+                t.get_second() as u32,
+            );
+            let us = t.get_microsecond();
+            if us != 0 {
+                let _ = write!(buf, ".{:06}", us);
+            }
+            let offset = value.call_method0(intern!(py, "utcoffset"))?;
+            if !offset.is_none() {
+                write_utcoffset(buf, &offset)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Serializer {
     fn run<'py>(
         &self,
@@ -817,6 +929,14 @@ impl Element {
                     ret.get_item(dk) // ``ret[data_key]``
                 }
             }
+            Element::TemporalNative(kind) => {
+                if value.is_none() {
+                    return Ok(py.None().into_bound(py));
+                }
+                let mut buf = String::with_capacity(32);
+                write_temporal_native(&mut buf, py, value, *kind)?;
+                Ok(PyString::new(py, &buf).into_any())
+            }
         }
     }
 
@@ -860,6 +980,19 @@ impl Element {
                     inner.write_json(buf, ctx, &each?)?;
                 }
                 buf.push(']');
+                Ok(())
+            }
+            Element::TemporalNative(kind) => {
+                let py = value.py();
+                if value.is_none() {
+                    buf.push_str("null");
+                    return Ok(());
+                }
+                // ISO datetime strings contain only printable ASCII safe for JSON
+                // (no '"' or '\'), so we write directly without json_escape_into.
+                buf.push('"');
+                write_temporal_native(buf, py, value, *kind)?;
+                buf.push('"');
                 Ok(())
             }
             _ => {
@@ -1018,6 +1151,21 @@ fn parse_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<Element> {
                 data_key: t.get_item(2)?.cast_into::<PyString>()?.unbind(),
                 many: t.get_item(3)?.extract()?,
             })
+        }
+        17 => {
+            // (17, kind) — TemporalNative: kind 0=DateTime, 1=Date, 2=Time
+            let kind: u8 = t.get_item(1)?.extract()?;
+            let temporal_kind = match kind {
+                0 => TemporalKind::DateTime,
+                1 => TemporalKind::Date,
+                2 => TemporalKind::Time,
+                _ => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "unknown TemporalNative kind {kind}"
+                    )))
+                }
+            };
+            Ok(Element::TemporalNative(temporal_kind))
         }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown element tag {other}"
@@ -2500,45 +2648,44 @@ impl LoadElement {
             // would use. Each arm matches only the JSON type it can handle natively;
             // any mismatch falls through to the materialise+apply path which handles
             // coercion and error generation identically to the dict-source load path.
-
-            LoadElement::Passthrough => return json_to_py(py, jv),
+            LoadElement::Passthrough => json_to_py(py, jv),
 
             LoadElement::Str => match jv {
                 // JSON strings arrive already as valid UTF-8 &str; use the global
                 // string cache (F7) so repeated values share the same Python object.
-                JsonValue::Str(s) => return Ok(cached_py_string(py, s.as_ref()).into_any()),
+                JsonValue::Str(s) => Ok(cached_py_string(py, s.as_ref()).into_any()),
                 _ => {
                     let v = json_to_py(py, jv)?;
-                    return self.apply(ctx, &v, partial);
+                    self.apply(ctx, &v, partial)
                 }
             },
 
             LoadElement::Int => match jv {
                 // Boolean in JSON means ``true``/``false``; ``apply`` rejects them
                 // as ``invalid``, defer so Python emits the right message.
-                JsonValue::Bool(_) => return Err(fallback()),
-                JsonValue::Int(i) => return Ok((*i).into_pyobject(py)?.into_any()),
+                JsonValue::Bool(_) => Err(fallback()),
+                JsonValue::Int(i) => Ok((*i).into_pyobject(py)?.into_any()),
                 // Float or string coercion: materialise and let ``apply`` handle.
                 _ => {
                     let v = json_to_py(py, jv)?;
-                    return self.apply(ctx, &v, partial);
+                    self.apply(ctx, &v, partial)
                 }
             },
 
             LoadElement::IntStrict => match jv {
-                JsonValue::Bool(_) => return Err(fallback()),
+                JsonValue::Bool(_) => Err(fallback()),
                 // Strict: exact int only; any other JSON type defers.
-                JsonValue::Int(i) => return Ok((*i).into_pyobject(py)?.into_any()),
-                _ => return Err(fallback()),
+                JsonValue::Int(i) => Ok((*i).into_pyobject(py)?.into_any()),
+                _ => Err(fallback()),
             },
 
             LoadElement::Float { allow_nan } => match jv {
-                JsonValue::Bool(_) => return Err(fallback()),
+                JsonValue::Bool(_) => Err(fallback()),
                 JsonValue::Float(f) => {
                     if !allow_nan && (f.is_nan() || f.is_infinite()) {
                         return Err(fallback()); // ``special`` error
                     }
-                    return Ok((*f).into_pyobject(py)?.into_any());
+                    Ok((*f).into_pyobject(py)?.into_any())
                 }
                 JsonValue::Int(i) => {
                     // JSON integers are valid float inputs (same as ``float(42)``).
@@ -2546,25 +2693,23 @@ impl LoadElement {
                     if !allow_nan && (f.is_nan() || f.is_infinite()) {
                         return Err(fallback());
                     }
-                    return Ok(f.into_pyobject(py)?.into_any());
+                    Ok(f.into_pyobject(py)?.into_any())
                 }
                 _ => {
                     let v = json_to_py(py, jv)?;
-                    return self.apply(ctx, &v, partial);
+                    self.apply(ctx, &v, partial)
                 }
             },
 
             LoadElement::Boolean { .. } => {
                 // JSON booleans can be resolved directly without a Python set lookup.
                 match jv {
-                    JsonValue::Bool(b) => {
-                        return Ok(PyBool::new(py, *b).to_owned().into_any());
-                    }
+                    JsonValue::Bool(b) => Ok(PyBool::new(py, *b).to_owned().into_any()),
                     // Non-bool JSON: materialise and fall through to apply which
                     // checks the truthy/falsy sets and defers on a miss.
                     _ => {
                         let v = json_to_py(py, jv)?;
-                        return self.apply(ctx, &v, partial);
+                        self.apply(ctx, &v, partial)
                     }
                 }
             }
@@ -3046,7 +3191,7 @@ fn parse_load_element(py: Python<'_>, e: &Bound<'_, PyAny>) -> PyResult<LoadElem
 /// Bump this whenever the element tags or payload tuple shapes change so a stale
 /// compiled extension paired with a newer ``marshmallow`` (or vice versa) is
 /// detected and the pure-Python path is used instead of misreading payloads.
-const PROTOCOL_VERSION: u32 = 19;
+const PROTOCOL_VERSION: u32 = 20;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {

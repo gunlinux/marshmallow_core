@@ -194,6 +194,70 @@ def test_temporal_enum_is_native():
     assert accel.is_available() == (vars(schema).get("_mc_dump_serializer") is not None)
 
 
+@pytest.mark.parametrize(
+    "obj",
+    [
+        # UTC timezone → "+00:00"
+        {"v": dt.datetime(2023, 6, 15, 12, 30, 45, tzinfo=dt.timezone.utc)},
+        # Positive offset (UTC+5:30) → "+05:30"
+        {
+            "v": dt.datetime(
+                2023,
+                6,
+                15,
+                12,
+                30,
+                45,
+                tzinfo=dt.timezone(dt.timedelta(hours=5, minutes=30)),
+            )
+        },
+        # Negative offset (UTC-5) → "-05:00"
+        {
+            "v": dt.datetime(
+                2023,
+                6,
+                15,
+                12,
+                30,
+                45,
+                tzinfo=dt.timezone(dt.timedelta(hours=-5)),
+            )
+        },
+        # Microseconds (no timezone)
+        {"v": dt.datetime(2023, 6, 15, 12, 30, 45, 123456)},
+        # Microseconds + timezone → ".123456+00:00"
+        {"v": dt.datetime(2023, 6, 15, 12, 30, 45, 123456, tzinfo=dt.timezone.utc)},
+        # Naive (no microseconds) — baseline
+        {"v": dt.datetime(2020, 1, 2, 3, 4, 5)},
+    ],
+    ids=["utc", "plus530", "minus5", "us", "us+utc", "naive"],
+)
+def test_temporal_native_datetime_edge_cases(obj, monkeypatch):
+    class S(Schema):
+        v = fields.DateTime()
+
+    accelerated, pure = _dump_both(S, obj, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {"v": dt.time(12, 30, 45)},
+        {"v": dt.time(12, 30, 45, 123456)},
+        {"v": dt.time(12, 30, 45, tzinfo=dt.timezone.utc)},
+        {"v": dt.time(12, 30, 45, 123456, tzinfo=dt.timezone.utc)},
+    ],
+    ids=["plain", "us", "utc", "us+utc"],
+)
+def test_temporal_native_time_edge_cases(obj, monkeypatch):
+    class S(Schema):
+        v = fields.Time()
+
+    accelerated, pure = _dump_both(S, obj, monkeypatch=monkeypatch)
+    assert accelerated == pure
+
+
 def test_dump_many_equivalence(monkeypatch):
     objs = [Obj(i=n, f=float(n), s=str(n), b=bool(n % 2), r=n) for n in range(5)]
     accelerated, pure = _dump_both(

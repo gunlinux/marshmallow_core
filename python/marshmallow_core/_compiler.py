@@ -62,7 +62,7 @@ except ImportError:  # pragma: no cover - extension is optional
 #: ``PROTOCOL_VERSION``; a mismatch (a stale compiled ``marshmallow_core._core``
 #: paired with newer ``marshmallow``, or vice versa) disables the core so we
 #: never hand mismatched payloads to a build that would misread the tags.
-_EXPECTED_PROTOCOL = 19
+_EXPECTED_PROTOCOL = 20
 
 
 class _NoFallbackError(Exception):
@@ -92,6 +92,12 @@ _DICT_TYPED = 13
 _TUPLE = 14
 _PLUCK = 15
 _IPADDR = 16
+# Native Rust ISO formatting — replaces the Python isoformat() call once abi3 is dropped.
+# kind values (not tags): 0=DateTime, 1=Date, 2=Time
+_TEMPORAL_NATIVE = 17
+_TN_DATETIME = 0
+_TN_DATE = 1
+_TN_TIME = 2
 
 # Load element tags (a distinct tag space from the dump tags above).
 _L_PASSTHROUGH = 0
@@ -337,6 +343,16 @@ def _build_element(field: typing.Any, stack: tuple[type, ...]) -> tuple | None:
         if not isinstance(data_format, str):
             return None
         func = field.SERIALIZATION_FUNCS.get(data_format)
+        # Native Rust ISO formatting: skip the Python isoformat() call entirely.
+        # Only for "iso"/"iso8601" (the registered isoformat callables); "rfc",
+        # "timestamp", and custom strptime formats stay on the _TEMPORAL path.
+        if func is not None and data_format in ("iso", "iso8601"):
+            if ftype is ma_fields.Date:
+                return (_TEMPORAL_NATIVE, _TN_DATE)
+            elif ftype is ma_fields.Time:
+                return (_TEMPORAL_NATIVE, _TN_TIME)
+            else:  # DateTime, NaiveDateTime, AwareDateTime
+                return (_TEMPORAL_NATIVE, _TN_DATETIME)
         return (_TEMPORAL, func, data_format)
     if ftype is ma_fields.Enum:
         # Enum serializes value.value / value.name through an inner field.

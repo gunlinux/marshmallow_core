@@ -23,8 +23,10 @@ marshmallow_core.uninstall()    # restore the stock methods
 ```
 
 This is a mixed Python/Rust project built with **maturin** (`flit`-style src
-layout under `python/`, Rust under `src/`). Python 3.10+ ; the extension is
-`abi3` so one wheel covers all supported versions.
+layout under `python/`, Rust under `src/`). Python 3.10+ ; the extension builds
+a per-version wheel (`cpXY-cpXY-...`) for each supported interpreter rather
+than a single `abi3` wheel — dropped deliberately so the core can use
+CPython's datetime C accessors, which aren't in the limited API.
 
 ## Provenance
 
@@ -62,6 +64,9 @@ MARSHMALLOW_NO_ACCEL=1 ./run_tests.sh -q -k "not core_active and not protocol"  
 # Benchmark stock vs core (dump/load/dumps/loads per case, speedup table):
 uv run python -m performance.benchmark               # all cases
 uv run python -m performance.benchmark --only flat,list --number 20000
+
+# Coverage probe: which fields run native in Rust vs fall back to Python callback:
+uv run python -m performance.analyze_paths
 ```
 
 `MARSHMALLOW_NO_ACCEL=1` disables the core even after `install()` (the
@@ -152,7 +157,10 @@ for every input it accepts, and must defer on any shape it does not.
   `_V_PYTHON` arm, which runs it in the core and falls back on failure),
   `Decimal`/`Dict`/`Constant` fields (typed `Dict` including inner key/value
   *validators*), the `IP`/`IPv4`/`IPv6`/`IPInterface` family, `Email`/`Url` load,
-  custom (non-ISO) strptime temporal formats on load,
+  custom (non-ISO) strptime temporal formats on load, ISO `DateTime`/`Date`/`Time`
+  dump (`_TEMPORAL_NATIVE` — formats directly off the C-level date/time struct
+  accessors instead of calling Python's `isoformat()`; non-ISO formats still go
+  through the callback `_TEMPORAL` element),
   schema-level load hooks (`pre_load`/`post_load`/`validates`/`validates_schema`
   run in Python around the core's per-field step), `dumps` (fused to JSON in
   Rust), and `loads` (**fused**: `_patched_loads` parses JSON with the pure-Rust
@@ -197,6 +205,24 @@ The other three files cover what equivalence can't:
   types, cached compiled state doesn't diverge from live schema state,
   `uninstall()` doesn't clobber foreign patches.
 - `tests/test_smoke.py` — quick install/uninstall + equivalence sanity check.
+
+## Architecture review & planning surface
+
+`F_REAL_REVIEW.md` is the primary architecture/planning document. It carries:
+
+- Benchmark baselines (use these to confirm no regression before landing perf changes).
+- Findings N1–N6 with their fix status (N1–N4 done; N5 profiled/skipped; N6 low, noted).
+- The standing won't-do list — deliberate non-features not to re-implement.
+
+### Deliberate non-features (do not re-litigate)
+
+These were evaluated, measured, and rejected. Full rationale is in `F_REAL_REVIEW.md`.
+
+- **Native float formatting in the JSON writer** — `ryu` differs from CPython `float.__repr__` (shortest-round-trip) on a measurable corpus. Stays `repr()`-via-Python.
+- **Native `Regexp` validator** — `regex` crate vs `re` semantics cannot be guaranteed equal. Already handled via `_V_PYTHON` with fallback.
+- **Per-class payload cache** — cross-instance sharing introduces R4-class staleness risk. Rejected.
+- **Big-int fused `loads`** — jiter deliberately built without `num-bigint` to keep its pyo3 optional dep out of the build. Values >i64 fall back to stock `loads`.
+- **hooks-case `loads` fusion** — would require running Python hooks mid-tree. The ~1.7x floor on `hooks loads` is accepted.
 
 ## Development
 
