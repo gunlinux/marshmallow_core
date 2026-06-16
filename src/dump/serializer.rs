@@ -104,11 +104,14 @@ impl Serializer {
     ) -> PyResult<Bound<'py, PyAny>> {
         let py = obj.py();
         if many && !obj.is_none() {
-            let out = PyList::empty(py);
+            // ``len`` is a best-effort capacity hint (exact for list/tuple/set,
+            // unavailable for generators -> 0), letting the common collection
+            // input build its list in one allocation instead of by append.
+            let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(obj.len().unwrap_or(0));
             for item in obj.try_iter()? {
-                out.append(self.run_one(ctx, &item?)?)?;
+                items.push(self.run_one(ctx, &item?)?.into_any());
             }
-            Ok(out.into_any())
+            Ok(PyList::new(py, items)?.into_any())
         } else {
             Ok(self.run_one(ctx, obj)?.into_any())
         }
@@ -312,11 +315,14 @@ impl Element {
                 if is_one_shot_iterator(value) {
                     return Err(fallback());
                 }
-                let out = PyList::empty(py);
+                // Best-effort capacity hint (exact for list/tuple/set, 0 for
+                // anything without ``__len__``); build the list in one allocation.
+                let mut items: Vec<Bound<'py, PyAny>> =
+                    Vec::with_capacity(value.len().unwrap_or(0));
                 for each in value.try_iter()? {
-                    out.append(inner.apply(ctx, &each?)?)?;
+                    items.push(inner.apply(ctx, &each?)?);
                 }
-                Ok(out.into_any())
+                Ok(PyList::new(py, items)?.into_any())
             }
             Element::Uuid | Element::IpAddr => {
                 if value.is_none() {
@@ -416,11 +422,14 @@ impl Element {
                 let ret = serializer.run(ctx, value, *many)?;
                 if *many {
                     // ``utils.pluck(ret, key)`` == ``[d[key] for d in ret]``.
-                    let out = PyList::empty(py);
+                    // ``ret`` is the freshly built result list, so its length is
+                    // an exact capacity hint.
+                    let mut items: Vec<Bound<'py, PyAny>> =
+                        Vec::with_capacity(ret.len().unwrap_or(0));
                     for d in ret.try_iter()? {
-                        out.append(d?.get_item(dk)?)?;
+                        items.push(d?.get_item(dk)?);
                     }
-                    Ok(out.into_any())
+                    Ok(PyList::new(py, items)?.into_any())
                 } else {
                     ret.get_item(dk) // ``ret[data_key]``
                 }
