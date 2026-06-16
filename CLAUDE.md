@@ -226,6 +226,14 @@ These were evaluated, measured, and rejected. Full rationale is in `F_REAL_REVIE
 
 ## Development
 
+ - **ALWAYS run `make lint` (or at minimum `uv run ruff format --check` +
+   `uv run ruff check`) before every commit and before every push, and fix any
+   reported issues first.** The GitHub Actions `py-lint` job runs
+   `ruff format --check`, which fails the build on *any* unformatted file —
+   including scripts under `scripts/` that the test suite never touches. A clean
+   local `pytest` is NOT sufficient; lint/format must pass too. When in doubt run
+   the full `make check` (lint + types + tests, both languages). Use `make fix`
+   (`ruff --fix/format` + `cargo fmt/clippy --fix`) to auto-resolve formatting.
  - commit only after passing tests
  - for every big part create a new branch
  - for every small task (feature) make a commit

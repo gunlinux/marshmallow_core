@@ -13,6 +13,7 @@ The patch inserts the minimum padding needed at two insertion points:
   2. Between the string table and the code signature to re-align the signature.
 After patching the file is re-signed (ad-hoc) so dyld accepts it.
 """
+
 from __future__ import annotations
 
 import struct
@@ -49,7 +50,7 @@ def fix_linkedit(path: Path, *, verbose: bool = False) -> bool:
 
     for _ in range(ncmds):
         cmd = _r32(data, off)
-        if cmd == 0x2:    # LC_SYMTAB
+        if cmd == 0x2:  # LC_SYMTAB
             sym_off = off
         elif cmd == 0x1D:  # LC_CODE_SIGNATURE
             cs_off = off
